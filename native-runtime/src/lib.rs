@@ -8,9 +8,12 @@
 //! - low bit 1: a small integer, the value in the upper 63 bits (`(n << 1) | 1`)
 //! - low bit 0: a pointer to a heap allocation (8-byte aligned)
 //!
-//! `Nil` is the small integer 0. The only heap objects so far are big
-//! integers, stored as a raw `Box<BigInt>`; they are currently leaked, as
-//! reference counting is not yet implemented.
+//! `Nil` is the small integer 0. Heap objects so far are big integers
+//! (a raw `Box<BigInt>`) and floats (a raw `Box<f64>`); they are currently
+//! leaked, as reference counting is not yet implemented. Heap objects carry
+//! no kind header yet: Gleam's type system statically separates which
+//! functions receive which types, so none is needed until polymorphic
+//! runtime services (structural equality, `echo`) exist.
 //!
 //! These functions use the platform C calling convention and are registered
 //! with the JIT by name via [`symbols`], so they need no `#[no_mangle]`.
@@ -62,10 +65,29 @@ pub unsafe extern "C" fn gleam_native_bigint_from_bytes(bytes: *const u8, length
     retag(BigInt::from_signed_bytes_le(bytes))
 }
 
+/// Boxes a float value given its IEEE 754 bit pattern. Taking the bits as an
+/// integer keeps every generated call signature uniformly i64.
+pub extern "C" fn gleam_native_float_from_bits(bits: u64) -> u64 {
+    Box::into_raw(Box::new(f64::from_bits(bits))) as u64
+}
+
 /// Prints an integer followed by a newline. The standin for a real printing
 /// external until strings exist on the native target.
 pub extern "C" fn print_int(value: u64) -> u64 {
     println!("{}", untag(value));
+    NIL
+}
+
+/// Prints a float followed by a newline, formatted the way Gleam floats are
+/// written (always with a decimal point or exponent).
+///
+/// # Safety
+///
+/// `value` must be a float created by this runtime. The Gleam type system
+/// upholds this for calls from generated code.
+pub unsafe extern "C" fn print_float(value: u64) -> u64 {
+    let float = unsafe { *(value as *const f64) };
+    println!("{float:?}");
     NIL
 }
 
@@ -80,7 +102,12 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_bigint_from_bytes",
             gleam_native_bigint_from_bytes as *const u8,
         ),
+        (
+            "gleam_native_float_from_bits",
+            gleam_native_float_from_bits as *const u8,
+        ),
         ("print_int", print_int as *const u8),
+        ("print_float", print_float as *const u8),
     ]
 }
 
@@ -108,6 +135,13 @@ mod tests {
         let bytes = BigInt::from(42).to_signed_bytes_le();
         let result = unsafe { gleam_native_bigint_from_bytes(bytes.as_ptr(), bytes.len() as u64) };
         assert_eq!(result, tag_small_int(42));
+    }
+
+    #[test]
+    fn float_round_trip() {
+        let boxed = gleam_native_float_from_bits(1.5_f64.to_bits());
+        assert_eq!(boxed & 1, 0);
+        assert_eq!(unsafe { *(boxed as *const f64) }, 1.5);
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub const INT_ADD_SLOW: &str = "gleam_native_int_add_slow";
 /// The symbol of the runtime's big integer literal constructor.
 pub const BIGINT_FROM_BYTES: &str = "gleam_native_bigint_from_bytes";
 
+/// The symbol of the runtime's float constructor.
+pub const FLOAT_FROM_BITS: &str = "gleam_native_float_from_bits";
+
 /// The symbol of the generated C-convention wrapper around `main`.
 pub const ENTRY_SYMBOL: &str = "gleam_native_main_wrapper";
 
@@ -56,6 +59,7 @@ pub struct Translator<'a, M: Module> {
     functions: HashMap<(String, String), FuncId>,
     int_add_slow: FuncId,
     bigint_from_bytes: FuncId,
+    float_from_bits: FuncId,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -71,11 +75,15 @@ impl<'a, M: Module> Translator<'a, M> {
                 &c_signature(call_conv, 2),
             )
             .map_err(|error| error.to_string())?;
+        let float_from_bits = module
+            .declare_function(FLOAT_FROM_BITS, Linkage::Import, &c_signature(call_conv, 1))
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             module,
             functions: HashMap::new(),
             int_add_slow,
             bigint_from_bytes,
+            float_from_bits,
         })
     }
 
@@ -175,6 +183,7 @@ impl<'a, M: Module> Translator<'a, M> {
             functions: &self.functions,
             int_add_slow: self.int_add_slow,
             bigint_from_bytes: self.bigint_from_bytes,
+            float_from_bits: self.float_from_bits,
             module: self.module,
             builder: &mut builder,
             environment,
@@ -225,6 +234,7 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     functions: &'a HashMap<(String, String), FuncId>,
     int_add_slow: FuncId,
     bigint_from_bytes: FuncId,
+    float_from_bits: FuncId,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
     environment: HashMap<String, Variable>,
@@ -278,6 +288,18 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .module
                     .declare_func_in_func(self.bigint_from_bytes, self.builder.func);
                 let call = self.builder.ins().call(from_bytes_ref, &[pointer, length]);
+                Ok(self.builder.inst_results(call)[0])
+            }
+
+            native_ir::Expression::Float(value) => {
+                let bits = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, value.to_bits() as i64);
+                let from_bits_ref = self
+                    .module
+                    .declare_func_in_func(self.float_from_bits, self.builder.func);
+                let call = self.builder.ins().call(from_bits_ref, &[bits]);
                 Ok(self.builder.inst_results(call)[0])
             }
 

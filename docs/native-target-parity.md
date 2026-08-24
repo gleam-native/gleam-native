@@ -32,12 +32,14 @@ platform C convention.
 - ✅ Integer literals beyond the small range (heap big integers built from
   constant data at run time)
 - ✅ `Nil`
-- ❌ Float literals (unboxed in registers or boxed; representation decision
-  needed — likely boxed f64 initially, matching the tagged-word scheme)
+- ✅ Float literals (boxed f64 heap objects; heap objects carry no kind
+  header yet — the type system separates them until polymorphic equality and
+  `echo` exist)
 - ❌ String literals (immutable UTF-8 heap objects, constant data section)
 - ❌ `True` / `False` (prelude custom type; likely tagged immediates)
-- ❌ Number literal notations already accepted by the parser: `0x`, `0o`,
-  `0b`, underscores, scientific notation for floats
+- ✅ Number literal notations already accepted by the parser: `0x`, `0o`,
+  `0b`, underscores, scientific notation for floats (parsed values arrive
+  pre-decoded in the typed AST)
 
 ## Operators
 

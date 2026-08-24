@@ -156,4 +156,32 @@ mod tests {
         };
         crate::jit::run(&[module], "app").unwrap();
     }
+
+    /// A float literal is boxed via the runtime constructor and can be
+    /// passed to an external.
+    #[test]
+    fn jit_runs_float_literals() {
+        let module = native_ir::Module {
+            name: "app".into(),
+            functions: vec![
+                native_ir::Function::External {
+                    name: "print_float".into(),
+                    arity: 1,
+                    symbol: "print_float".into(),
+                },
+                native_ir::Function::Defined {
+                    name: "main".into(),
+                    parameters: vec![],
+                    body: vec![native_ir::Statement::Expression(
+                        native_ir::Expression::Call {
+                            module: "app".into(),
+                            function: "print_float".into(),
+                            arguments: vec![native_ir::Expression::Float(1.5)],
+                        },
+                    )],
+                },
+            ],
+        };
+        crate::jit::run(&[module], "app").unwrap();
+    }
 }

@@ -126,6 +126,10 @@ impl Lowerer {
                 }
             }
 
+            TypedExpr::Float { float_value, .. } => {
+                Ok(native_ir::Expression::Float(float_value.value()))
+            }
+
             TypedExpr::Block { statements, .. } => Ok(native_ir::Expression::Block(
                 self.statements(statements.iter())?,
             )),
@@ -237,6 +241,34 @@ mod tests {
                 value: native_ir::Expression::BigInt(
                     BigInt::from(9223372036854775808_u64).to_signed_bytes_le(),
                 ),
+            }
+        );
+    }
+
+    #[test]
+    fn float_literals() {
+        let module = lower(
+            "pub fn main() {
+  let x = 1.5
+  let y = -3.0e2
+  0
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "x".into(),
+                value: native_ir::Expression::Float(1.5),
+            }
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Let {
+                name: "y".into(),
+                value: native_ir::Expression::Float(-300.0),
             }
         );
     }

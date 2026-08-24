@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -58,6 +58,8 @@ pub enum Expression {
     /// An integer literal too large for a tagged immediate: the value as
     /// signed little-endian bytes, built into a heap big integer at run time.
     BigInt(Vec<u8>),
+    /// A float literal, boxed on the heap at run time.
+    Float(f64),
     Nil,
     Variable(String),
     Block(Vec<Statement>),
