@@ -52,7 +52,9 @@ platform C convention.
 - ✅ Comparison operators on `Int` (`<`, `<=`, `>`, `>=`): tagged words
   compare directly on the fast path; big integer operands go through the
   runtime's three-way comparison
-- ❌ Float arithmetic and comparison (`+.`, `-.`, `*.`, `/.`, `<.`, …)
+- ✅ Float arithmetic and comparison (`+.`, `-.`, `*.`, `/.`, `<.`, `<=.`,
+  `>.`, `>=.`): unboxed register arithmetic between loads, division by zero
+  yields 0.0, IEEE ordered comparisons
 - ❌ `==` / `!=` structural equality for every type (deep runtime equality,
   the same semantics as Erlang `=:=` on Gleam data / `isEqual` in the JS
   prelude)

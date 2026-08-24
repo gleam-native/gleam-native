@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 10;
+pub const FORMAT_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -86,6 +86,19 @@ pub enum Expression {
         left: Box<Expression>,
         right: Box<Expression>,
     },
+    /// Float arithmetic on boxed f64 values.
+    FloatBinary {
+        operator: FloatOperator,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
+    /// Float ordering comparison, yielding a boolean. IEEE ordered
+    /// semantics: comparisons involving NaN are false.
+    FloatCompare {
+        operator: CompareOperator,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
     StringConcat(Box<Expression>, Box<Expression>),
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
@@ -110,6 +123,15 @@ pub enum CompareOperator {
     LessThanOrEqual,
     GreaterThan,
     GreaterThanOrEqual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum FloatOperator {
+    Add,
+    Subtract,
+    Multiply,
+    /// Division by zero yields 0.0.
+    Divide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

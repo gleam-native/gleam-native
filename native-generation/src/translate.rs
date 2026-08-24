@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, types};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, Value, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
@@ -476,7 +476,75 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let right = self.expression(right)?;
                 self.int_compare(*operator, left, right)
             }
+
+            native_ir::Expression::FloatBinary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.expression(left)?;
+                let right = self.expression(right)?;
+                let left = self.load_float(left);
+                let right = self.load_float(right);
+                let result = match operator {
+                    native_ir::FloatOperator::Add => self.builder.ins().fadd(left, right),
+                    native_ir::FloatOperator::Subtract => self.builder.ins().fsub(left, right),
+                    native_ir::FloatOperator::Multiply => self.builder.ins().fmul(left, right),
+                    // Division by zero yields 0.0. Float division never
+                    // traps, so the quotient is computed unconditionally and
+                    // the zero-divisor case selected in.
+                    native_ir::FloatOperator::Divide => {
+                        let zero = self.builder.ins().f64const(0.0);
+                        let divisor_is_zero =
+                            self.builder.ins().fcmp(FloatCC::Equal, right, zero);
+                        let quotient = self.builder.ins().fdiv(left, right);
+                        self.builder.ins().select(divisor_is_zero, zero, quotient)
+                    }
+                };
+                self.box_float(result)
+            }
+
+            native_ir::Expression::FloatCompare {
+                operator,
+                left,
+                right,
+            } => {
+                let condition = match operator {
+                    native_ir::CompareOperator::LessThan => FloatCC::LessThan,
+                    native_ir::CompareOperator::LessThanOrEqual => FloatCC::LessThanOrEqual,
+                    native_ir::CompareOperator::GreaterThan => FloatCC::GreaterThan,
+                    native_ir::CompareOperator::GreaterThanOrEqual => {
+                        FloatCC::GreaterThanOrEqual
+                    }
+                };
+                let left = self.expression(left)?;
+                let right = self.expression(right)?;
+                let left = self.load_float(left);
+                let right = self.load_float(right);
+                let flag = self.builder.ins().fcmp(condition, left, right);
+                Ok(self.tag_boolean_flag(flag))
+            }
         }
+    }
+
+    /// Loads the f64 out of a boxed float value.
+    fn load_float(&mut self, boxed: Value) -> Value {
+        self.builder
+            .ins()
+            .load(types::F64, MemFlagsData::trusted(), boxed, 0)
+    }
+
+    /// Boxes an f64 register value via the runtime's float constructor.
+    fn box_float(&mut self, value: Value) -> Result<Value, String> {
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), value);
+        let from_bits_ref = self
+            .module
+            .declare_func_in_func(self.runtime.float_from_bits, self.builder.func);
+        let call = self.builder.ins().call(from_bits_ref, &[bits]);
+        Ok(self.builder.inst_results(call)[0])
     }
 
     /// Turns an i8 comparison flag into a tagged boolean (1 or 3).

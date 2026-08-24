@@ -237,6 +237,44 @@ impl Lowerer<'_> {
                 right: Box::new(self.expression(right)?),
             }),
             TypedExpr::BinOp {
+                operator:
+                    operator @ (BinOp::AddFloat
+                    | BinOp::SubFloat
+                    | BinOp::MultFloat
+                    | BinOp::DivFloat),
+                left,
+                right,
+                ..
+            } => Ok(native_ir::Expression::FloatBinary {
+                operator: match operator {
+                    BinOp::AddFloat => native_ir::FloatOperator::Add,
+                    BinOp::SubFloat => native_ir::FloatOperator::Subtract,
+                    BinOp::MultFloat => native_ir::FloatOperator::Multiply,
+                    _ => native_ir::FloatOperator::Divide,
+                },
+                left: Box::new(self.expression(left)?),
+                right: Box::new(self.expression(right)?),
+            }),
+            TypedExpr::BinOp {
+                operator:
+                    operator @ (BinOp::LtFloat
+                    | BinOp::LtEqFloat
+                    | BinOp::GtFloat
+                    | BinOp::GtEqFloat),
+                left,
+                right,
+                ..
+            } => Ok(native_ir::Expression::FloatCompare {
+                operator: match operator {
+                    BinOp::LtFloat => native_ir::CompareOperator::LessThan,
+                    BinOp::LtEqFloat => native_ir::CompareOperator::LessThanOrEqual,
+                    BinOp::GtFloat => native_ir::CompareOperator::GreaterThan,
+                    _ => native_ir::CompareOperator::GreaterThanOrEqual,
+                },
+                left: Box::new(self.expression(left)?),
+                right: Box::new(self.expression(right)?),
+            }),
+            TypedExpr::BinOp {
                 operator: BinOp::Concatenate,
                 left,
                 right,
@@ -438,6 +476,44 @@ mod tests {
                 operator: native_ir::IntOperator::Remainder,
                 left: Box::new(native_ir::Expression::Int(85)),
                 right: Box::new(native_ir::Expression::Int(43)),
+            })
+        );
+    }
+
+    #[test]
+    fn float_operators() {
+        let module = lower(
+            "pub fn main() {
+  1.5 +. 2.0
+  10.0 /. 4.0
+  1.5 <. 2.5
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Expression(native_ir::Expression::FloatBinary {
+                operator: native_ir::FloatOperator::Add,
+                left: Box::new(native_ir::Expression::Float(1.5)),
+                right: Box::new(native_ir::Expression::Float(2.0)),
+            })
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Expression(native_ir::Expression::FloatBinary {
+                operator: native_ir::FloatOperator::Divide,
+                left: Box::new(native_ir::Expression::Float(10.0)),
+                right: Box::new(native_ir::Expression::Float(4.0)),
+            })
+        );
+        assert_eq!(
+            body[2],
+            native_ir::Statement::Expression(native_ir::Expression::FloatCompare {
+                operator: native_ir::CompareOperator::LessThan,
+                left: Box::new(native_ir::Expression::Float(1.5)),
+                right: Box::new(native_ir::Expression::Float(2.5)),
             })
         );
     }
