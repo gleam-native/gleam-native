@@ -20,6 +20,8 @@ members = [
   "erlang-term-format",
   "erlang-generation",
   "native-generation",
+  "native-ir",
+  "native-runtime",
   "src-span",
 ]
 

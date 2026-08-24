@@ -83,6 +83,7 @@ pub mod io;
 pub mod javascript;
 pub mod manifest;
 pub mod metadata;
+pub mod native;
 pub mod package_interface;
 pub mod parse;
 pub mod paths;

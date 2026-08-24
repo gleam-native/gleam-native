@@ -437,8 +437,11 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
     #[error("could not create temp file: {error}")]
     CouldNotCreateTempFile { error: String },
 
-    #[error("the {} target is not yet implemented", target.as_presentable_str())]
-    TargetNotYetImplemented { target: Target },
+    #[error("module {module} uses a feature unsupported by the native target: {feature}")]
+    NativeUnsupportedFeature {
+        module: EcoString,
+        feature: EcoString,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -2531,11 +2534,11 @@ add `gleam add {name}` in this project."
                 hint: None,
             }],
 
-            Error::TargetNotYetImplemented { target } => vec![Diagnostic {
-                title: "Target not yet implemented".into(),
+            Error::NativeUnsupportedFeature { module, feature } => vec![Diagnostic {
+                title: "Unsupported feature for native target".into(),
                 text: wrap_format!(
-                    "Support for the {} target has not been implemented yet.",
-                    target.as_presentable_str()
+                    "The module `{module}` uses a feature that the native \
+target does not support yet: {feature}."
                 ),
                 level: Level::Error,
                 location: None,

@@ -9,6 +9,8 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
+native-ir = { path = "../native-ir" }
+native-runtime = { path = "../native-runtime" }
 cranelift-codegen = "0.135.0"
 cranelift-frontend = "0.135.0"
 cranelift-jit = "0.135.0"

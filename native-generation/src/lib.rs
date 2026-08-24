@@ -4,7 +4,13 @@
 //! Native code generation for the Gleam native target, built on Cranelift.
 //!
 //! This crate must not be depended upon by `compiler-core`, which has to keep
-//! compiling to WebAssembly for `compiler-wasm`.
+//! compiling to WebAssembly for `compiler-wasm`. It consumes the serialized
+//! native IR that `compiler-core` writes at build time (see the `native-ir`
+//! crate) and either JIT-compiles and runs it ([`jit`]) or, in the future,
+//! emits object files for ahead-of-time compilation.
+
+pub mod jit;
+pub mod translate;
 
 #[cfg(test)]
 mod tests {
@@ -67,5 +73,66 @@ mod tests {
         let pointer = module.get_finalized_function(function);
         let add = unsafe { std::mem::transmute::<*const u8, fn(i64, i64) -> i64>(pointer) };
         assert_eq!(add(20, 22), 42);
+    }
+
+    /// End-to-end: build a tiny two-module program in native IR, JIT it, and
+    /// run `main`. Uses the runtime's `print_int` external and an addition
+    /// that stays on the fast path plus one that overflows to a big integer.
+    #[test]
+    fn jit_runs_main_of_a_program() {
+        let dependency = native_ir::Module {
+            name: "wibble/wobble".into(),
+            functions: vec![
+                native_ir::Function::External {
+                    name: "print_int".into(),
+                    arity: 1,
+                    symbol: "print_int".into(),
+                },
+                native_ir::Function::Defined {
+                    name: "add".into(),
+                    parameters: vec!["x".into(), "y".into()],
+                    body: vec![native_ir::Statement::Expression(
+                        native_ir::Expression::IntAdd(
+                            Box::new(native_ir::Expression::Variable("x".into())),
+                            Box::new(native_ir::Expression::Variable("y".into())),
+                        ),
+                    )],
+                },
+            ],
+        };
+        let root = native_ir::Module {
+            name: "app".into(),
+            functions: vec![native_ir::Function::Defined {
+                name: "main".into(),
+                parameters: vec![],
+                body: vec![
+                    native_ir::Statement::Let {
+                        name: "total".into(),
+                        value: native_ir::Expression::Call {
+                            module: "wibble/wobble".into(),
+                            function: "add".into(),
+                            arguments: vec![
+                                native_ir::Expression::Int(40),
+                                native_ir::Expression::Int(2),
+                            ],
+                        },
+                    },
+                    native_ir::Statement::Let {
+                        name: "huge".into(),
+                        value: native_ir::Expression::IntAdd(
+                            Box::new(native_ir::Expression::Int(i64::MAX >> 1)),
+                            Box::new(native_ir::Expression::Variable("total".into())),
+                        ),
+                    },
+                    native_ir::Statement::Expression(native_ir::Expression::Call {
+                        module: "wibble/wobble".into(),
+                        function: "print_int".into(),
+                        arguments: vec![native_ir::Expression::Variable("huge".into())],
+                    }),
+                ],
+            }],
+        };
+
+        crate::jit::run(&[dependency, root], "app").unwrap();
     }
 }

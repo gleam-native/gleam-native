@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+//! The serializable intermediate representation for the Gleam native target.
+//!
+//! `compiler-core` lowers typed Gleam modules into this IR at build time and
+//! writes one artifact file per module; `native-generation` loads the
+//! artifacts and translates them to Cranelift IR. This crate must stay free
+//! of Cranelift so that `compiler-core` remains compilable to WebAssembly.
+
+use serde::{Deserialize, Serialize};
+
+/// Bumped whenever the types in this crate change shape, so that stale
+/// artifacts from previous compiler builds are rejected rather than
+/// misinterpreted. bitcode is not a self-describing format.
+pub const FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub version: u32,
+    pub module: Module,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Module {
+    /// The Gleam module name, with `/` separators, e.g. `gleam/wibble`.
+    pub name: String,
+    pub functions: Vec<Function>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Function {
+    /// A function with a Gleam body, compiled to native code.
+    Defined {
+        name: String,
+        parameters: Vec<String>,
+        body: Vec<Statement>,
+    },
+    /// A function implemented by `@external(native, _, symbol)`. Calls
+    /// resolve to `symbol` with the platform C calling convention.
+    External {
+        name: String,
+        arity: u32,
+        symbol: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Statement {
+    Let { name: String, value: Expression },
+    Expression(Expression),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Expression {
+    /// An integer literal small enough to be stored as a tagged immediate.
+    Int(i64),
+    Nil,
+    Variable(String),
+    Block(Vec<Statement>),
+    Call {
+        module: String,
+        function: String,
+        arguments: Vec<Expression>,
+    },
+    IntAdd(Box<Expression>, Box<Expression>),
+}
+
+pub fn encode(module: &Module) -> Result<Vec<u8>, bitcode::Error> {
+    bitcode::serialize(&Artifact {
+        version: FORMAT_VERSION,
+        module: module.clone(),
+    })
+}
+
+pub fn decode(bytes: &[u8]) -> Result<Module, String> {
+    let artifact: Artifact =
+        bitcode::deserialize(bytes).map_err(|error| format!("corrupt native artifact: {error}"))?;
+    if artifact.version != FORMAT_VERSION {
+        return Err(format!(
+            "native artifact format version {} does not match compiler version {}",
+            artifact.version, FORMAT_VERSION
+        ));
+    }
+    Ok(artifact.module)
+}

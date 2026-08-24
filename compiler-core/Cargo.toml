@@ -62,6 +62,7 @@ futures.workspace = true
 hexpm = { path = "../hexpm" }
 pretty-arena = { path = "../pretty-arena" }
 erlang-generation = { path = "../erlang-generation" }
+native-ir = { path = "../native-ir" }
 http.workspace = true
 im.workspace = true
 itertools.workspace = true

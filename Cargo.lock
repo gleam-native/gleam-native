@@ -1486,6 +1486,7 @@ dependencies = [
  "itertools 0.15.0",
  "lsp-server",
  "native-generation",
+ "native-ir",
  "opener",
  "pretty_assertions",
  "pubgrub",
@@ -1541,6 +1542,7 @@ dependencies = [
  "insta",
  "itertools 0.15.0",
  "lsp-server",
+ "native-ir",
  "num-bigint 0.5.1",
  "num-traits",
  "pathdiff",
@@ -2416,7 +2418,25 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "native-ir",
+ "native-runtime",
  "target-lexicon",
+]
+
+[[package]]
+name = "native-ir"
+version = "1.0.0"
+dependencies = [
+ "bitcode",
+ "serde",
+]
+
+[[package]]
+name = "native-runtime"
+version = "1.0.0"
+dependencies = [
+ "num-bigint 0.5.1",
+ "num-traits",
 ]
 
 [[package]]

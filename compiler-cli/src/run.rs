@@ -259,15 +259,52 @@ fn run_javascript_node_command(
     })
 }
 
+/// Unlike the other targets, which return a command for a runtime to be run
+/// as a subprocess, the native target JIT-compiles the build artifacts and
+/// runs `main` in this process, exiting with the outcome.
 fn run_native_command(
-    _paths: &ProjectPaths,
+    paths: &ProjectPaths,
     _package: &str,
-    _module: &str,
+    module: &str,
     _arguments: Vec<String>,
 ) -> Result<Command, Error> {
-    Err(Error::TargetNotYetImplemented {
-        target: Target::Native,
-    })
+    fn fail(message: String) -> ! {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
+
+    let build_directory = paths.build_directory_for_target(Mode::Dev, Target::Native);
+    let mut modules = vec![];
+    let packages = std::fs::read_dir(&build_directory)
+        .unwrap_or_else(|error| fail(format!("could not read {build_directory}: {error}")));
+    for package in packages {
+        let package = package
+            .unwrap_or_else(|error| fail(format!("could not read {build_directory}: {error}")));
+        let artefact_directory = package
+            .path()
+            .join(gleam_core::paths::ARTEFACT_DIRECTORY_NAME);
+        let Ok(artefacts) = std::fs::read_dir(&artefact_directory) else {
+            continue;
+        };
+        for artefact in artefacts {
+            let path = artefact
+                .unwrap_or_else(|error| fail(format!("could not read build artifacts: {error}")))
+                .path();
+            if path.extension() != Some(std::ffi::OsStr::new("nir")) {
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| fail(format!("could not read {}: {error}", path.display())));
+            let module = native_ir::decode(&bytes)
+                .unwrap_or_else(|error| fail(format!("in {}: {error}", path.display())));
+            modules.push(module);
+        }
+    }
+
+    match native_generation::jit::run(&modules, module) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => fail(error),
+    }
 }
 
 fn write_javascript_entrypoint(
