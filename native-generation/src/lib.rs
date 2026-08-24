@@ -202,14 +202,15 @@ mod tests {
                 body: vec![native_ir::Statement::Expression(
                     native_ir::Expression::Case {
                         subjects: vec![native_ir::Expression::Bool(true)],
+                        subject_ids: vec![0],
                         tree: native_ir::Decision::Switch {
-                            subject: 0,
+                            var: 0,
                             choices: vec![(
                                 native_ir::Check::Immediate(3),
                                 native_ir::Decision::Run {
                                     bindings: vec![(
                                         "x".into(),
-                                        native_ir::Bound::Subject(0),
+                                        native_ir::Bound::Variable(0),
                                     )],
                                     body: vec![native_ir::Statement::Expression(
                                         native_ir::Expression::Variable("x".into()),
@@ -222,6 +223,7 @@ mod tests {
                                     native_ir::Expression::Int(0),
                                 )],
                             }),
+                            fallback_fields: vec![],
                         },
                     },
                 )],

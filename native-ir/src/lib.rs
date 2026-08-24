@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 15;
+pub const FORMAT_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -120,9 +120,25 @@ pub enum Expression {
     /// A `case` expression, lowered from the compiler's exhaustiveness
     /// decision tree. Subjects are evaluated once, in order, then the tree
     /// decides which clause body runs.
+    ///
+    /// Decision variables are numbered: `subject_ids[i]` is the variable
+    /// holding subject `i`, and variant checks introduce further variables
+    /// for the fields they extract.
     Case {
         subjects: Vec<Expression>,
+        subject_ids: Vec<u32>,
         tree: Decision,
+    },
+    /// Constructing a custom type value: a heap record with a variant tag
+    /// word followed by the field values.
+    Constructor {
+        tag: u32,
+        arguments: Vec<Expression>,
+    },
+    /// Reading field `index` out of a custom type record.
+    FieldAccess {
+        record: Box<Expression>,
+        index: u32,
     },
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
@@ -163,13 +179,17 @@ pub enum Decision {
         bindings: Vec<(String, Bound)>,
         body: Vec<Statement>,
     },
-    /// Try each check against the subject in order; on the first success
+    /// Try each check against the variable in order; on the first success
     /// follow its decision, otherwise the fallback. The type system
-    /// guarantees the fallback always matches.
+    /// guarantees the fallback always matches; when the fallback is the
+    /// final variant of an exhaustive match, `fallback_fields` are the
+    /// decision variables for that variant's fields, extracted without any
+    /// tag test.
     Switch {
-        subject: u32,
+        var: u32,
         choices: Vec<(Check, Decision)>,
         fallback: Box<Decision>,
+        fallback_fields: Vec<u32>,
     },
     /// A clause guard: bind the pattern's variables, evaluate the guard
     /// expression, and run the clause body when it is true; otherwise
@@ -187,8 +207,8 @@ pub enum Decision {
 /// The value bound to a pattern variable when a clause matches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Bound {
-    /// One of the case subjects.
-    Subject(u32),
+    /// A decision variable: a subject or an extracted field.
+    Variable(u32),
     /// A literal from the pattern itself.
     Value(Expression),
 }
@@ -206,6 +226,9 @@ pub enum Check {
     String(String),
     /// The subject is exactly this tagged word (`Bool`/`Nil` variants).
     Immediate(i64),
+    /// The subject is a custom type record with this variant tag. On a
+    /// match, the record's fields become the given decision variables.
+    Variant { tag: u32, fields: Vec<u32> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

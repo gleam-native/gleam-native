@@ -77,9 +77,10 @@ platform C convention.
   variant-index-to-tagged-word mapping: `True` is variant 0 but encodes
   as 1), variable and discard patterns, pattern bindings, alternative
   patterns (`a | b`)
-- ❌ Destructuring pattern kinds: tuples, constructors with fields, lists
-  (`[x, ..rest]`), string prefixes, bit arrays, `as` bindings on composite
-  patterns — each blocked on its data type existing natively
+- 🚧 Destructuring pattern kinds: constructors with fields work (including
+  untested final variants of exhaustive matches, whose fields arrive via
+  the fallback). Still missing: tuples, lists (`[x, ..rest]`), string
+  prefixes, bit arrays — each blocked on its data type existing natively
 - 🚧 Guards (`if` clauses): operators, negation, variables, and scalar
   literal constants work (sharing the expression operator lowering). Not yet:
   tuples, field access, and module constants in guards
@@ -109,12 +110,15 @@ platform C convention.
 
 - ❌ Tuples (heap objects, positional access `#(1, 2).0`)
 - ❌ Lists (cons cells; literals, prepend, pattern support)
-- ❌ Custom types: constructor functions, tag words, field access by label,
-  record accessors (`wibble.name`)
+- ✅ Custom types: heap records (variant tag word + field words),
+  constructors (labelled and positional), field access (`wibble.name`),
+  destructuring in `case`; `Result` works as a plain custom type. Not yet:
+  constructors used as function values, and equality (needs polymorphic
+  deep equality)
 - ❌ Record updates (`Wibble(..old, name: "new")`)
-- ❌ `Result` (prelude custom type; no special casing beyond the prelude)
-- ❌ Strings: UTF-8 heap objects, concatenation, comparison, the grapheme
-  guarantees the stdlib relies on come from stdlib externals
+- 🚧 Strings: UTF-8 heap objects with literals, concatenation, and equality
+  done; ordering comparison and the grapheme operations the stdlib relies on
+  still need runtime support
 - ❌ Bit arrays: construction and patterns with size/unit/signedness/
   endianness options, UTF codepoint segments; the per-target feature gates in
   `compiler-core/src/bit_array.rs` need `Native` rules
@@ -123,8 +127,8 @@ platform C convention.
 
 ## Runtime semantics and services
 
-- ✅ Arbitrary precision integers (representation and overflow promotion;
-  only `+` wired so far)
+- ✅ Arbitrary precision integers (representation, overflow promotion, and
+  all arithmetic and comparison operators)
 - ✅ `panic`, `todo` with module/function/line metadata baked into the call
   site, lazily-evaluated message expressions, exit code 1
 - ❌ `echo` (debug printing of any value; needs runtime value inspection)

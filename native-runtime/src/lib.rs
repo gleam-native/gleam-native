@@ -9,12 +9,14 @@
 //! - low bit 0: a pointer to a heap allocation (8-byte aligned)
 //!
 //! `Nil` is the small integer 0. Heap objects so far are big integers
-//! (a raw `Box<BigInt>`), floats (a raw `Box<f64>`), and strings (a raw
-//! `Box<String>`, always valid UTF-8); they are currently leaked, as
-//! reference counting is not yet implemented. Heap objects carry no kind
-//! header yet: Gleam's type system statically separates which functions
-//! receive which types, so none is needed until polymorphic runtime
-//! services (structural equality, `echo`) exist.
+//! (a raw `Box<BigInt>`), floats (a raw `Box<f64>`), strings (a raw
+//! `Box<String>`, always valid UTF-8), and custom type records (a variant
+//! tag word followed by the field values, allocated by
+//! [`gleam_native_record_new`] and written by generated code); they are
+//! currently leaked, as reference counting is not yet implemented. Heap
+//! objects carry no kind header yet: Gleam's type system statically
+//! separates which functions receive which types, so none is needed until
+//! polymorphic runtime services (structural equality, `echo`) exist.
 //!
 //! These functions use the platform C calling convention and are registered
 //! with the JIT by name via [`symbols`], so they need no `#[no_mangle]`.
@@ -195,6 +197,18 @@ pub unsafe extern "C" fn gleam_native_panic(
     std::process::exit(1);
 }
 
+/// Allocates a custom type record: one word for the variant tag followed by
+/// `arity` words for the fields, which generated code stores immediately
+/// after this call.
+pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64) -> u64 {
+    let words = 1 + arity as usize;
+    let layout = std::alloc::Layout::array::<u64>(words).expect("record layout");
+    let pointer = unsafe { std::alloc::alloc(layout) } as *mut u64;
+    assert!(!pointer.is_null(), "record allocation failed");
+    unsafe { *pointer = tag };
+    pointer as u64
+}
+
 /// String equality by contents, returning [`TRUE`] or [`FALSE`].
 ///
 /// # Safety
@@ -287,6 +301,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         (
             "gleam_native_string_eq",
             gleam_native_string_eq as *const u8,
+        ),
+        (
+            "gleam_native_record_new",
+            gleam_native_record_new as *const u8,
         ),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),

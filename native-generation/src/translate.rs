@@ -50,6 +50,9 @@ pub const STRING_CONCAT: &str = "gleam_native_string_concat";
 /// The symbol of the runtime's string equality function.
 pub const STRING_EQ: &str = "gleam_native_string_eq";
 
+/// The symbol of the runtime's custom type record allocator.
+pub const RECORD_NEW: &str = "gleam_native_record_new";
+
 /// The symbol of the runtime's panic/todo report-and-abort function.
 pub const PANIC: &str = "gleam_native_panic";
 
@@ -94,6 +97,7 @@ struct RuntimeFunctions {
     string_from_bytes: FuncId,
     string_concat: FuncId,
     string_eq: FuncId,
+    record_new: FuncId,
     panic: FuncId,
 }
 
@@ -117,6 +121,7 @@ impl RuntimeFunctions {
             string_from_bytes: declare(STRING_FROM_BYTES, 2)?,
             string_concat: declare(STRING_CONCAT, 2)?,
             string_eq: declare(STRING_EQ, 2)?,
+            record_new: declare(RECORD_NEW, 2)?,
             panic: declare(PANIC, 7)?,
         })
     }
@@ -421,19 +426,57 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 Ok(self.builder.inst_results(call)[0])
             }
 
-            native_ir::Expression::Case { subjects, tree } => {
-                let subjects = subjects
-                    .iter()
-                    .map(|subject| self.expression(subject))
-                    .collect::<Result<Vec<_>, _>>()?;
+            native_ir::Expression::Case {
+                subjects,
+                subject_ids,
+                tree,
+            } => {
+                let mut variables = HashMap::new();
+                for (id, subject) in subject_ids.iter().zip(subjects) {
+                    let value = self.expression(subject)?;
+                    let _ = variables.insert(*id, value);
+                }
 
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
-                self.decision(&subjects, tree, join)?;
+                self.decision(&variables, tree, join)?;
                 self.builder.seal_block(join);
 
                 self.builder.switch_to_block(join);
                 Ok(self.builder.block_params(join)[0])
+            }
+
+            native_ir::Expression::Constructor { tag, arguments } => {
+                let mut values = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    values.push(self.expression(argument)?);
+                }
+                let tag = self.builder.ins().iconst(types::I64, *tag as i64);
+                let arity = self.builder.ins().iconst(types::I64, values.len() as i64);
+                let record_new_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.record_new, self.builder.func);
+                let call = self.builder.ins().call(record_new_ref, &[tag, arity]);
+                let record = self.builder.inst_results(call)[0];
+                for (index, value) in values.into_iter().enumerate() {
+                    let _ = self.builder.ins().store(
+                        MemFlagsData::trusted(),
+                        value,
+                        record,
+                        8 + 8 * index as i32,
+                    );
+                }
+                Ok(record)
+            }
+
+            native_ir::Expression::FieldAccess { record, index } => {
+                let record = self.expression(record)?;
+                Ok(self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    record,
+                    8 + 8 * *index as i32,
+                ))
             }
 
             native_ir::Expression::Panic {
@@ -664,7 +707,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     /// traps on the unreachable `Fail` node.
     fn decision(
         &mut self,
-        subjects: &[Value],
+        variables: &HashMap<u32, Value>,
         tree: &native_ir::Decision,
         join: Block,
     ) -> Result<(), String> {
@@ -675,7 +718,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let saved_environment = self.environment.clone();
                 for (name, bound) in bindings {
                     let value = match bound {
-                        native_ir::Bound::Subject(index) => subjects[*index as usize],
+                        native_ir::Bound::Variable(id) => *variables
+                            .get(id)
+                            .ok_or_else(|| format!("unbound decision variable {id}"))?,
                         native_ir::Bound::Value(expression) => self.expression(expression)?,
                     };
                     let variable = self.builder.declare_var(types::I64);
@@ -708,7 +753,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let saved_environment = self.environment.clone();
                 for (name, bound) in bindings {
                     let value = match bound {
-                        native_ir::Bound::Subject(index) => subjects[*index as usize],
+                        native_ir::Bound::Variable(id) => *variables
+                            .get(id)
+                            .ok_or_else(|| format!("unbound decision variable {id}"))?,
                         native_ir::Bound::Value(expression) => self.expression(expression)?,
                     };
                     let variable = self.builder.declare_var(types::I64);
@@ -732,17 +779,32 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.environment = saved_environment;
 
                 self.builder.switch_to_block(false_block);
-                self.decision(subjects, if_false, join)
+                self.decision(variables, if_false, join)
             }
 
             native_ir::Decision::Switch {
-                subject,
+                var,
                 choices,
                 fallback,
+                fallback_fields,
             } => {
-                let subject = subjects[*subject as usize];
+                let subject = *variables
+                    .get(var)
+                    .ok_or_else(|| format!("unbound decision variable {var}"))?;
                 for (check, decision) in choices {
-                    let matched = self.check(subject, check)?;
+                    let matched = match check {
+                        native_ir::Check::Variant { tag, .. } => {
+                            let actual = self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::trusted(),
+                                subject,
+                                0,
+                            );
+                            let expected = self.builder.ins().iconst(types::I64, *tag as i64);
+                            self.builder.ins().icmp(IntCC::Equal, actual, expected)
+                        }
+                        check => self.check(subject, check)?,
+                    };
                     let match_block = self.builder.create_block();
                     let next_block = self.builder.create_block();
                     self.builder
@@ -752,10 +814,43 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     self.builder.seal_block(next_block);
 
                     self.builder.switch_to_block(match_block);
-                    self.decision(subjects, decision, join)?;
+                    match check {
+                        // A matched variant makes its fields available as
+                        // decision variables for the rest of this branch.
+                        native_ir::Check::Variant { fields, .. } => {
+                            let mut extended = variables.clone();
+                            for (index, field) in fields.iter().enumerate() {
+                                let value = self.builder.ins().load(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    subject,
+                                    8 + 8 * index as i32,
+                                );
+                                let _ = extended.insert(*field, value);
+                            }
+                            self.decision(&extended, decision, join)?;
+                        }
+                        _ => self.decision(variables, decision, join)?,
+                    }
                     self.builder.switch_to_block(next_block);
                 }
-                self.decision(subjects, fallback, join)
+                // An exhaustive match's final variant is not tag-tested,
+                // but its fields still become decision variables.
+                if fallback_fields.is_empty() {
+                    self.decision(variables, fallback, join)
+                } else {
+                    let mut extended = variables.clone();
+                    for (index, field) in fallback_fields.iter().enumerate() {
+                        let value = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            subject,
+                            8 + 8 * index as i32,
+                        );
+                        let _ = extended.insert(*field, value);
+                    }
+                    self.decision(&extended, fallback, join)
+                }
             }
         }
     }
@@ -782,6 +877,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let subject = self.load_float(subject);
                 let expected = self.builder.ins().f64const(*value);
                 Ok(self.builder.ins().fcmp(FloatCC::Equal, subject, expected))
+            }
+            native_ir::Check::Variant { .. } => {
+                unreachable!("variant checks are handled by the switch")
             }
             native_ir::Check::String(value) => {
                 let literal = self

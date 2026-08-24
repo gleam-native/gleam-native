@@ -7,8 +7,6 @@
 //! outside it produces an error naming the unsupported feature rather than
 //! generating wrong code. The subset grows with the native backend.
 
-use std::collections::HashMap;
-
 use ecow::EcoString;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -38,13 +36,8 @@ fn lower_int(value: &BigInt) -> native_ir::Expression {
 pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
     let mut functions = Vec::new();
 
-    // Imports and type aliases generate no code.
-    if !module.definitions.custom_types.is_empty() {
-        return Err(Error::NativeUnsupportedFeature {
-            module: module.name.clone(),
-            feature: "custom types".into(),
-        });
-    }
+    // Imports, type aliases, and custom type definitions generate no code:
+    // constructors are lowered to record allocations at their call sites.
     if !module.definitions.constants.is_empty() {
         return Err(Error::NativeUnsupportedFeature {
             module: module.name.clone(),
@@ -179,6 +172,17 @@ impl Lowerer<'_> {
                 } if module == PRELUDE_MODULE_NAME && (name == "True" || name == "False") => {
                     Ok(native_ir::Expression::Bool(name == "True"))
                 }
+                ValueConstructorVariant::Record {
+                    arity: 0,
+                    variant_index,
+                    ..
+                } => Ok(native_ir::Expression::Constructor {
+                    tag: *variant_index as u32,
+                    arguments: vec![],
+                }),
+                ValueConstructorVariant::Record { .. } => {
+                    Err(self.unsupported("constructors as function values"))
+                }
                 ValueConstructorVariant::ModuleFn { .. } => {
                     Err(self.unsupported("function values"))
                 }
@@ -188,23 +192,35 @@ impl Lowerer<'_> {
             TypedExpr::Call {
                 fun, arguments, ..
             } => {
-                let (module, function) = match fun.as_ref() {
-                    TypedExpr::Var { constructor, .. } => match &constructor.variant {
-                        ValueConstructorVariant::ModuleFn { module, name, .. } => {
-                            (module.clone(), name.clone())
-                        }
-                        _ => return Err(self.unsupported("calling non-function values")),
-                    },
-                    _ => return Err(self.unsupported("calling expressions")),
-                };
                 let arguments = arguments
                     .iter()
                     .map(|argument| self.expression(&argument.value))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(native_ir::Expression::Call {
-                    module: module.into(),
-                    function: function.into(),
-                    arguments,
+                match fun.as_ref() {
+                    TypedExpr::Var { constructor, .. } => match &constructor.variant {
+                        ValueConstructorVariant::ModuleFn { module, name, .. } => {
+                            Ok(native_ir::Expression::Call {
+                                module: module.clone().into(),
+                                function: name.clone().into(),
+                                arguments,
+                            })
+                        }
+                        ValueConstructorVariant::Record { variant_index, .. } => {
+                            Ok(native_ir::Expression::Constructor {
+                                tag: *variant_index as u32,
+                                arguments,
+                            })
+                        }
+                        _ => Err(self.unsupported("calling non-function values")),
+                    },
+                    _ => Err(self.unsupported("calling expressions")),
+                }
+            }
+
+            TypedExpr::RecordAccess { record, index, .. } => {
+                Ok(native_ir::Expression::FieldAccess {
+                    record: Box::new(self.expression(record)?),
+                    index: *index as u32,
                 })
             }
 
@@ -226,18 +242,21 @@ impl Lowerer<'_> {
                 compiled_case,
                 ..
             } => {
-                let subject_indices: HashMap<usize, u32> = compiled_case
+                let subject_ids = compiled_case
                     .subject_variables
                     .iter()
-                    .enumerate()
-                    .map(|(index, variable)| (variable.id, index as u32))
+                    .map(|variable| variable.id as u32)
                     .collect();
-                let tree = self.decision(&compiled_case.tree, clauses, &subject_indices)?;
+                let tree = self.decision(&compiled_case.tree, clauses)?;
                 let subjects = subjects
                     .iter()
                     .map(|subject| self.expression(subject))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(native_ir::Expression::Case { subjects, tree })
+                Ok(native_ir::Expression::Case {
+                    subjects,
+                    subject_ids,
+                    tree,
+                })
             }
 
             TypedExpr::Panic {
@@ -401,11 +420,10 @@ impl Lowerer<'_> {
         &self,
         decision: &exhaustiveness::Decision,
         clauses: &[TypedClause],
-        subject_indices: &HashMap<usize, u32>,
     ) -> Result<native_ir::Decision, Error> {
         match decision {
             exhaustiveness::Decision::Run { body } => {
-                self.decision_body(body, clauses, subject_indices)
+                self.decision_body(body, clauses)
             }
 
             exhaustiveness::Decision::Guard {
@@ -419,14 +437,14 @@ impl Lowerer<'_> {
                     .guard
                     .as_ref()
                     .expect("guard decision on clause with a guard");
-                let bindings = self.bound_values(&if_true.bindings, subject_indices)?;
+                let bindings = self.bound_values(&if_true.bindings)?;
                 let clause = clauses
                     .get(if_true.clause_index)
                     .expect("decision tree clause index in range");
                 let body = vec![native_ir::Statement::Expression(
                     self.expression(&clause.then)?,
                 )];
-                let if_false = self.decision(if_false, clauses, subject_indices)?;
+                let if_false = self.decision(if_false, clauses)?;
                 Ok(native_ir::Decision::Guard {
                     bindings,
                     guard: Box::new(self.guard(guard_expression)?),
@@ -441,24 +459,36 @@ impl Lowerer<'_> {
                 var,
                 choices,
                 fallback,
-                fallback_check: _,
+                fallback_check,
             } => {
-                let subject = *subject_indices
-                    .get(&var.id)
-                    .ok_or_else(|| self.unsupported("patterns that destructure values"))?;
+                let subject = var.id as u32;
                 let choices = choices
                     .iter()
                     .map(|(check, decision)| {
                         let check = self.runtime_check(check, &var.type_)?;
-                        let decision = self.decision(decision, clauses, subject_indices)?;
+                        let decision = self.decision(decision, clauses)?;
                         Ok((check, decision))
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
-                let fallback = self.decision(fallback, clauses, subject_indices)?;
+                // When the fallback is the final variant of an exhaustive
+                // match its check is not performed, but the fields it
+                // extracts must still be made available.
+                let fallback_fields = match fallback_check.as_ref() {
+                    exhaustiveness::FallbackCheck::RuntimeCheck { check } => {
+                        match self.runtime_check(check, &var.type_)? {
+                            native_ir::Check::Variant { fields, .. } => fields,
+                            _ => vec![],
+                        }
+                    }
+                    exhaustiveness::FallbackCheck::InfiniteCatchAll
+                    | exhaustiveness::FallbackCheck::CatchAll { .. } => vec![],
+                };
+                let fallback = self.decision(fallback, clauses)?;
                 Ok(native_ir::Decision::Switch {
-                    subject,
+                    var: subject,
                     choices,
                     fallback: Box::new(fallback),
+                    fallback_fields,
                 })
             }
         }
@@ -482,10 +512,10 @@ impl Lowerer<'_> {
             exhaustiveness::RuntimeCheck::String { value } => Ok(native_ir::Check::String(
                 crate::strings::convert_string_escape_chars(value).into(),
             )),
-            exhaustiveness::RuntimeCheck::Variant { index, fields, .. } if fields.is_empty() => {
-                // The only variant-shaped values so far are the tagged
-                // immediates: Bool (True is variant 0 but encodes as 1) and
-                // Nil.
+            exhaustiveness::RuntimeCheck::Variant { index, fields, .. } => {
+                // Bool and Nil are tagged immediates (True is variant 0 but
+                // encodes as 1); every other custom type is a heap record
+                // with a variant tag word.
                 if subject_type.is_bool() {
                     Ok(native_ir::Check::Immediate(tag_small_int(
                         if *index == 0 { 1 } else { 0 },
@@ -493,11 +523,11 @@ impl Lowerer<'_> {
                 } else if subject_type.is_nil() {
                     Ok(native_ir::Check::Immediate(tag_small_int(0)))
                 } else {
-                    Err(self.unsupported("matching on custom types"))
+                    Ok(native_ir::Check::Variant {
+                        tag: *index as u32,
+                        fields: fields.iter().map(|field| field.id as u32).collect(),
+                    })
                 }
-            }
-            exhaustiveness::RuntimeCheck::Variant { .. } => {
-                Err(self.unsupported("matching on custom types"))
             }
             exhaustiveness::RuntimeCheck::StringPrefix { .. } => {
                 Err(self.unsupported("string prefix patterns"))
@@ -517,9 +547,8 @@ impl Lowerer<'_> {
         &self,
         body: &exhaustiveness::Body,
         clauses: &[TypedClause],
-        subject_indices: &HashMap<usize, u32>,
     ) -> Result<native_ir::Decision, Error> {
-        let bindings = self.bound_values(&body.bindings, subject_indices)?;
+        let bindings = self.bound_values(&body.bindings)?;
         let clause = clauses
             .get(body.clause_index)
             .expect("decision tree clause index in range");
@@ -532,16 +561,13 @@ impl Lowerer<'_> {
     fn bound_values(
         &self,
         body_bindings: &[(EcoString, exhaustiveness::BoundValue)],
-        subject_indices: &HashMap<usize, u32>,
     ) -> Result<Vec<(String, native_ir::Bound)>, Error> {
         let mut bindings = Vec::with_capacity(body_bindings.len());
         for (name, value) in body_bindings {
             let bound = match value {
-                exhaustiveness::BoundValue::Variable(variable) => native_ir::Bound::Subject(
-                    *subject_indices
-                        .get(&variable.id)
-                        .ok_or_else(|| self.unsupported("patterns that destructure values"))?,
-                ),
+                exhaustiveness::BoundValue::Variable(variable) => {
+                    native_ir::Bound::Variable(variable.id as u32)
+                }
                 exhaustiveness::BoundValue::LiteralInt(value) => {
                     native_ir::Bound::Value(lower_int(value))
                 }
@@ -921,8 +947,9 @@ mod tests {
             body[0],
             native_ir::Statement::Expression(native_ir::Expression::Case {
                 subjects: vec![native_ir::Expression::Int(5)],
+                subject_ids: vec![0],
                 tree: native_ir::Decision::Switch {
-                    subject: 0,
+                    var: 0,
                     choices: vec![(
                         native_ir::Check::Int(1),
                         native_ir::Decision::Run {
@@ -933,13 +960,79 @@ mod tests {
                         },
                     )],
                     fallback: Box::new(native_ir::Decision::Run {
-                        bindings: vec![("n".into(), native_ir::Bound::Subject(0))],
+                        bindings: vec![("n".into(), native_ir::Bound::Variable(0))],
                         body: vec![native_ir::Statement::Expression(
                             native_ir::Expression::Variable("n".into())
                         )],
                     }),
+                    fallback_fields: vec![],
                 },
             })
+        );
+    }
+
+    #[test]
+    fn custom_types() {
+        let module = lower(
+            r#"pub type Pair {
+  Pair(first: Int, second: Int)
+}
+
+pub fn main() {
+  let pair = Pair(1, 2)
+  let total = case pair {
+    Pair(first, second) -> first + second
+  }
+  total + pair.first
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "pair".into(),
+                value: native_ir::Expression::Constructor {
+                    tag: 0,
+                    arguments: vec![
+                        native_ir::Expression::Int(1),
+                        native_ir::Expression::Int(2)
+                    ],
+                },
+            }
+        );
+        // The single-variant match is not tag-tested: the fields arrive via
+        // the fallback.
+        let native_ir::Statement::Let { value, .. } = &body[1] else {
+            panic!("expected a let");
+        };
+        let native_ir::Expression::Case { tree, .. } = value else {
+            panic!("expected a case");
+        };
+        let native_ir::Decision::Switch {
+            choices,
+            fallback_fields,
+            ..
+        } = tree
+        else {
+            panic!("expected a switch");
+        };
+        assert!(choices.is_empty());
+        assert_eq!(fallback_fields.len(), 2);
+        // `pair.first` reads field 0.
+        let native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+            right, ..
+        }) = &body[2]
+        else {
+            panic!("expected an addition");
+        };
+        assert_eq!(
+            right.as_ref(),
+            &native_ir::Expression::FieldAccess {
+                record: Box::new(native_ir::Expression::Variable("pair".into())),
+                index: 0,
+            }
         );
     }
 
@@ -963,7 +1056,7 @@ mod tests {
         assert_eq!(
             tree,
             &native_ir::Decision::Guard {
-                bindings: vec![("n".into(), native_ir::Bound::Subject(0))],
+                bindings: vec![("n".into(), native_ir::Bound::Variable(0))],
                 guard: Box::new(native_ir::Expression::BoolBinary {
                     operator: native_ir::BoolOperator::And,
                     left: Box::new(native_ir::Expression::IntCompare {
