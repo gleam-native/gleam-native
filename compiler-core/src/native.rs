@@ -275,6 +275,19 @@ impl Lowerer<'_> {
                 right: Box::new(self.expression(right)?),
             }),
             TypedExpr::BinOp {
+                operator: operator @ (BinOp::And | BinOp::Or),
+                left,
+                right,
+                ..
+            } => Ok(native_ir::Expression::BoolBinary {
+                operator: match operator {
+                    BinOp::And => native_ir::BoolOperator::And,
+                    _ => native_ir::BoolOperator::Or,
+                },
+                left: Box::new(self.expression(left)?),
+                right: Box::new(self.expression(right)?),
+            }),
+            TypedExpr::BinOp {
                 operator: BinOp::Concatenate,
                 left,
                 right,
@@ -543,6 +556,31 @@ mod tests {
                 operator: native_ir::CompareOperator::GreaterThanOrEqual,
                 left: Box::new(native_ir::Expression::Int(3)),
                 right: Box::new(native_ir::Expression::Int(4)),
+            })
+        );
+    }
+
+    #[test]
+    fn boolean_operators() {
+        let module = lower(
+            "pub fn main() {
+  True && False || True
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        // `&&` binds tighter than `||`.
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Expression(native_ir::Expression::BoolBinary {
+                operator: native_ir::BoolOperator::Or,
+                left: Box::new(native_ir::Expression::BoolBinary {
+                    operator: native_ir::BoolOperator::And,
+                    left: Box::new(native_ir::Expression::Bool(true)),
+                    right: Box::new(native_ir::Expression::Bool(false)),
+                }),
+                right: Box::new(native_ir::Expression::Bool(true)),
             })
         );
     }

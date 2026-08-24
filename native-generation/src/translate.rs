@@ -477,6 +477,44 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.int_compare(*operator, left, right)
             }
 
+            native_ir::Expression::BoolBinary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.expression(left)?;
+
+                let evaluate_right = self.builder.create_block();
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+
+                // Booleans are the tagged small integers 1 (False) and
+                // 3 (True), so bit 1 distinguishes them. When the left value
+                // decides the result it flows to the join unchanged.
+                let is_true = self.builder.ins().band_imm_u(left, 2);
+                match operator {
+                    native_ir::BoolOperator::And => {
+                        self.builder
+                            .ins()
+                            .brif(is_true, evaluate_right, &[], join, &[left.into()]);
+                    }
+                    native_ir::BoolOperator::Or => {
+                        self.builder
+                            .ins()
+                            .brif(is_true, join, &[left.into()], evaluate_right, &[]);
+                    }
+                }
+                self.builder.seal_block(evaluate_right);
+
+                self.builder.switch_to_block(evaluate_right);
+                let right = self.expression(right)?;
+                self.builder.ins().jump(join, &[right.into()]);
+                self.builder.seal_block(join);
+
+                self.builder.switch_to_block(join);
+                Ok(self.builder.block_params(join)[0])
+            }
+
             native_ir::Expression::FloatBinary {
                 operator,
                 left,

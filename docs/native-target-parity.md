@@ -59,7 +59,8 @@ platform C convention.
   the same semantics as Erlang `=:=` on Gleam data / `isEqual` in the JS
   prelude)
 - ✅ `<>` string concatenation
-- ❌ `&&`, `||` with short-circuit evaluation
+- ✅ `&&`, `||` with short-circuit evaluation (pure codegen: the right
+  operand's evaluation sits in a conditionally-executed block)
 - ❌ Pipe operator `|>` (desugared by the compiler; needs function values)
 
 ## Bindings and control flow

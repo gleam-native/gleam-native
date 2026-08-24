@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 11;
+pub const FORMAT_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -99,6 +99,13 @@ pub enum Expression {
         left: Box<Expression>,
         right: Box<Expression>,
     },
+    /// `&&` or `||` with short-circuit evaluation: the right expression is
+    /// evaluated only when the left one does not decide the result.
+    BoolBinary {
+        operator: BoolOperator,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
     StringConcat(Box<Expression>, Box<Expression>),
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
@@ -123,6 +130,12 @@ pub enum CompareOperator {
     LessThanOrEqual,
     GreaterThan,
     GreaterThanOrEqual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BoolOperator {
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
