@@ -362,6 +362,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
             native_ir::Expression::Nil => Ok(self.builder.ins().iconst(types::I64, NIL)),
 
+            // Tagged small integers 1 and 0.
+            native_ir::Expression::Bool(value) => Ok(self
+                .builder
+                .ins()
+                .iconst(types::I64, if *value { 3 } else { 1 })),
+
             native_ir::Expression::Variable(name) => {
                 let variable = self
                     .environment

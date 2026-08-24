@@ -159,8 +159,16 @@ impl Lowerer<'_> {
                     arity: 0,
                     module,
                     ..
-                } if name == "Nil" && module == PRELUDE_MODULE_NAME => {
+                } if module == PRELUDE_MODULE_NAME && name == "Nil" => {
                     Ok(native_ir::Expression::Nil)
+                }
+                ValueConstructorVariant::Record {
+                    name,
+                    arity: 0,
+                    module,
+                    ..
+                } if module == PRELUDE_MODULE_NAME && (name == "True" || name == "False") => {
+                    Ok(native_ir::Expression::Bool(name == "True"))
                 }
                 ValueConstructorVariant::ModuleFn { .. } => {
                     Err(self.unsupported("function values"))
@@ -360,6 +368,34 @@ mod tests {
                     Box::new(native_ir::Expression::String("Hello, ".into())),
                     Box::new(native_ir::Expression::String("world!".into())),
                 ),
+            }
+        );
+    }
+
+    #[test]
+    fn boolean_literals() {
+        let module = lower(
+            "pub fn main() {
+  let yes = True
+  let no = False
+  0
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "yes".into(),
+                value: native_ir::Expression::Bool(true),
+            }
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Let {
+                name: "no".into(),
+                value: native_ir::Expression::Bool(false),
             }
         );
     }

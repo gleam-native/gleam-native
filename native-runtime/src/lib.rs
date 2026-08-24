@@ -24,6 +24,10 @@ use num_traits::ToPrimitive;
 
 pub const NIL: u64 = 1;
 
+/// `False` and `True` are the tagged small integers 0 and 1.
+pub const FALSE: u64 = 1;
+pub const TRUE: u64 = 3;
+
 pub const SMALL_INT_MIN: i64 = i64::MIN >> 1;
 pub const SMALL_INT_MAX: i64 = i64::MAX >> 1;
 
@@ -157,6 +161,13 @@ pub extern "C" fn print_int(value: u64) -> u64 {
     NIL
 }
 
+/// Prints a boolean as Gleam writes it, `True` or `False`, followed by a
+/// newline.
+pub extern "C" fn print_bool(value: u64) -> u64 {
+    println!("{}", if value == TRUE { "True" } else { "False" });
+    NIL
+}
+
 /// Prints a string followed by a newline, the native implementation for a
 /// `gleam/io.println`-style external.
 ///
@@ -208,6 +219,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
+        ("print_bool", print_bool as *const u8),
         ("print_float", print_float as *const u8),
         ("println", println as *const u8),
     ]

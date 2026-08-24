@@ -37,7 +37,8 @@ platform C convention.
   `echo` exist)
 - ✅ String literals (immutable UTF-8 heap strings built from constant data;
   escape sequences processed at lowering time; `println` runtime external)
-- ❌ `True` / `False` (prelude custom type; likely tagged immediates)
+- ✅ `True` / `False` (tagged small integers 1 and 0; `print_bool` runtime
+  external)
 - ✅ Number literal notations already accepted by the parser: `0x`, `0o`,
   `0b`, underscores, scientific notation for floats (parsed values arrive
   pre-decoded in the typed AST)
