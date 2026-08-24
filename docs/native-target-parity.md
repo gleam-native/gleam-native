@@ -118,7 +118,9 @@ platform C convention.
   destructuring in `case`; `Result` works as a plain custom type. Not yet:
   constructors used as function values, and equality (needs polymorphic
   deep equality)
-- ❌ Record updates (`Wibble(..old, name: "new")`)
+- ✅ Record updates (`Wibble(..old, name: "new")`): the type checker's
+  desugaring lowers onto existing constructor and field access nodes,
+  including non-variable spread expressions
 - 🚧 Strings: UTF-8 heap objects with literals, concatenation, and equality
   done; ordering comparison and the grapheme operations the stdlib relies on
   still need runtime support

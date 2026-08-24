@@ -247,6 +247,51 @@ impl Lowerer<'_> {
                 Ok(list)
             }
 
+            TypedExpr::PositionalAccess { record, index, .. } => {
+                Ok(native_ir::Expression::FieldAccess {
+                    record: Box::new(self.expression(record)?),
+                    index: *index as u32,
+                })
+            }
+
+            TypedExpr::RecordUpdate {
+                updated_record,
+                updated_record_assigned_name,
+                constructor,
+                arguments,
+                ..
+            } => {
+                // The type checker has already desugared the update into a
+                // full constructor argument list where unchanged fields read
+                // from the spread record, referenced by name.
+                let tag = match constructor.as_ref() {
+                    TypedExpr::Var { constructor, .. } => match &constructor.variant {
+                        ValueConstructorVariant::Record { variant_index, .. } => {
+                            *variant_index as u32
+                        }
+                        _ => return Err(self.unsupported("this record update")),
+                    },
+                    _ => return Err(self.unsupported("this record update")),
+                };
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.expression(&argument.value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let construct = native_ir::Expression::Constructor { tag, arguments };
+                match updated_record_assigned_name {
+                    // The spread expression is not a plain variable: bind it
+                    // to the compiler-chosen name the arguments refer to.
+                    Some(name) => Ok(native_ir::Expression::Block(vec![
+                        native_ir::Statement::Let {
+                            name: name.clone().into(),
+                            value: self.expression(updated_record)?,
+                        },
+                        native_ir::Statement::Expression(construct),
+                    ])),
+                    None => Ok(construct),
+                }
+            }
+
             TypedExpr::RecordAccess { record, index, .. } => {
                 Ok(native_ir::Expression::FieldAccess {
                     record: Box::new(self.expression(record)?),
@@ -1303,6 +1348,38 @@ pub fn main() {
                 .iter()
                 .any(|(_, decision)| has_non_subject_switch(decision, *var))
                 || has_non_subject_switch(fallback, *var)
+        );
+    }
+
+    #[test]
+    fn record_updates() {
+        let module = lower(
+            r#"pub type Person {
+  Person(name: String, age: Int)
+}
+
+pub fn main() {
+  let alice = Person(name: "Alice", age: 30)
+  Person(..alice, age: 31)
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        // The unchanged field reads from the spread record; the updated one
+        // uses the new value.
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Expression(native_ir::Expression::Constructor {
+                tag: 0,
+                arguments: vec![
+                    native_ir::Expression::FieldAccess {
+                        record: Box::new(native_ir::Expression::Variable("alice".into())),
+                        index: 0,
+                    },
+                    native_ir::Expression::Int(31),
+                ],
+            })
         );
     }
 
