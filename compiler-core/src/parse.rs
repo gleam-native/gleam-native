@@ -4835,6 +4835,7 @@ functions are declared separately from types.";
         let target = match target.as_str() {
             "erlang" => Target::Erlang,
             "javascript" => Target::JavaScript,
+            "native" => Target::Native,
             _ => return parse_error(ParseErrorType::UnknownTarget, SrcSpan::new(start, end)),
         };
 

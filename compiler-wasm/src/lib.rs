@@ -122,7 +122,8 @@ pub fn compile_package(project_id: usize, target: &str) -> Result<(), String> {
         "js" | "javascript" => Target::JavaScript,
         "native" => Target::Native,
         _ => {
-            let msg = format!("Unknown target `{target}`, expected `erlang` or `javascript`");
+            let msg =
+                format!("Unknown target `{target}`, expected `erlang`, `javascript` or `native`");
             return Err(msg);
         }
     };

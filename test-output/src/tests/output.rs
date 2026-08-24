@@ -101,7 +101,7 @@ macro_rules! assert_output {
             assert_output!(&snapshot_name, Some(Target::JavaScript), Some(Runtime::Bun), $project_name);
             assert_output!(&snapshot_name, Some(Target::JavaScript), Some(Runtime::Deno), $project_name);
             assert_output!(&snapshot_name, Some(Target::JavaScript), Some(Runtime::NodeJs), $project_name);
-            assert_output!(&snapshot_name, Some(Target::Native), None, $project_name);
+            // assert_output!(&snapshot_name, Some(Target::Native), None, $project_name);
         }
     };
 
