@@ -182,6 +182,10 @@ pub unsafe extern "C" fn gleam_native_panic(
     };
     let (name, default_message) = match kind {
         1 => ("todo", "This has not yet been implemented"),
+        2 => (
+            "let assert",
+            "Pattern match failed, no pattern matched the value",
+        ),
         _ => ("panic", "`panic` expression evaluated"),
     };
     let message = if message == 0 {

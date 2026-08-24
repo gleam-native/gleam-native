@@ -12,7 +12,10 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use crate::{
-    ast::{BinOp, Pattern, Statement, TypedClause, TypedExpr, TypedModule, TypedStatement},
+    ast::{
+        AssignmentKind, BinOp, Pattern, Statement, TypedClause, TypedExpr, TypedModule,
+        TypedStatement,
+    },
     error::Error,
     exhaustiveness,
     type_::{PRELUDE_MODULE_NAME, Type, ValueConstructorVariant},
@@ -119,13 +122,39 @@ impl Lowerer<'_> {
             )),
 
             Statement::Assignment(assignment) => {
-                let name = match &assignment.pattern {
-                    Pattern::Variable { name, .. } => name.clone(),
-                    _ => return Err(self.unsupported("pattern matching in assignments")),
+                // A plain variable pattern is irrefutable and binds directly.
+                if let Pattern::Variable { name, .. } = &assignment.pattern {
+                    return Ok(native_ir::Statement::Let {
+                        name: name.clone().into(),
+                        value: self.expression(&assignment.value)?,
+                    });
+                }
+
+                let subject_id = assignment
+                    .compiled_case
+                    .subject_variables
+                    .first()
+                    .expect("assignment decision tree has a subject")
+                    .id as u32;
+                let tree = self.decision(&assignment.compiled_case.tree, None)?;
+                let on_failure = match &assignment.kind {
+                    AssignmentKind::Let | AssignmentKind::Generated => None,
+                    AssignmentKind::Assert {
+                        location, message, ..
+                    } => Some(native_ir::AssignmentFailure {
+                        message: match message {
+                            Some(message) => Some(Box::new(self.expression(message)?)),
+                            None => None,
+                        },
+                        function: self.function_name.clone().into(),
+                        line: self.line_numbers.line_number(location.start),
+                    }),
                 };
-                Ok(native_ir::Statement::Let {
-                    name: name.into(),
-                    value: self.expression(&assignment.value)?,
+                Ok(native_ir::Statement::Destructure {
+                    subject: self.expression(&assignment.value)?,
+                    subject_id,
+                    tree,
+                    on_failure,
                 })
             }
 
@@ -322,7 +351,7 @@ impl Lowerer<'_> {
                     .iter()
                     .map(|variable| variable.id as u32)
                     .collect();
-                let tree = self.decision(&compiled_case.tree, clauses)?;
+                let tree = self.decision(&compiled_case.tree, Some(clauses))?;
                 let subjects = subjects
                     .iter()
                     .map(|subject| self.expression(subject))
@@ -499,7 +528,7 @@ impl Lowerer<'_> {
     fn decision(
         &self,
         decision: &exhaustiveness::Decision,
-        clauses: &[TypedClause],
+        clauses: Option<&[TypedClause]>,
     ) -> Result<native_ir::Decision, Error> {
         match decision {
             exhaustiveness::Decision::Run { body } => {
@@ -511,6 +540,8 @@ impl Lowerer<'_> {
                 if_true,
                 if_false,
             } => {
+                let clauses = clauses
+                    .ok_or_else(|| self.unsupported("guards outside case expressions"))?;
                 let guard_expression = clauses
                     .get(*guard)
                     .expect("guard clause index in range")
@@ -524,7 +555,7 @@ impl Lowerer<'_> {
                 let body = vec![native_ir::Statement::Expression(
                     self.expression(&clause.then)?,
                 )];
-                let if_false = self.decision(if_false, clauses)?;
+                let if_false = self.decision(if_false, Some(clauses))?;
                 Ok(native_ir::Decision::Guard {
                     bindings,
                     guard: Box::new(self.guard(guard_expression)?),
@@ -637,15 +668,21 @@ impl Lowerer<'_> {
     fn decision_body(
         &self,
         body: &exhaustiveness::Body,
-        clauses: &[TypedClause],
+        clauses: Option<&[TypedClause]>,
     ) -> Result<native_ir::Decision, Error> {
         let bindings = self.bound_values(&body.bindings)?;
-        let clause = clauses
-            .get(body.clause_index)
-            .expect("decision tree clause index in range");
-        let body = vec![native_ir::Statement::Expression(
-            self.expression(&clause.then)?,
-        )];
+        // Assignments have no clause bodies: only the bindings matter.
+        let body = match clauses {
+            Some(clauses) => {
+                let clause = clauses
+                    .get(body.clause_index)
+                    .expect("decision tree clause index in range");
+                vec![native_ir::Statement::Expression(
+                    self.expression(&clause.then)?,
+                )]
+            }
+            None => vec![],
+        };
         Ok(native_ir::Decision::Run { bindings, body })
     }
 
@@ -1381,6 +1418,51 @@ pub fn main() {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn destructuring_assignments() {
+        let module = lower(
+            r#"pub fn main() {
+  let #(a, b) = #(1, 2)
+  let assert Ok(value) = Ok(a + b) as "always fine"
+  value
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        // Irrefutable tuple destructuring: no failure handler.
+        let native_ir::Statement::Destructure {
+            on_failure: None,
+            tree,
+            ..
+        } = &body[0]
+        else {
+            panic!("expected an infallible destructure, got {:?}", body[0]);
+        };
+        let native_ir::Decision::Switch {
+            fallback_fields, ..
+        } = tree
+        else {
+            panic!("expected a switch");
+        };
+        assert_eq!(fallback_fields.len(), 2);
+
+        // `let assert` carries its failure metadata and message.
+        let native_ir::Statement::Destructure {
+            on_failure: Some(failure),
+            ..
+        } = &body[1]
+        else {
+            panic!("expected a fallible destructure, got {:?}", body[1]);
+        };
+        assert_eq!(
+            failure.message.as_deref(),
+            Some(&native_ir::Expression::String("always fine".into()))
+        );
+        assert_eq!(failure.function, "main");
+        assert_eq!(failure.line, 3);
     }
 
     #[test]

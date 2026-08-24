@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 18;
+pub const FORMAT_VERSION: u32 = 19;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -47,8 +47,29 @@ pub enum Function {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Statement {
-    Let { name: String, value: Expression },
+    Let {
+        name: String,
+        value: Expression,
+    },
+    /// A `let` with a non-trivial pattern, or a `let assert`. The subject is
+    /// bound as decision variable `subject_id` and the tree's bindings
+    /// persist in the enclosing scope. `Fail` panics with `on_failure` for
+    /// `let assert`, and is unreachable (a trap) for irrefutable `let`.
+    Destructure {
+        subject: Expression,
+        subject_id: u32,
+        tree: Decision,
+        on_failure: Option<AssignmentFailure>,
+    },
     Expression(Expression),
+}
+
+/// How a failed `let assert` reports itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssignmentFailure {
+    pub message: Option<Box<Expression>>,
+    pub function: String,
+    pub line: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -158,6 +179,7 @@ pub enum Expression {
 pub enum PanicKind {
     Panic,
     Todo,
+    LetAssert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

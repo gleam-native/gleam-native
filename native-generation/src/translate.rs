@@ -287,6 +287,18 @@ impl<'a, M: Module> Translator<'a, M> {
     }
 }
 
+/// How a decision tree's leaves behave: `case` clause bodies run in their
+/// own scope, while assignment destructuring binds into the enclosing scope
+/// and yields the subject value.
+#[derive(Clone, Copy)]
+enum DecisionMode<'a> {
+    Case,
+    Assignment {
+        result: Value,
+        on_failure: Option<&'a native_ir::AssignmentFailure>,
+    },
+}
+
 struct FunctionTranslator<'a, 'b, M: Module> {
     functions: &'a HashMap<(String, String), FuncId>,
     runtime: RuntimeFunctions,
@@ -297,6 +309,44 @@ struct FunctionTranslator<'a, 'b, M: Module> {
 }
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
+    /// Emits a call to the runtime's report-and-abort function. It never
+    /// actually returns; treating it as an ordinary call keeps the block
+    /// structure simple, and the code after it is simply never reached.
+    fn emit_panic(
+        &mut self,
+        kind: i64,
+        message: Option<&native_ir::Expression>,
+        function: &str,
+        line: u32,
+    ) -> Result<Value, String> {
+        let kind = self.builder.ins().iconst(types::I64, kind);
+        let message = match message {
+            Some(message) => self.expression(message)?,
+            None => self.builder.ins().iconst(types::I64, 0),
+        };
+        let module_name = self.module_name.to_string();
+        let (module_pointer, module_length) = self.constant_bytes(module_name.as_bytes())?;
+        let (function_pointer, function_length) =
+            self.constant_bytes(function.to_string().as_bytes())?;
+        let line = self.builder.ins().iconst(types::I64, line as i64);
+        let panic_ref = self
+            .module
+            .declare_func_in_func(self.runtime.panic, self.builder.func);
+        let call = self.builder.ins().call(
+            panic_ref,
+            &[
+                kind,
+                message,
+                module_pointer,
+                module_length,
+                function_pointer,
+                function_length,
+                line,
+            ],
+        );
+        Ok(self.builder.inst_results(call)[0])
+    }
+
     /// Embeds bytes as read-only constant data, yielding their address and
     /// length as values.
     fn constant_bytes(&mut self, bytes: &[u8]) -> Result<(Value, Value), String> {
@@ -343,6 +393,31 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     self.builder.def_var(variable, value);
                     let _ = self.environment.insert(name.clone(), variable);
                     value
+                }
+                native_ir::Statement::Destructure {
+                    subject,
+                    subject_id,
+                    tree,
+                    on_failure,
+                } => {
+                    let value = self.expression(subject)?;
+                    let mut variables = HashMap::new();
+                    let _ = variables.insert(*subject_id, value);
+
+                    let join = self.builder.create_block();
+                    self.builder.append_block_param(join, types::I64);
+                    self.decision(
+                        &variables,
+                        tree,
+                        join,
+                        DecisionMode::Assignment {
+                            result: value,
+                            on_failure: on_failure.as_ref(),
+                        },
+                    )?;
+                    self.builder.seal_block(join);
+                    self.builder.switch_to_block(join);
+                    self.builder.block_params(join)[0]
                 }
             });
         }
@@ -445,7 +520,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
-                self.decision(&variables, tree, join)?;
+                self.decision(&variables, tree, join, DecisionMode::Case)?;
                 self.builder.seal_block(join);
 
                 self.builder.switch_to_block(join);
@@ -491,41 +566,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 function,
                 line,
             } => {
-                let kind = self.builder.ins().iconst(
-                    types::I64,
-                    match kind {
-                        native_ir::PanicKind::Panic => 0,
-                        native_ir::PanicKind::Todo => 1,
-                    },
-                );
-                let message = match message {
-                    Some(message) => self.expression(message)?,
-                    None => self.builder.ins().iconst(types::I64, 0),
+                let kind = match kind {
+                    native_ir::PanicKind::Panic => 0,
+                    native_ir::PanicKind::Todo => 1,
+                    native_ir::PanicKind::LetAssert => 2,
                 };
-                let module_name = self.module_name.to_string();
-                let (module_pointer, module_length) =
-                    self.constant_bytes(module_name.as_bytes())?;
-                let function_name = function.clone();
-                let (function_pointer, function_length) =
-                    self.constant_bytes(function_name.as_bytes())?;
-                let line = self.builder.ins().iconst(types::I64, *line as i64);
-                let panic_ref = self.module.declare_func_in_func(self.runtime.panic, self.builder.func);
-                // The runtime aborts the program and never actually returns;
-                // treating this as an ordinary call keeps the block structure
-                // simple, and the code after it is simply never reached.
-                let call = self.builder.ins().call(
-                    panic_ref,
-                    &[
-                        kind,
-                        message,
-                        module_pointer,
-                        module_length,
-                        function_pointer,
-                        function_length,
-                        line,
-                    ],
-                );
-                Ok(self.builder.inst_results(call)[0])
+                let function = function.clone();
+                self.emit_panic(kind, message.as_deref(), &function, *line)
             }
 
             native_ir::Expression::IntBinary {
@@ -716,12 +763,17 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         variables: &HashMap<u32, Value>,
         tree: &native_ir::Decision,
         join: Block,
+        mode: DecisionMode<'_>,
     ) -> Result<(), String> {
         match tree {
             native_ir::Decision::Run { bindings, body } => {
-                // Clause bindings must not leak past this clause: another
-                // clause or the surrounding code may use the same names.
-                let saved_environment = self.environment.clone();
+                // In a case expression, clause bindings must not leak past
+                // this clause. In an assignment they are the whole point and
+                // persist in the enclosing scope.
+                let saved_environment = match mode {
+                    DecisionMode::Case => Some(self.environment.clone()),
+                    DecisionMode::Assignment { .. } => None,
+                };
                 for (name, bound) in bindings {
                     let value = match bound {
                         native_ir::Bound::Variable(id) => *variables
@@ -733,20 +785,41 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     self.builder.def_var(variable, value);
                     let _ = self.environment.insert(name.clone(), variable);
                 }
-                let result = self.statements(body)?;
+                let result = match mode {
+                    DecisionMode::Case => self.statements(body)?,
+                    DecisionMode::Assignment { result, .. } => result,
+                };
                 self.builder.ins().jump(join, &[result.into()]);
-                self.environment = saved_environment;
+                if let Some(environment) = saved_environment {
+                    self.environment = environment;
+                }
                 Ok(())
             }
 
-            native_ir::Decision::Fail => {
-                // The type system guarantees exhaustiveness; this node is
-                // unreachable at run time.
-                self.builder
-                    .ins()
-                    .trap(TrapCode::user(1).expect("valid trap code"));
-                Ok(())
-            }
+            native_ir::Decision::Fail => match mode {
+                // A failed `let assert` panics with its source location.
+                DecisionMode::Assignment {
+                    on_failure: Some(failure),
+                    ..
+                } => {
+                    let result = self.emit_panic(
+                        2,
+                        failure.message.as_deref(),
+                        &failure.function.clone(),
+                        failure.line,
+                    )?;
+                    self.builder.ins().jump(join, &[result.into()]);
+                    Ok(())
+                }
+                // Otherwise the type system guarantees exhaustiveness; this
+                // node is unreachable at run time.
+                _ => {
+                    self.builder
+                        .ins()
+                        .trap(TrapCode::user(1).expect("valid trap code"));
+                    Ok(())
+                }
+            },
 
             native_ir::Decision::Guard {
                 bindings,
@@ -785,7 +858,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.environment = saved_environment;
 
                 self.builder.switch_to_block(false_block);
-                self.decision(variables, if_false, join)
+                self.decision(variables, if_false, join, mode)
             }
 
             native_ir::Decision::Switch {
@@ -840,7 +913,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         _ => vec![],
                     };
                     if extracted.is_empty() {
-                        self.decision(variables, decision, join)?;
+                        self.decision(variables, decision, join, mode)?;
                     } else {
                         let mut extended = variables.clone();
                         for (index, field) in extracted.iter().enumerate() {
@@ -852,14 +925,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             );
                             let _ = extended.insert(*field, value);
                         }
-                        self.decision(&extended, decision, join)?;
+                        self.decision(&extended, decision, join, mode)?;
                     }
                     self.builder.switch_to_block(next_block);
                 }
                 // An exhaustive match's final variant is not tag-tested,
                 // but its fields still become decision variables.
                 if fallback_fields.is_empty() {
-                    self.decision(variables, fallback, join)
+                    self.decision(variables, fallback, join, mode)
                 } else {
                     let mut extended = variables.clone();
                     for (index, field) in fallback_fields.iter().enumerate() {
@@ -871,7 +944,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         );
                         let _ = extended.insert(*field, value);
                     }
-                    self.decision(&extended, fallback, join)
+                    self.decision(&extended, fallback, join, mode)
                 }
             }
         }

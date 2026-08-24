@@ -69,8 +69,10 @@ platform C convention.
 
 - ✅ `let` with a variable pattern
 - ✅ Blocks
-- ❌ `let` with arbitrary patterns (tuple destructuring etc.)
-- ❌ `let assert` (pattern match or panic, with optional `as` message)
+- ✅ `let` with arbitrary irrefutable patterns (tuple, single-variant
+  constructor destructuring); bindings persist in the enclosing scope
+- ✅ `let assert` (pattern match or panic with the optional `as` message,
+  module/function/line metadata, exit code 1)
 - 🚧 `case` expressions — lowered from the `CompiledCase` decision tree as
   planned. Working: multi-subject matches, literal checks (small and big
   integers, floats, strings), `Bool`/`Nil` variant checks (with the
