@@ -15,10 +15,13 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
 /// The symbol of the runtime's integer addition slow path.
 pub const INT_ADD_SLOW: &str = "gleam_native_int_add_slow";
+
+/// The symbol of the runtime's big integer literal constructor.
+pub const BIGINT_FROM_BYTES: &str = "gleam_native_bigint_from_bytes";
 
 /// The symbol of the generated C-convention wrapper around `main`.
 pub const ENTRY_SYMBOL: &str = "gleam_native_main_wrapper";
@@ -52,6 +55,7 @@ pub struct Translator<'a, M: Module> {
     /// Gleam (module, function) to declared Cranelift function.
     functions: HashMap<(String, String), FuncId>,
     int_add_slow: FuncId,
+    bigint_from_bytes: FuncId,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -60,10 +64,18 @@ impl<'a, M: Module> Translator<'a, M> {
         let int_add_slow = module
             .declare_function(INT_ADD_SLOW, Linkage::Import, &c_signature(call_conv, 2))
             .map_err(|error| error.to_string())?;
+        let bigint_from_bytes = module
+            .declare_function(
+                BIGINT_FROM_BYTES,
+                Linkage::Import,
+                &c_signature(call_conv, 2),
+            )
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             module,
             functions: HashMap::new(),
             int_add_slow,
+            bigint_from_bytes,
         })
     }
 
@@ -162,6 +174,7 @@ impl<'a, M: Module> Translator<'a, M> {
         let mut function_translator = FunctionTranslator {
             functions: &self.functions,
             int_add_slow: self.int_add_slow,
+            bigint_from_bytes: self.bigint_from_bytes,
             module: self.module,
             builder: &mut builder,
             environment,
@@ -211,6 +224,7 @@ impl<'a, M: Module> Translator<'a, M> {
 struct FunctionTranslator<'a, 'b, M: Module> {
     functions: &'a HashMap<(String, String), FuncId>,
     int_add_slow: FuncId,
+    bigint_from_bytes: FuncId,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
     environment: HashMap<String, Variable>,
@@ -244,6 +258,28 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 .builder
                 .ins()
                 .iconst(types::I64, (value << 1) | 1)),
+
+            native_ir::Expression::BigInt(bytes) => {
+                let data = self
+                    .module
+                    .declare_anonymous_data(false, false)
+                    .map_err(|error| error.to_string())?;
+                let mut description = DataDescription::new();
+                description.define(bytes.clone().into_boxed_slice());
+                self.module
+                    .define_data(data, &description)
+                    .map_err(|error| error.to_string())?;
+
+                let pointer_type = self.module.target_config().pointer_type();
+                let data_ref = self.module.declare_data_in_func(data, self.builder.func);
+                let pointer = self.builder.ins().symbol_value(pointer_type, data_ref);
+                let length = self.builder.ins().iconst(types::I64, bytes.len() as i64);
+                let from_bytes_ref = self
+                    .module
+                    .declare_func_in_func(self.bigint_from_bytes, self.builder.func);
+                let call = self.builder.ins().call(from_bytes_ref, &[pointer, length]);
+                Ok(self.builder.inst_results(call)[0])
+            }
 
             native_ir::Expression::Nil => Ok(self.builder.ins().iconst(types::I64, NIL)),
 

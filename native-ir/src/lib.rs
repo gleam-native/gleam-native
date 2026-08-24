@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -55,6 +55,9 @@ pub enum Statement {
 pub enum Expression {
     /// An integer literal small enough to be stored as a tagged immediate.
     Int(i64),
+    /// An integer literal too large for a tagged immediate: the value as
+    /// signed little-endian bytes, built into a heap big integer at run time.
+    BigInt(Vec<u8>),
     Nil,
     Variable(String),
     Block(Vec<Statement>),
@@ -74,11 +77,16 @@ pub fn encode(module: &Module) -> Result<Vec<u8>, bitcode::Error> {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Module, String> {
-    let artifact: Artifact =
-        bitcode::deserialize(bytes).map_err(|error| format!("corrupt native artifact: {error}"))?;
+    let artifact: Artifact = bitcode::deserialize(bytes).map_err(|error| {
+        format!(
+            "corrupt or outdated native artifact ({error}). \
+Delete the project's `build` directory and rebuild."
+        )
+    })?;
     if artifact.version != FORMAT_VERSION {
         return Err(format!(
-            "native artifact format version {} does not match compiler version {}",
+            "native artifact format version {} does not match compiler version {}. \
+Delete the project's `build` directory and rebuild.",
             artifact.version, FORMAT_VERSION
         ));
     }

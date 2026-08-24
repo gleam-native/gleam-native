@@ -49,6 +49,19 @@ pub extern "C" fn gleam_native_int_add_slow(left: u64, right: u64) -> u64 {
     retag(untag(left) + untag(right))
 }
 
+/// Builds a big integer value from a signed little-endian byte string stored
+/// in the compiled program's data section, for integer literals too large to
+/// be tagged immediates.
+///
+/// # Safety
+///
+/// `bytes` must point to `length` readable bytes. Generated code always
+/// passes a pointer into its own constant data.
+pub unsafe extern "C" fn gleam_native_bigint_from_bytes(bytes: *const u8, length: u64) -> u64 {
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
+    retag(BigInt::from_signed_bytes_le(bytes))
+}
+
 /// Prints an integer followed by a newline. The standin for a real printing
 /// external until strings exist on the native target.
 pub extern "C" fn print_int(value: u64) -> u64 {
@@ -63,6 +76,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_int_add_slow",
             gleam_native_int_add_slow as *const u8,
         ),
+        (
+            "gleam_native_bigint_from_bytes",
+            gleam_native_bigint_from_bytes as *const u8,
+        ),
         ("print_int", print_int as *const u8),
     ]
 }
@@ -74,6 +91,22 @@ mod tests {
     #[test]
     fn small_int_addition() {
         let result = gleam_native_int_add_slow(tag_small_int(20), tag_small_int(22));
+        assert_eq!(result, tag_small_int(42));
+    }
+
+    #[test]
+    fn big_integer_from_bytes() {
+        let value: BigInt = BigInt::from(i64::MAX) * 3 - BigInt::from(7);
+        let bytes = value.to_signed_bytes_le();
+        let result = unsafe { gleam_native_bigint_from_bytes(bytes.as_ptr(), bytes.len() as u64) };
+        assert_eq!(result & 1, 0);
+        assert_eq!(untag(result), value);
+    }
+
+    #[test]
+    fn small_integer_from_bytes_is_tagged() {
+        let bytes = BigInt::from(42).to_signed_bytes_le();
+        let result = unsafe { gleam_native_bigint_from_bytes(bytes.as_ptr(), bytes.len() as u64) };
         assert_eq!(result, tag_small_int(42));
     }
 

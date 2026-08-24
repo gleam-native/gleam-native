@@ -135,4 +135,25 @@ mod tests {
 
         crate::jit::run(&[dependency, root], "app").unwrap();
     }
+
+    /// A big integer literal flows from the data section through the runtime
+    /// constructor and the addition slow path.
+    #[test]
+    fn jit_runs_big_integer_literals() {
+        let module = native_ir::Module {
+            name: "app".into(),
+            functions: vec![native_ir::Function::Defined {
+                name: "main".into(),
+                parameters: vec![],
+                body: vec![native_ir::Statement::Expression(
+                    native_ir::Expression::IntAdd(
+                        // 2^70, as signed little-endian bytes.
+                        Box::new(native_ir::Expression::BigInt(vec![0, 0, 0, 0, 0, 0, 0, 0, 64])),
+                        Box::new(native_ir::Expression::Int(1)),
+                    ),
+                )],
+            }],
+        };
+        crate::jit::run(&[module], "app").unwrap();
+    }
 }

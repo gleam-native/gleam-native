@@ -115,11 +115,15 @@ impl Lowerer {
     fn expression(&self, expression: &TypedExpr) -> Result<native_ir::Expression, Error> {
         match expression {
             TypedExpr::Int { int_value, .. } => {
-                let value = int_value
+                match int_value
                     .to_i64()
                     .filter(|value| ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(value))
-                    .ok_or_else(|| self.unsupported("big integer literals"))?;
-                Ok(native_ir::Expression::Int(value))
+                {
+                    Some(value) => Ok(native_ir::Expression::Int(value)),
+                    None => Ok(native_ir::Expression::BigInt(
+                        int_value.to_signed_bytes_le(),
+                    )),
+                }
             }
 
             TypedExpr::Block { statements, .. } => Ok(native_ir::Expression::Block(
@@ -184,5 +188,56 @@ impl Lowerer {
 
             _ => Err(self.unsupported("this kind of expression")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use num_bigint::BigInt;
+
+    use crate::{analyse::TargetSupport, build::Target, type_::tests::compile_module_with_opts};
+
+    fn lower(src: &str) -> native_ir::Module {
+        let module = compile_module_with_opts(
+            "test_module",
+            src,
+            None,
+            vec![],
+            Target::Native,
+            TargetSupport::NotEnforced,
+            None,
+        )
+        .expect("should compile");
+        super::module(&module).expect("should lower")
+    }
+
+    #[test]
+    fn integer_literals() {
+        let module = lower(
+            "pub fn main() {
+  let small = 42
+  let big = 9223372036854775808
+  0
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "small".into(),
+                value: native_ir::Expression::Int(42),
+            }
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Let {
+                name: "big".into(),
+                value: native_ir::Expression::BigInt(
+                    BigInt::from(9223372036854775808_u64).to_signed_bytes_le(),
+                ),
+            }
+        );
     }
 }
