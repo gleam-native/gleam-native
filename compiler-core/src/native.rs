@@ -221,6 +221,22 @@ impl Lowerer<'_> {
                 right: Box::new(self.expression(right)?),
             }),
             TypedExpr::BinOp {
+                operator:
+                    operator @ (BinOp::LtInt | BinOp::LtEqInt | BinOp::GtInt | BinOp::GtEqInt),
+                left,
+                right,
+                ..
+            } => Ok(native_ir::Expression::IntCompare {
+                operator: match operator {
+                    BinOp::LtInt => native_ir::CompareOperator::LessThan,
+                    BinOp::LtEqInt => native_ir::CompareOperator::LessThanOrEqual,
+                    BinOp::GtInt => native_ir::CompareOperator::GreaterThan,
+                    _ => native_ir::CompareOperator::GreaterThanOrEqual,
+                },
+                left: Box::new(self.expression(left)?),
+                right: Box::new(self.expression(right)?),
+            }),
+            TypedExpr::BinOp {
                 operator: BinOp::Concatenate,
                 left,
                 right,
@@ -422,6 +438,35 @@ mod tests {
                 operator: native_ir::IntOperator::Remainder,
                 left: Box::new(native_ir::Expression::Int(85)),
                 right: Box::new(native_ir::Expression::Int(43)),
+            })
+        );
+    }
+
+    #[test]
+    fn integer_comparison_operators() {
+        let module = lower(
+            "pub fn main() {
+  1 < 2
+  3 >= 4
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Expression(native_ir::Expression::IntCompare {
+                operator: native_ir::CompareOperator::LessThan,
+                left: Box::new(native_ir::Expression::Int(1)),
+                right: Box::new(native_ir::Expression::Int(2)),
+            })
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Expression(native_ir::Expression::IntCompare {
+                operator: native_ir::CompareOperator::GreaterThanOrEqual,
+                left: Box::new(native_ir::Expression::Int(3)),
+                right: Box::new(native_ir::Expression::Int(4)),
             })
         );
     }

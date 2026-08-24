@@ -49,8 +49,9 @@ platform C convention.
   integers)
 - ✅ `/`, `%` on `Int` (runtime calls; truncating, division by zero returns
   zero, remainder takes the dividend's sign)
-- ❌ Comparison operators on `Int` (`<`, `<=`, `>`, `>=`) including big
-  integer operands
+- ✅ Comparison operators on `Int` (`<`, `<=`, `>`, `>=`): tagged words
+  compare directly on the fast path; big integer operands go through the
+  runtime's three-way comparison
 - ❌ Float arithmetic and comparison (`+.`, `-.`, `*.`, `/.`, `<.`, …)
 - ❌ `==` / `!=` structural equality for every type (deep runtime equality,
   the same semantics as Erlang `=:=` on Gleam data / `isEqual` in the JS

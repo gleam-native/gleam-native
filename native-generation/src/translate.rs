@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -27,6 +28,10 @@ pub const INT_MUL_SLOW: &str = "gleam_native_int_mul_slow";
 /// live entirely in the runtime.
 pub const INT_DIV: &str = "gleam_native_int_div";
 pub const INT_REM: &str = "gleam_native_int_rem";
+
+/// The symbol of the runtime's three-way integer comparison, used when
+/// either operand is a big integer.
+pub const INT_COMPARE: &str = "gleam_native_int_compare";
 
 /// The symbol of the runtime's big integer literal constructor.
 pub const BIGINT_FROM_BYTES: &str = "gleam_native_bigint_from_bytes";
@@ -78,6 +83,7 @@ struct RuntimeFunctions {
     int_mul_slow: FuncId,
     int_div: FuncId,
     int_rem: FuncId,
+    int_compare: FuncId,
     bigint_from_bytes: FuncId,
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
@@ -99,6 +105,7 @@ impl RuntimeFunctions {
             int_mul_slow: declare(INT_MUL_SLOW, 2)?,
             int_div: declare(INT_DIV, 2)?,
             int_rem: declare(INT_REM, 2)?,
+            int_compare: declare(INT_COMPARE, 2)?,
             bigint_from_bytes: declare(BIGINT_FROM_BYTES, 2)?,
             float_from_bits: declare(FLOAT_FROM_BITS, 1)?,
             string_from_bytes: declare(STRING_FROM_BYTES, 2)?,
@@ -459,7 +466,75 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let right = self.expression(right)?;
                 self.int_binary(*operator, left, right)
             }
+
+            native_ir::Expression::IntCompare {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.expression(left)?;
+                let right = self.expression(right)?;
+                self.int_compare(*operator, left, right)
+            }
         }
+    }
+
+    /// Turns an i8 comparison flag into a tagged boolean (1 or 3).
+    fn tag_boolean_flag(&mut self, flag: Value) -> Value {
+        let extended = self.builder.ins().uextend(types::I64, flag);
+        let shifted = self.builder.ins().ishl_imm_u(extended, 1);
+        self.builder.ins().bor_imm_u(shifted, 1)
+    }
+
+    /// Integer ordering comparison on tagged values. For two small integers
+    /// the tagged words compare exactly like the values they encode
+    /// (2x + 1 < 2y + 1 iff x < y), so the fast path is a single signed
+    /// comparison. Otherwise the runtime's three-way comparison returns a
+    /// tagged -1/0/1, which the same condition then compares against a
+    /// tagged 0.
+    fn int_compare(
+        &mut self,
+        operator: native_ir::CompareOperator,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, String> {
+        let condition = match operator {
+            native_ir::CompareOperator::LessThan => IntCC::SignedLessThan,
+            native_ir::CompareOperator::LessThanOrEqual => IntCC::SignedLessThanOrEqual,
+            native_ir::CompareOperator::GreaterThan => IntCC::SignedGreaterThan,
+            native_ir::CompareOperator::GreaterThanOrEqual => IntCC::SignedGreaterThanOrEqual,
+        };
+
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        let both = self.builder.ins().band(left, right);
+        let both_small = self.builder.ins().band_imm_u(both, 1);
+        self.builder.ins().brif(both_small, fast, &[], slow, &[]);
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+
+        self.builder.switch_to_block(fast);
+        let flag = self.builder.ins().icmp(condition, left, right);
+        let result = self.tag_boolean_flag(flag);
+        self.builder.ins().jump(join, &[result.into()]);
+
+        self.builder.switch_to_block(slow);
+        let compare_ref = self
+            .module
+            .declare_func_in_func(self.runtime.int_compare, self.builder.func);
+        let call = self.builder.ins().call(compare_ref, &[left, right]);
+        let ordering = self.builder.inst_results(call)[0];
+        let tagged_zero = self.builder.ins().iconst(types::I64, 1);
+        let flag = self.builder.ins().icmp(condition, ordering, tagged_zero);
+        let result = self.tag_boolean_flag(flag);
+        self.builder.ins().jump(join, &[result.into()]);
+        self.builder.seal_block(join);
+
+        self.builder.switch_to_block(join);
+        Ok(self.builder.block_params(join)[0])
     }
 
     /// Integer arithmetic on tagged values: a fast path for two small

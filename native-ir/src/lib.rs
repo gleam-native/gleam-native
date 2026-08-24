@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -80,6 +80,12 @@ pub enum Expression {
         left: Box<Expression>,
         right: Box<Expression>,
     },
+    /// Integer ordering comparison, yielding a boolean.
+    IntCompare {
+        operator: CompareOperator,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
     StringConcat(Box<Expression>, Box<Expression>),
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
@@ -96,6 +102,14 @@ pub enum Expression {
 pub enum PanicKind {
     Panic,
     Todo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CompareOperator {
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

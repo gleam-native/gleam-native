@@ -68,6 +68,16 @@ pub extern "C" fn gleam_native_int_mul_slow(left: u64, right: u64) -> u64 {
     retag(untag(left) * untag(right))
 }
 
+/// Three-way integer comparison for when either operand is a big integer:
+/// returns the tagged small integer -1, 0, or 1.
+pub extern "C" fn gleam_native_int_compare(left: u64, right: u64) -> u64 {
+    tag_small_int(match untag(left).cmp(&untag(right)) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })
+}
+
 /// Truncating integer division. Division by zero yields zero, following
 /// Gleam's semantics on every target.
 pub extern "C" fn gleam_native_int_div(left: u64, right: u64) -> u64 {
@@ -240,6 +250,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_int_mul_slow",
             gleam_native_int_mul_slow as *const u8,
         ),
+        (
+            "gleam_native_int_compare",
+            gleam_native_int_compare as *const u8,
+        ),
         ("gleam_native_int_div", gleam_native_int_div as *const u8),
         ("gleam_native_int_rem", gleam_native_int_rem as *const u8),
         (
@@ -332,6 +346,22 @@ mod tests {
             gleam_native_int_mul_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(2));
         assert_eq!(overflowed & 1, 0);
         assert_eq!(untag(overflowed), BigInt::from(SMALL_INT_MAX) * 2);
+    }
+
+    #[test]
+    fn integer_comparison() {
+        let compare = |a: u64, b: u64| gleam_native_int_compare(a, b);
+        assert_eq!(
+            compare(tag_small_int(1), tag_small_int(2)),
+            tag_small_int(-1)
+        );
+        assert_eq!(
+            compare(tag_small_int(2), tag_small_int(2)),
+            tag_small_int(0)
+        );
+        let big = gleam_native_int_add_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(1));
+        assert_eq!(compare(big, tag_small_int(5)), tag_small_int(1));
+        assert_eq!(compare(tag_small_int(-5), big), tag_small_int(-1));
     }
 
     #[test]
