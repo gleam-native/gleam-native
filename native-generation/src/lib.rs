@@ -92,10 +92,11 @@ mod tests {
                     name: "add".into(),
                     parameters: vec!["x".into(), "y".into()],
                     body: vec![native_ir::Statement::Expression(
-                        native_ir::Expression::IntAdd(
-                            Box::new(native_ir::Expression::Variable("x".into())),
-                            Box::new(native_ir::Expression::Variable("y".into())),
-                        ),
+                        native_ir::Expression::IntBinary {
+                            operator: native_ir::IntOperator::Add,
+                            left: Box::new(native_ir::Expression::Variable("x".into())),
+                            right: Box::new(native_ir::Expression::Variable("y".into())),
+                        },
                     )],
                 },
             ],
@@ -119,10 +120,11 @@ mod tests {
                     },
                     native_ir::Statement::Let {
                         name: "huge".into(),
-                        value: native_ir::Expression::IntAdd(
-                            Box::new(native_ir::Expression::Int(i64::MAX >> 1)),
-                            Box::new(native_ir::Expression::Variable("total".into())),
-                        ),
+                        value: native_ir::Expression::IntBinary {
+                            operator: native_ir::IntOperator::Add,
+                            left: Box::new(native_ir::Expression::Int(i64::MAX >> 1)),
+                            right: Box::new(native_ir::Expression::Variable("total".into())),
+                        },
                     },
                     native_ir::Statement::Expression(native_ir::Expression::Call {
                         module: "wibble/wobble".into(),
@@ -146,11 +148,14 @@ mod tests {
                 name: "main".into(),
                 parameters: vec![],
                 body: vec![native_ir::Statement::Expression(
-                    native_ir::Expression::IntAdd(
+                    native_ir::Expression::IntBinary {
+                        operator: native_ir::IntOperator::Add,
                         // 2^70, as signed little-endian bytes.
-                        Box::new(native_ir::Expression::BigInt(vec![0, 0, 0, 0, 0, 0, 0, 0, 64])),
-                        Box::new(native_ir::Expression::Int(1)),
-                    ),
+                        left: Box::new(native_ir::Expression::BigInt(vec![
+                            0, 0, 0, 0, 0, 0, 0, 0, 64,
+                        ])),
+                        right: Box::new(native_ir::Expression::Int(1)),
+                    },
                 )],
             }],
         };

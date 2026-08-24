@@ -57,6 +57,17 @@ pub extern "C" fn gleam_native_int_add_slow(left: u64, right: u64) -> u64 {
     retag(untag(left) + untag(right))
 }
 
+/// The slow path for integer subtraction; see [`gleam_native_int_add_slow`].
+pub extern "C" fn gleam_native_int_sub_slow(left: u64, right: u64) -> u64 {
+    retag(untag(left) - untag(right))
+}
+
+/// The slow path for integer multiplication; see
+/// [`gleam_native_int_add_slow`].
+pub extern "C" fn gleam_native_int_mul_slow(left: u64, right: u64) -> u64 {
+    retag(untag(left) * untag(right))
+}
+
 /// Builds a big integer value from a signed little-endian byte string stored
 /// in the compiled program's data section, for integer literals too large to
 /// be tagged immediates.
@@ -202,6 +213,14 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_int_add_slow as *const u8,
         ),
         (
+            "gleam_native_int_sub_slow",
+            gleam_native_int_sub_slow as *const u8,
+        ),
+        (
+            "gleam_native_int_mul_slow",
+            gleam_native_int_mul_slow as *const u8,
+        ),
+        (
             "gleam_native_bigint_from_bytes",
             gleam_native_bigint_from_bytes as *const u8,
         ),
@@ -275,6 +294,22 @@ mod tests {
         };
         let result = unsafe { gleam_native_string_concat(make("Hello, "), make("🌍!")) };
         assert_eq!(unsafe { &*(result as *const String) }, "Hello, 🌍!");
+    }
+
+    #[test]
+    fn subtraction_and_multiplication() {
+        assert_eq!(
+            gleam_native_int_sub_slow(tag_small_int(40), tag_small_int(-2)),
+            tag_small_int(42)
+        );
+        assert_eq!(
+            gleam_native_int_mul_slow(tag_small_int(6), tag_small_int(7)),
+            tag_small_int(42)
+        );
+        let overflowed =
+            gleam_native_int_mul_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(2));
+        assert_eq!(overflowed & 1, 0);
+        assert_eq!(untag(overflowed), BigInt::from(SMALL_INT_MAX) * 2);
     }
 
     #[test]

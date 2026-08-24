@@ -45,8 +45,8 @@ platform C convention.
 
 ## Operators
 
-- ✅ `+` on `Int` (fast path plus overflow promotion to big integers)
-- ❌ `-`, `*` on `Int` (same fast/slow shape as `+`)
+- ✅ `+`, `-`, `*` on `Int` (fast path plus overflow promotion to big
+  integers)
 - ❌ `/`, `%` on `Int` (runtime calls; division by zero returns zero)
 - ❌ Comparison operators on `Int` (`<`, `<=`, `>`, `>=`) including big
   integer operands

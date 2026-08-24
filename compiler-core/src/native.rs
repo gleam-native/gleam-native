@@ -200,14 +200,19 @@ impl Lowerer<'_> {
             }
 
             TypedExpr::BinOp {
-                operator: BinOp::AddInt,
+                operator: operator @ (BinOp::AddInt | BinOp::SubInt | BinOp::MultInt),
                 left,
                 right,
                 ..
-            } => Ok(native_ir::Expression::IntAdd(
-                Box::new(self.expression(left)?),
-                Box::new(self.expression(right)?),
-            )),
+            } => Ok(native_ir::Expression::IntBinary {
+                operator: match operator {
+                    BinOp::AddInt => native_ir::IntOperator::Add,
+                    BinOp::SubInt => native_ir::IntOperator::Subtract,
+                    _ => native_ir::IntOperator::Multiply,
+                },
+                left: Box::new(self.expression(left)?),
+                right: Box::new(self.expression(right)?),
+            }),
             TypedExpr::BinOp {
                 operator: BinOp::Concatenate,
                 left,
@@ -369,6 +374,30 @@ mod tests {
                     Box::new(native_ir::Expression::String("world!".into())),
                 ),
             }
+        );
+    }
+
+    #[test]
+    fn integer_arithmetic_operators() {
+        let module = lower(
+            "pub fn main() {
+  40 - 2 * 3
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+                operator: native_ir::IntOperator::Subtract,
+                left: Box::new(native_ir::Expression::Int(40)),
+                right: Box::new(native_ir::Expression::IntBinary {
+                    operator: native_ir::IntOperator::Multiply,
+                    left: Box::new(native_ir::Expression::Int(2)),
+                    right: Box::new(native_ir::Expression::Int(3)),
+                }),
+            })
         );
     }
 

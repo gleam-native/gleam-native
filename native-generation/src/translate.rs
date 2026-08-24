@@ -17,8 +17,10 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
-/// The symbol of the runtime's integer addition slow path.
+/// The symbols of the runtime's integer arithmetic slow paths.
 pub const INT_ADD_SLOW: &str = "gleam_native_int_add_slow";
+pub const INT_SUB_SLOW: &str = "gleam_native_int_sub_slow";
+pub const INT_MUL_SLOW: &str = "gleam_native_int_mul_slow";
 
 /// The symbol of the runtime's big integer literal constructor.
 pub const BIGINT_FROM_BYTES: &str = "gleam_native_bigint_from_bytes";
@@ -62,11 +64,12 @@ fn c_signature(call_conv: CallConv, arity: usize) -> Signature {
     signature
 }
 
-pub struct Translator<'a, M: Module> {
-    module: &'a mut M,
-    /// Gleam (module, function) to declared Cranelift function.
-    functions: HashMap<(String, String), FuncId>,
+/// The declared imports for the runtime functions generated code calls.
+#[derive(Clone, Copy)]
+struct RuntimeFunctions {
     int_add_slow: FuncId,
+    int_sub_slow: FuncId,
+    int_mul_slow: FuncId,
     bigint_from_bytes: FuncId,
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
@@ -74,44 +77,41 @@ pub struct Translator<'a, M: Module> {
     panic: FuncId,
 }
 
+impl RuntimeFunctions {
+    fn declare(module: &mut impl Module) -> Result<Self, String> {
+        let call_conv = module.isa().default_call_conv();
+        let mut declare = |symbol: &str, arity: usize| {
+            module
+                .declare_function(symbol, Linkage::Import, &c_signature(call_conv, arity))
+                .map_err(|error| error.to_string())
+        };
+        Ok(Self {
+            int_add_slow: declare(INT_ADD_SLOW, 2)?,
+            int_sub_slow: declare(INT_SUB_SLOW, 2)?,
+            int_mul_slow: declare(INT_MUL_SLOW, 2)?,
+            bigint_from_bytes: declare(BIGINT_FROM_BYTES, 2)?,
+            float_from_bits: declare(FLOAT_FROM_BITS, 1)?,
+            string_from_bytes: declare(STRING_FROM_BYTES, 2)?,
+            string_concat: declare(STRING_CONCAT, 2)?,
+            panic: declare(PANIC, 7)?,
+        })
+    }
+}
+
+pub struct Translator<'a, M: Module> {
+    module: &'a mut M,
+    /// Gleam (module, function) to declared Cranelift function.
+    functions: HashMap<(String, String), FuncId>,
+    runtime: RuntimeFunctions,
+}
+
 impl<'a, M: Module> Translator<'a, M> {
     pub fn new(module: &'a mut M) -> Result<Self, String> {
-        let call_conv = module.isa().default_call_conv();
-        let int_add_slow = module
-            .declare_function(INT_ADD_SLOW, Linkage::Import, &c_signature(call_conv, 2))
-            .map_err(|error| error.to_string())?;
-        let bigint_from_bytes = module
-            .declare_function(
-                BIGINT_FROM_BYTES,
-                Linkage::Import,
-                &c_signature(call_conv, 2),
-            )
-            .map_err(|error| error.to_string())?;
-        let float_from_bits = module
-            .declare_function(FLOAT_FROM_BITS, Linkage::Import, &c_signature(call_conv, 1))
-            .map_err(|error| error.to_string())?;
-        let string_from_bytes = module
-            .declare_function(
-                STRING_FROM_BYTES,
-                Linkage::Import,
-                &c_signature(call_conv, 2),
-            )
-            .map_err(|error| error.to_string())?;
-        let string_concat = module
-            .declare_function(STRING_CONCAT, Linkage::Import, &c_signature(call_conv, 2))
-            .map_err(|error| error.to_string())?;
-        let panic = module
-            .declare_function(PANIC, Linkage::Import, &c_signature(call_conv, 7))
-            .map_err(|error| error.to_string())?;
+        let runtime = RuntimeFunctions::declare(module)?;
         Ok(Self {
             module,
             functions: HashMap::new(),
-            int_add_slow,
-            bigint_from_bytes,
-            float_from_bits,
-            string_from_bytes,
-            string_concat,
-            panic,
+            runtime,
         })
     }
 
@@ -210,12 +210,7 @@ impl<'a, M: Module> Translator<'a, M> {
 
         let mut function_translator = FunctionTranslator {
             functions: &self.functions,
-            int_add_slow: self.int_add_slow,
-            bigint_from_bytes: self.bigint_from_bytes,
-            float_from_bits: self.float_from_bits,
-            string_from_bytes: self.string_from_bytes,
-            string_concat: self.string_concat,
-            panic: self.panic,
+            runtime: self.runtime,
             module_name,
             module: self.module,
             builder: &mut builder,
@@ -265,12 +260,7 @@ impl<'a, M: Module> Translator<'a, M> {
 
 struct FunctionTranslator<'a, 'b, M: Module> {
     functions: &'a HashMap<(String, String), FuncId>,
-    int_add_slow: FuncId,
-    bigint_from_bytes: FuncId,
-    float_from_bits: FuncId,
-    string_from_bytes: FuncId,
-    string_concat: FuncId,
-    panic: FuncId,
+    runtime: RuntimeFunctions,
     module_name: &'a str,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
@@ -341,11 +331,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 .iconst(types::I64, (value << 1) | 1)),
 
             native_ir::Expression::BigInt(bytes) => {
-                self.construct_from_constant_bytes(bytes, self.bigint_from_bytes)
+                self.construct_from_constant_bytes(bytes, self.runtime.bigint_from_bytes)
             }
 
             native_ir::Expression::String(string) => {
-                self.construct_from_constant_bytes(string.as_bytes(), self.string_from_bytes)
+                self.construct_from_constant_bytes(string.as_bytes(), self.runtime.string_from_bytes)
             }
 
             native_ir::Expression::Float(value) => {
@@ -355,7 +345,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .iconst(types::I64, value.to_bits() as i64);
                 let from_bits_ref = self
                     .module
-                    .declare_func_in_func(self.float_from_bits, self.builder.func);
+                    .declare_func_in_func(self.runtime.float_from_bits, self.builder.func);
                 let call = self.builder.ins().call(from_bits_ref, &[bits]);
                 Ok(self.builder.inst_results(call)[0])
             }
@@ -402,7 +392,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let right = self.expression(right)?;
                 let concat_ref = self
                     .module
-                    .declare_func_in_func(self.string_concat, self.builder.func);
+                    .declare_func_in_func(self.runtime.string_concat, self.builder.func);
                 let call = self.builder.ins().call(concat_ref, &[left, right]);
                 Ok(self.builder.inst_results(call)[0])
             }
@@ -431,7 +421,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let (function_pointer, function_length) =
                     self.constant_bytes(function_name.as_bytes())?;
                 let line = self.builder.ins().iconst(types::I64, *line as i64);
-                let panic_ref = self.module.declare_func_in_func(self.panic, self.builder.func);
+                let panic_ref = self.module.declare_func_in_func(self.runtime.panic, self.builder.func);
                 // The runtime aborts the program and never actually returns;
                 // treating this as an ordinary call keeps the block structure
                 // simple, and the code after it is simply never reached.
@@ -450,48 +440,88 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 Ok(self.builder.inst_results(call)[0])
             }
 
-            native_ir::Expression::IntAdd(left, right) => {
+            native_ir::Expression::IntBinary {
+                operator,
+                left,
+                right,
+            } => {
                 let left = self.expression(left)?;
                 let right = self.expression(right)?;
-
-                let fast = self.builder.create_block();
-                let slow = self.builder.create_block();
-                let join = self.builder.create_block();
-                self.builder.append_block_param(join, types::I64);
-
-                // Take the fast path only when both operands have their small
-                // integer tag bit set.
-                let both = self.builder.ins().band(left, right);
-                let both_small = self.builder.ins().band_imm_u(both, 1);
-                self.builder
-                    .ins()
-                    .brif(both_small, fast, &[], slow, &[]);
-                self.builder.seal_block(fast);
-
-                // (2x + 1) + (2y + 1) - 1 == 2(x + y) + 1, and overflow of
-                // the tagged addition coincides with the mathematical result
-                // leaving the small integer range.
-                self.builder.switch_to_block(fast);
-                let right_untagged = self.builder.ins().iadd_imm_s(right, -1);
-                let (sum, overflowed) =
-                    self.builder.ins().sadd_overflow(left, right_untagged);
-                self.builder
-                    .ins()
-                    .brif(overflowed, slow, &[], join, &[sum.into()]);
-                self.builder.seal_block(slow);
-
-                self.builder.switch_to_block(slow);
-                let slow_ref = self
-                    .module
-                    .declare_func_in_func(self.int_add_slow, self.builder.func);
-                let call = self.builder.ins().call(slow_ref, &[left, right]);
-                let slow_result = self.builder.inst_results(call)[0];
-                self.builder.ins().jump(join, &[slow_result.into()]);
-                self.builder.seal_block(join);
-
-                self.builder.switch_to_block(join);
-                Ok(self.builder.block_params(join)[0])
+                self.int_binary(*operator, left, right)
             }
         }
+    }
+
+    /// Integer arithmetic on tagged values: a fast path for two small
+    /// integers whose result stays small, spilling to the runtime's big
+    /// integer slow path otherwise.
+    fn int_binary(
+        &mut self,
+        operator: native_ir::IntOperator,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, String> {
+        let slow_function = match operator {
+            native_ir::IntOperator::Add => self.runtime.int_add_slow,
+            native_ir::IntOperator::Subtract => self.runtime.int_sub_slow,
+            native_ir::IntOperator::Multiply => self.runtime.int_mul_slow,
+        };
+
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        // Take the fast path only when both operands have their small
+        // integer tag bit set.
+        let both = self.builder.ins().band(left, right);
+        let both_small = self.builder.ins().band_imm_u(both, 1);
+        self.builder.ins().brif(both_small, fast, &[], slow, &[]);
+        self.builder.seal_block(fast);
+
+        // With operands tagged as 2n + 1, each operation below computes the
+        // tagged result directly, and its overflow flag coincides with the
+        // mathematical result leaving the small integer range:
+        //
+        // - add:      (2x + 1) + (2y + 1 - 1)      == 2(x + y) + 1
+        // - subtract: (2x + 1) - (2y + 1 - 1)      == 2(x - y) + 1
+        // - multiply: (2x + 1 - 1) * ((2y + 1)>>1) == 2xy, then + 1
+        //   (the final + 1 cannot overflow: 2xy is even, so it is at most
+        //   i64::MAX - 1 when the multiplication did not overflow)
+        self.builder.switch_to_block(fast);
+        let (result, overflowed) = match operator {
+            native_ir::IntOperator::Add => {
+                let right_even = self.builder.ins().iadd_imm_s(right, -1);
+                self.builder.ins().sadd_overflow(left, right_even)
+            }
+            native_ir::IntOperator::Subtract => {
+                let right_even = self.builder.ins().iadd_imm_s(right, -1);
+                self.builder.ins().ssub_overflow(left, right_even)
+            }
+            native_ir::IntOperator::Multiply => {
+                let left_even = self.builder.ins().iadd_imm_s(left, -1);
+                let right_untagged = self.builder.ins().sshr_imm_u(right, 1);
+                let (product, overflowed) =
+                    self.builder.ins().smul_overflow(left_even, right_untagged);
+                let result = self.builder.ins().iadd_imm_s(product, 1);
+                (result, overflowed)
+            }
+        };
+        self.builder
+            .ins()
+            .brif(overflowed, slow, &[], join, &[result.into()]);
+        self.builder.seal_block(slow);
+
+        self.builder.switch_to_block(slow);
+        let slow_ref = self
+            .module
+            .declare_func_in_func(slow_function, self.builder.func);
+        let call = self.builder.ins().call(slow_ref, &[left, right]);
+        let slow_result = self.builder.inst_results(call)[0];
+        self.builder.ins().jump(join, &[slow_result.into()]);
+        self.builder.seal_block(join);
+
+        self.builder.switch_to_block(join);
+        Ok(self.builder.block_params(join)[0])
     }
 }
