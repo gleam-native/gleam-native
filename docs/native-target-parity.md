@@ -53,7 +53,7 @@ platform C convention.
 - ❌ `==` / `!=` structural equality for every type (deep runtime equality,
   the same semantics as Erlang `=:=` on Gleam data / `isEqual` in the JS
   prelude)
-- ❌ `<>` string concatenation
+- ✅ `<>` string concatenation
 - ❌ `&&`, `||` with short-circuit evaluation
 - ❌ Pipe operator `|>` (desugared by the compiler; needs function values)
 

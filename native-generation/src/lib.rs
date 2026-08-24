@@ -204,8 +204,13 @@ mod tests {
                         native_ir::Expression::Call {
                             module: "app".into(),
                             function: "println".into(),
-                            arguments: vec![native_ir::Expression::String(
-                                "Hello from the JIT! 🌍".into(),
+                            arguments: vec![native_ir::Expression::StringConcat(
+                                Box::new(native_ir::Expression::String(
+                                    "Hello from ".into(),
+                                )),
+                                Box::new(native_ir::Expression::String(
+                                    "the JIT! 🌍".into(),
+                                )),
                             )],
                         },
                     )],

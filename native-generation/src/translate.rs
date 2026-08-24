@@ -29,6 +29,9 @@ pub const FLOAT_FROM_BITS: &str = "gleam_native_float_from_bits";
 /// The symbol of the runtime's string literal constructor.
 pub const STRING_FROM_BYTES: &str = "gleam_native_string_from_bytes";
 
+/// The symbol of the runtime's string concatenation function.
+pub const STRING_CONCAT: &str = "gleam_native_string_concat";
+
 /// The symbol of the generated C-convention wrapper around `main`.
 pub const ENTRY_SYMBOL: &str = "gleam_native_main_wrapper";
 
@@ -64,6 +67,7 @@ pub struct Translator<'a, M: Module> {
     bigint_from_bytes: FuncId,
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
+    string_concat: FuncId,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -89,6 +93,9 @@ impl<'a, M: Module> Translator<'a, M> {
                 &c_signature(call_conv, 2),
             )
             .map_err(|error| error.to_string())?;
+        let string_concat = module
+            .declare_function(STRING_CONCAT, Linkage::Import, &c_signature(call_conv, 2))
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             module,
             functions: HashMap::new(),
@@ -96,6 +103,7 @@ impl<'a, M: Module> Translator<'a, M> {
             bigint_from_bytes,
             float_from_bits,
             string_from_bytes,
+            string_concat,
         })
     }
 
@@ -197,6 +205,7 @@ impl<'a, M: Module> Translator<'a, M> {
             bigint_from_bytes: self.bigint_from_bytes,
             float_from_bits: self.float_from_bits,
             string_from_bytes: self.string_from_bytes,
+            string_concat: self.string_concat,
             module: self.module,
             builder: &mut builder,
             environment,
@@ -249,6 +258,7 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     bigint_from_bytes: FuncId,
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
+    string_concat: FuncId,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
     environment: HashMap<String, Variable>,
@@ -358,6 +368,16 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
                 let function_ref = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(function_ref, &values);
+                Ok(self.builder.inst_results(call)[0])
+            }
+
+            native_ir::Expression::StringConcat(left, right) => {
+                let left = self.expression(left)?;
+                let right = self.expression(right)?;
+                let concat_ref = self
+                    .module
+                    .declare_func_in_func(self.string_concat, self.builder.func);
+                let call = self.builder.ins().call(concat_ref, &[left, right]);
                 Ok(self.builder.inst_results(call)[0])
             }
 

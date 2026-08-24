@@ -190,6 +190,15 @@ impl Lowerer {
                 Box::new(self.expression(left)?),
                 Box::new(self.expression(right)?),
             )),
+            TypedExpr::BinOp {
+                operator: BinOp::Concatenate,
+                left,
+                right,
+                ..
+            } => Ok(native_ir::Expression::StringConcat(
+                Box::new(self.expression(left)?),
+                Box::new(self.expression(right)?),
+            )),
             TypedExpr::BinOp { operator, .. } => {
                 Err(self.unsupported(&format!("the `{}` operator", operator.name())))
             }
@@ -293,6 +302,29 @@ mod tests {
             native_ir::Statement::Let {
                 name: "x".into(),
                 value: native_ir::Expression::String("hello\n🌍".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn string_concatenation() {
+        let module = lower(
+            r#"pub fn main() {
+  let x = "Hello, " <> "world!"
+  0
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "x".into(),
+                value: native_ir::Expression::StringConcat(
+                    Box::new(native_ir::Expression::String("Hello, ".into())),
+                    Box::new(native_ir::Expression::String("world!".into())),
+                ),
             }
         );
     }

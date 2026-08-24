@@ -86,6 +86,22 @@ pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length
     Box::into_raw(Box::new(string.to_string())) as u64
 }
 
+/// Concatenates two strings into a new string, the implementation of the
+/// `<>` operator.
+///
+/// # Safety
+///
+/// Both arguments must be strings created by this runtime. The Gleam type
+/// system upholds this for calls from generated code.
+pub unsafe extern "C" fn gleam_native_string_concat(left: u64, right: u64) -> u64 {
+    let left = unsafe { &*(left as *const String) };
+    let right = unsafe { &*(right as *const String) };
+    let mut result = String::with_capacity(left.len() + right.len());
+    result.push_str(left);
+    result.push_str(right);
+    Box::into_raw(Box::new(result)) as u64
+}
+
 /// Prints an integer followed by a newline. The standin for a real printing
 /// external until strings exist on the native target.
 pub extern "C" fn print_int(value: u64) -> u64 {
@@ -138,6 +154,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_string_from_bytes",
             gleam_native_string_from_bytes as *const u8,
         ),
+        (
+            "gleam_native_string_concat",
+            gleam_native_string_concat as *const u8,
+        ),
         ("print_int", print_int as *const u8),
         ("print_float", print_float as *const u8),
         ("println", println as *const u8),
@@ -185,6 +205,15 @@ mod tests {
         };
         assert_eq!(boxed & 1, 0);
         assert_eq!(unsafe { &*(boxed as *const String) }, content);
+    }
+
+    #[test]
+    fn string_concatenation() {
+        let make = |content: &str| unsafe {
+            gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64)
+        };
+        let result = unsafe { gleam_native_string_concat(make("Hello, "), make("🌍!")) };
+        assert_eq!(unsafe { &*(result as *const String) }, "Hello, 🌍!");
     }
 
     #[test]
