@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 17;
+pub const FORMAT_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -135,11 +135,14 @@ pub enum Expression {
         tag: u32,
         arguments: Vec<Expression>,
     },
-    /// Reading field `index` out of a custom type record.
+    /// Reading field `index` out of a custom type record or tuple.
     FieldAccess {
         record: Box<Expression>,
         index: u32,
     },
+    /// The empty list, a tagged immediate. Cons cells are two-field records
+    /// with tag 1, built with [`Expression::Constructor`].
+    EmptyList,
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
     /// string expression evaluated only if the panic is reached.
@@ -229,6 +232,11 @@ pub enum Check {
     /// The subject is a custom type record with this variant tag. On a
     /// match, the record's fields become the given decision variables.
     Variant { tag: u32, fields: Vec<u32> },
+    /// Always matches (tuples): the fields become decision variables.
+    Always { fields: Vec<u32> },
+    /// The subject is a non-empty list: its head and tail become decision
+    /// variables.
+    NonEmptyList { first: u32, rest: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

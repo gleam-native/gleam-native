@@ -217,6 +217,36 @@ impl Lowerer<'_> {
                 }
             }
 
+            TypedExpr::Tuple { elements, .. } => {
+                // Tuples are records with tag 0.
+                let arguments = elements
+                    .iter()
+                    .map(|element| self.expression(element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(native_ir::Expression::Constructor { tag: 0, arguments })
+            }
+
+            TypedExpr::TupleIndex { tuple, index, .. } => Ok(native_ir::Expression::FieldAccess {
+                record: Box::new(self.expression(tuple)?),
+                index: *index as u32,
+            }),
+
+            TypedExpr::List { elements, tail, .. } => {
+                // Cons cells are two-field records with tag 1, built from
+                // the tail outwards.
+                let mut list = match tail {
+                    Some(tail) => self.expression(tail)?,
+                    None => native_ir::Expression::EmptyList,
+                };
+                for element in elements.iter().rev() {
+                    list = native_ir::Expression::Constructor {
+                        tag: 1,
+                        arguments: vec![self.expression(element)?, list],
+                    };
+                }
+                Ok(list)
+            }
+
             TypedExpr::RecordAccess { record, index, .. } => {
                 Ok(native_ir::Expression::FieldAccess {
                     record: Box::new(self.expression(record)?),
@@ -388,7 +418,12 @@ impl Lowerer<'_> {
 
             ClauseGuard::Constant(constant) => self.constant(constant),
 
-            ClauseGuard::TupleIndex { .. } => Err(self.unsupported("tuples in guards")),
+            ClauseGuard::TupleIndex { tuple, index, .. } => {
+                Ok(native_ir::Expression::FieldAccess {
+                    record: Box::new(self.guard(tuple)?),
+                    index: *index as u32,
+                })
+            }
             ClauseGuard::FieldAccess { .. } => Err(self.unsupported("field access in guards")),
             ClauseGuard::ModuleSelect { .. } => Err(self.unsupported("constants in guards")),
             ClauseGuard::Invalid { .. } => Err(self.unsupported("this guard expression")),
@@ -476,7 +511,9 @@ impl Lowerer<'_> {
                 let fallback_fields = match fallback_check.as_ref() {
                     exhaustiveness::FallbackCheck::RuntimeCheck { check } => {
                         match self.runtime_check(check, &var.type_)? {
-                            native_ir::Check::Variant { fields, .. } => fields,
+                            native_ir::Check::Variant { fields, .. }
+                            | native_ir::Check::Always { fields } => fields,
+                            native_ir::Check::NonEmptyList { first, rest } => vec![first, rest],
                             _ => vec![],
                         }
                     }
@@ -532,13 +569,22 @@ impl Lowerer<'_> {
             exhaustiveness::RuntimeCheck::StringPrefix { .. } => {
                 Err(self.unsupported("string prefix patterns"))
             }
-            exhaustiveness::RuntimeCheck::Tuple { .. } => Err(self.unsupported("tuple patterns")),
+            exhaustiveness::RuntimeCheck::Tuple { elements, .. } => {
+                Ok(native_ir::Check::Always {
+                    fields: elements.iter().map(|element| element.id as u32).collect(),
+                })
+            }
             exhaustiveness::RuntimeCheck::BitArray { .. } => {
                 Err(self.unsupported("bit array patterns"))
             }
-            exhaustiveness::RuntimeCheck::EmptyList
-            | exhaustiveness::RuntimeCheck::NonEmptyList { .. } => {
-                Err(self.unsupported("list patterns"))
+            exhaustiveness::RuntimeCheck::EmptyList => {
+                Ok(native_ir::Check::Immediate(tag_small_int(0)))
+            }
+            exhaustiveness::RuntimeCheck::NonEmptyList { first, rest } => {
+                Ok(native_ir::Check::NonEmptyList {
+                    first: first.id as u32,
+                    rest: rest.id as u32,
+                })
             }
         }
     }
@@ -1033,6 +1079,230 @@ pub fn main() {
                 record: Box::new(native_ir::Expression::Variable("pair".into())),
                 index: 0,
             }
+        );
+    }
+
+    #[test]
+    fn tuple_construction_and_access() {
+        let module = lower(
+            "pub fn main() {
+  let pair = #(1, #(2, 3))
+  pair.0
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "pair".into(),
+                value: native_ir::Expression::Constructor {
+                    tag: 0,
+                    arguments: vec![
+                        native_ir::Expression::Int(1),
+                        native_ir::Expression::Constructor {
+                            tag: 0,
+                            arguments: vec![
+                                native_ir::Expression::Int(2),
+                                native_ir::Expression::Int(3),
+                            ],
+                        },
+                    ],
+                },
+            }
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Expression(native_ir::Expression::FieldAccess {
+                record: Box::new(native_ir::Expression::Variable("pair".into())),
+                index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn tuple_patterns_extract_fields_without_a_test() {
+        let module = lower(
+            "pub fn main() {
+  case #(1, 2) {
+    #(a, b) -> a + b
+  }
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        else {
+            panic!("expected a case expression");
+        };
+        let native_ir::Decision::Switch {
+            choices,
+            fallback_fields,
+            ..
+        } = tree
+        else {
+            panic!("expected a switch");
+        };
+        // A tuple pattern cannot fail, so its element extraction arrives
+        // via the untested fallback.
+        assert!(choices.is_empty());
+        assert_eq!(fallback_fields.len(), 2);
+    }
+
+    #[test]
+    fn tuple_index_in_guards() {
+        let module = lower(
+            "pub fn main() {
+  case #(1, 2) {
+    pair if pair.1 > 1 -> 1
+    _ -> 0
+  }
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        else {
+            panic!("expected a case expression");
+        };
+        let native_ir::Decision::Guard { guard, .. } = tree else {
+            panic!("expected a guard");
+        };
+        assert_eq!(
+            guard.as_ref(),
+            &native_ir::Expression::IntCompare {
+                operator: native_ir::CompareOperator::GreaterThan,
+                left: Box::new(native_ir::Expression::FieldAccess {
+                    record: Box::new(native_ir::Expression::Variable("pair".into())),
+                    index: 1,
+                }),
+                right: Box::new(native_ir::Expression::Int(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn list_literals() {
+        let module = lower(
+            "pub fn main() {
+  let rest = [4]
+  [3, ..rest]
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "rest".into(),
+                value: native_ir::Expression::Constructor {
+                    tag: 1,
+                    arguments: vec![
+                        native_ir::Expression::Int(4),
+                        native_ir::Expression::EmptyList,
+                    ],
+                },
+            }
+        );
+        // The spread tail is used directly rather than rebuilt.
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Expression(native_ir::Expression::Constructor {
+                tag: 1,
+                arguments: vec![
+                    native_ir::Expression::Int(3),
+                    native_ir::Expression::Variable("rest".into()),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn list_patterns() {
+        let module = lower(
+            "pub fn main(list: List(Int)) {
+  case list {
+    [] -> 0
+    [first, ..rest] -> first
+  }
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        else {
+            panic!("expected a case expression");
+        };
+        let native_ir::Decision::Switch {
+            choices,
+            fallback_fields,
+            ..
+        } = tree
+        else {
+            panic!("expected a switch");
+        };
+        // The empty list is a tagged immediate; the cons case is the
+        // exhaustive fallback whose head and tail arrive untested.
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].0, native_ir::Check::Immediate(1));
+        assert_eq!(fallback_fields.len(), 2);
+    }
+
+    #[test]
+    fn nested_list_patterns_switch_on_extracted_variables() {
+        let module = lower(
+            "pub fn main(list: List(Int)) {
+  case list {
+    [_, _] -> 2
+    _ -> 0
+  }
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let native_ir::Statement::Expression(native_ir::Expression::Case {
+            subject_ids,
+            tree,
+            ..
+        }) = &body[0]
+        else {
+            panic!("expected a case expression");
+        };
+        // The outer switch checks the subject; some inner switch must check
+        // a variable that is not the subject: the extracted tail.
+        let native_ir::Decision::Switch {
+            var,
+            choices,
+            fallback,
+            ..
+        } = tree
+        else {
+            panic!("expected a switch");
+        };
+        assert_eq!(subject_ids, &vec![*var]);
+        fn has_non_subject_switch(decision: &native_ir::Decision, subject: u32) -> bool {
+            match decision {
+                native_ir::Decision::Switch { var, choices, fallback, .. } => {
+                    *var != subject
+                        || choices
+                            .iter()
+                            .any(|(_, decision)| has_non_subject_switch(decision, subject))
+                        || has_non_subject_switch(fallback, subject)
+                }
+                _ => false,
+            }
+        }
+        assert!(
+            choices
+                .iter()
+                .any(|(_, decision)| has_non_subject_switch(decision, *var))
+                || has_non_subject_switch(fallback, *var)
         );
     }
 

@@ -381,6 +381,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
             native_ir::Expression::Nil => Ok(self.builder.ins().iconst(types::I64, NIL)),
 
+            // The empty list is the tagged small integer 0; cons cells are
+            // heap records, so any pointer-valued list is non-empty.
+            native_ir::Expression::EmptyList => {
+                Ok(self.builder.ins().iconst(types::I64, NIL))
+            }
+
             // Tagged small integers 1 and 0.
             native_ir::Expression::Bool(value) => Ok(self
                 .builder
@@ -803,6 +809,15 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             let expected = self.builder.ins().iconst(types::I64, *tag as i64);
                             self.builder.ins().icmp(IntCC::Equal, actual, expected)
                         }
+                        // Tuples always match: the type system guarantees it.
+                        native_ir::Check::Always { .. } => {
+                            self.builder.ins().iconst(types::I64, 1)
+                        }
+                        // Any list value that is not the empty immediate is
+                        // a cons cell.
+                        native_ir::Check::NonEmptyList { .. } => {
+                            self.builder.ins().icmp_imm_s(IntCC::NotEqual, subject, NIL)
+                        }
                         check => self.check(subject, check)?,
                     };
                     let match_block = self.builder.create_block();
@@ -814,23 +829,30 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     self.builder.seal_block(next_block);
 
                     self.builder.switch_to_block(match_block);
-                    match check {
-                        // A matched variant makes its fields available as
-                        // decision variables for the rest of this branch.
-                        native_ir::Check::Variant { fields, .. } => {
-                            let mut extended = variables.clone();
-                            for (index, field) in fields.iter().enumerate() {
-                                let value = self.builder.ins().load(
-                                    types::I64,
-                                    MemFlagsData::trusted(),
-                                    subject,
-                                    8 + 8 * index as i32,
-                                );
-                                let _ = extended.insert(*field, value);
-                            }
-                            self.decision(&extended, decision, join)?;
+                    // A matched variant, tuple, or cons cell makes its
+                    // fields available as decision variables for the rest of
+                    // this branch. All three share the record layout: fields
+                    // start one word past the tag.
+                    let extracted: Vec<u32> = match check {
+                        native_ir::Check::Variant { fields, .. }
+                        | native_ir::Check::Always { fields } => fields.clone(),
+                        native_ir::Check::NonEmptyList { first, rest } => vec![*first, *rest],
+                        _ => vec![],
+                    };
+                    if extracted.is_empty() {
+                        self.decision(variables, decision, join)?;
+                    } else {
+                        let mut extended = variables.clone();
+                        for (index, field) in extracted.iter().enumerate() {
+                            let value = self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::trusted(),
+                                subject,
+                                8 + 8 * index as i32,
+                            );
+                            let _ = extended.insert(*field, value);
                         }
-                        _ => self.decision(variables, decision, join)?,
+                        self.decision(&extended, decision, join)?;
                     }
                     self.builder.switch_to_block(next_block);
                 }
@@ -878,8 +900,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let expected = self.builder.ins().f64const(*value);
                 Ok(self.builder.ins().fcmp(FloatCC::Equal, subject, expected))
             }
-            native_ir::Check::Variant { .. } => {
-                unreachable!("variant checks are handled by the switch")
+            native_ir::Check::Variant { .. }
+            | native_ir::Check::Always { .. }
+            | native_ir::Check::NonEmptyList { .. } => {
+                unreachable!("field-extracting checks are handled by the switch")
             }
             native_ir::Check::String(value) => {
                 let literal = self

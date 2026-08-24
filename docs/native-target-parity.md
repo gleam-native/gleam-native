@@ -77,13 +77,13 @@ platform C convention.
   variant-index-to-tagged-word mapping: `True` is variant 0 but encodes
   as 1), variable and discard patterns, pattern bindings, alternative
   patterns (`a | b`)
-- 🚧 Destructuring pattern kinds: constructors with fields work (including
-  untested final variants of exhaustive matches, whose fields arrive via
-  the fallback). Still missing: tuples, lists (`[x, ..rest]`), string
-  prefixes, bit arrays — each blocked on its data type existing natively
-- 🚧 Guards (`if` clauses): operators, negation, variables, and scalar
-  literal constants work (sharing the expression operator lowering). Not yet:
-  tuples, field access, and module constants in guards
+- 🚧 Destructuring pattern kinds: constructors with fields, tuples, and
+  lists (`[x, ..rest]`, nested patterns) work, including untested final
+  variants of exhaustive matches, whose fields arrive via the fallback.
+  Still missing: string prefixes and bit arrays
+- 🚧 Guards (`if` clauses): operators, negation, variables, tuple indexing,
+  and scalar literal constants work (sharing the expression operator
+  lowering). Not yet: field access and module constants in guards
 - ❌ `use` expressions (desugared to callbacks; needs closures)
 - ❌ `assert` (boolean assertion with structured failure information)
 
@@ -108,8 +108,11 @@ platform C convention.
 
 ## Data types
 
-- ❌ Tuples (heap objects, positional access `#(1, 2).0`)
-- ❌ Lists (cons cells; literals, prepend, pattern support)
+- ✅ Tuples (records with tag 0; construction, positional access
+  `#(1, 2).0`, destructuring, tuple index in guards)
+- ✅ Lists (empty list is a tagged immediate, cons cells are two-field
+  records; literals, spread construction `[x, ..rest]`, and patterns
+  including nested ones like `[_, _]`)
 - ✅ Custom types: heap records (variant tag word + field words),
   constructors (labelled and positional), field access (`wibble.name`),
   destructuring in `case`; `Result` works as a plain custom type. Not yet:
