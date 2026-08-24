@@ -19,15 +19,32 @@ macro_rules! assert_targets {
             .collect_vec();
         assert_eq!(expected, result);
     };
+    ($src:expr, $target:expr, $implementations:expr $(,)?) => {
+        let result = $crate::type_::tests::target_implementations::implementations_with_target(
+            $src, $target,
+        );
+        let expected = $implementations
+            .iter()
+            .map(|(name, expected_impl)| ((*name).into(), *expected_impl))
+            .collect_vec();
+        assert_eq!(expected, result);
+    };
 }
 
 pub fn implementations(src: &str) -> Vec<(EcoString, Implementations)> {
+    implementations_with_target(src, Target::Erlang)
+}
+
+pub fn implementations_with_target(
+    src: &str,
+    target: Target,
+) -> Vec<(EcoString, Implementations)> {
     compile_module_with_opts(
         "test_module",
         src,
         None,
         vec![],
-        Target::Erlang,
+        target,
         TargetSupport::NotEnforced,
         None,
     )
@@ -108,6 +125,45 @@ pub fn erlang_only_2() { erlang_only_1() * 2 }
                     can_run_on_erlang: true,
                     can_run_on_javascript: false,
                     can_run_on_native: false,
+                }
+            )
+        ],
+    );
+}
+
+#[test]
+pub fn native_only_function() {
+    assert_targets!(
+        r#"
+@external(native, "wibble", "wobble")
+pub fn native_only_1() -> Int
+
+pub fn native_only_2() { native_only_1() * 2 }
+"#,
+        Target::Native,
+        [
+            (
+                "native_only_1",
+                Implementations {
+                    gleam: false,
+                    uses_erlang_externals: false,
+                    uses_javascript_externals: false,
+                    uses_native_externals: true,
+                    can_run_on_erlang: false,
+                    can_run_on_javascript: false,
+                    can_run_on_native: true,
+                }
+            ),
+            (
+                "native_only_2",
+                Implementations {
+                    gleam: false,
+                    uses_erlang_externals: false,
+                    uses_javascript_externals: false,
+                    uses_native_externals: true,
+                    can_run_on_erlang: false,
+                    can_run_on_javascript: false,
+                    can_run_on_native: true,
                 }
             )
         ],

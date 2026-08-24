@@ -4400,6 +4400,17 @@ impl<'a, 'doc> AttributesPrinter<'a> {
             ])
         };
 
+        if let Some((module, function, _)) = self.external_native {
+            attributes.push(docvec![
+                arena,
+                EXTERNAL_NATIVE_QUOTE_DOCUMENT,
+                module,
+                QUOTE_COMMA_SPACE_QUOTE_DOCUMENT,
+                function,
+                QUOTE_CLOSE_PAREN_DOCUMENT
+            ])
+        };
+
         // @internal attribute
         if self.internal {
             attributes.push(INTERNAL_ATTRIBUTE_DOCUMENT);

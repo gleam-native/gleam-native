@@ -1,0 +1,22 @@
+---
+source: compiler-core/src/parse/tests.rs
+assertion_line: 896
+expression: "\n@external(native, \"one\", \"two\")\n@external(native, \"three\", \"four\")\npub fn one(x: Int) -> Int {\n  todo\n}\n"
+---
+----- SOURCE CODE
+
+@external(native, "one", "two")
+@external(native, "three", "four")
+pub fn one(x: Int) -> Int {
+  todo
+}
+
+
+----- ERROR
+error: Syntax error
+  ┌─ /src/parse/error.gleam:3:1
+  │
+3 │ @external(native, "three", "four")
+  │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Duplicate attribute
+
+This attribute has already been given.

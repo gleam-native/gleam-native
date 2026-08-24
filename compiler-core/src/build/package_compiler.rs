@@ -498,8 +498,8 @@ where
 
     fn perform_native_codegen(
         &mut self,
-        modules: &[Module],
-        cached_module_names: &[EcoString],
+        _modules: &[Module],
+        _cached_module_names: &[EcoString],
     ) -> Result<(), Error> {
         // TODO(native): Implement native codegen
         Ok(())

@@ -260,12 +260,14 @@ fn run_javascript_node_command(
 }
 
 fn run_native_command(
-    paths: &ProjectPaths,
-    package: &str,
-    module: &str,
-    arguments: Vec<String>,
+    _paths: &ProjectPaths,
+    _package: &str,
+    _module: &str,
+    _arguments: Vec<String>,
 ) -> Result<Command, Error> {
-    Err(Error::UnsupportedTarget)
+    Err(Error::TargetNotYetImplemented {
+        target: Target::Native,
+    })
 }
 
 fn write_javascript_entrypoint(

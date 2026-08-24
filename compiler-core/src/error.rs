@@ -437,8 +437,8 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
     #[error("could not create temp file: {error}")]
     CouldNotCreateTempFile { error: String },
 
-    #[error("Unsupported target")]
-    UnsupportedTarget,
+    #[error("the {} target is not yet implemented", target.as_presentable_str())]
+    TargetNotYetImplemented { target: Target },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -2531,9 +2531,12 @@ add `gleam add {name}` in this project."
                 hint: None,
             }],
 
-            Error::UnsupportedTarget => vec![Diagnostic {
-                title: "Unsupported target".into(),
-                text: "The target you are trying to compile for is not supported.".into(),
+            Error::TargetNotYetImplemented { target } => vec![Diagnostic {
+                title: "Target not yet implemented".into(),
+                text: wrap_format!(
+                    "Support for the {} target has not been implemented yet.",
+                    target.as_presentable_str()
+                ),
                 level: Level::Error,
                 location: None,
                 hint: None,
