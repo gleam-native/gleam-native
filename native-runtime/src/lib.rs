@@ -102,6 +102,54 @@ pub unsafe extern "C" fn gleam_native_string_concat(left: u64, right: u64) -> u6
     Box::into_raw(Box::new(result)) as u64
 }
 
+/// Reports a `panic` or `todo` and aborts the program with exit code 1.
+///
+/// `kind` is 0 for `panic` and 1 for `todo`. `message` is a string value or
+/// 0 when the source gave no message. The module and function names arrive
+/// as pointers into the compiled program's constant data. Declared as
+/// returning a value so generated code can treat it as an ordinary call, but
+/// it never returns.
+///
+/// # Safety
+///
+/// The pointer arguments must be valid as described above. Generated code
+/// always passes pointers into its own constant data and runtime-created
+/// strings.
+pub unsafe extern "C" fn gleam_native_panic(
+    kind: u64,
+    message: u64,
+    module: *const u8,
+    module_length: u64,
+    function: *const u8,
+    function_length: u64,
+    line: u64,
+) -> u64 {
+    let module = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(module, module_length as usize))
+    };
+    let function = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            function,
+            function_length as usize,
+        ))
+    };
+    let (name, default_message) = match kind {
+        1 => ("todo", "This has not yet been implemented"),
+        _ => ("panic", "`panic` expression evaluated"),
+    };
+    let message = if message == 0 {
+        default_message
+    } else {
+        unsafe { &*(message as *const String) }
+    };
+    eprintln!("runtime error: {name}");
+    eprintln!();
+    eprintln!("{message}");
+    eprintln!();
+    eprintln!("    {module}.{function}:{line}");
+    std::process::exit(1);
+}
+
 /// Prints an integer followed by a newline. The standin for a real printing
 /// external until strings exist on the native target.
 pub extern "C" fn print_int(value: u64) -> u64 {
@@ -158,6 +206,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_string_concat",
             gleam_native_string_concat as *const u8,
         ),
+        ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
         ("print_float", print_float as *const u8),
         ("println", println as *const u8),

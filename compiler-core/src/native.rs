@@ -17,17 +17,20 @@ use crate::{
 };
 
 pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
-    let lowerer = Lowerer {
-        module_name: module.name.clone(),
-    };
     let mut functions = Vec::new();
 
     // Imports and type aliases generate no code.
     if !module.definitions.custom_types.is_empty() {
-        return Err(lowerer.unsupported("custom types"));
+        return Err(Error::NativeUnsupportedFeature {
+            module: module.name.clone(),
+            feature: "custom types".into(),
+        });
     }
     if !module.definitions.constants.is_empty() {
-        return Err(lowerer.unsupported("module constants"));
+        return Err(Error::NativeUnsupportedFeature {
+            module: module.name.clone(),
+            feature: "module constants".into(),
+        });
     }
 
     for function in &module.definitions.functions {
@@ -55,6 +58,11 @@ pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
             parameters.push(parameter);
         }
 
+        let lowerer = Lowerer {
+            module_name: module.name.clone(),
+            function_name: name.clone(),
+            line_numbers: &module.type_info.line_numbers,
+        };
         let body = lowerer.statements(function.body.iter())?;
         functions.push(native_ir::Function::Defined {
             name: name.into(),
@@ -69,11 +77,13 @@ pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
     })
 }
 
-struct Lowerer {
+struct Lowerer<'a> {
     module_name: EcoString,
+    function_name: EcoString,
+    line_numbers: &'a src_span::LineNumbers,
 }
 
-impl Lowerer {
+impl Lowerer<'_> {
     fn unsupported(&self, feature: &str) -> Error {
         Error::NativeUnsupportedFeature {
             module: self.module_name.clone(),
@@ -203,8 +213,33 @@ impl Lowerer {
                 Err(self.unsupported(&format!("the `{}` operator", operator.name())))
             }
 
+            TypedExpr::Panic {
+                location, message, ..
+            } => self.panic_expression(native_ir::PanicKind::Panic, message, location),
+            TypedExpr::Todo {
+                location, message, ..
+            } => self.panic_expression(native_ir::PanicKind::Todo, message, location),
+
             _ => Err(self.unsupported("this kind of expression")),
         }
+    }
+
+    fn panic_expression(
+        &self,
+        kind: native_ir::PanicKind,
+        message: &Option<Box<TypedExpr>>,
+        location: &src_span::SrcSpan,
+    ) -> Result<native_ir::Expression, Error> {
+        let message = match message {
+            Some(message) => Some(Box::new(self.expression(message)?)),
+            None => None,
+        };
+        Ok(native_ir::Expression::Panic {
+            kind,
+            message,
+            function: self.function_name.clone().into(),
+            line: self.line_numbers.line_number(location.start),
+        })
     }
 }
 
@@ -326,6 +361,40 @@ mod tests {
                     Box::new(native_ir::Expression::String("world!".into())),
                 ),
             }
+        );
+    }
+
+    #[test]
+    fn panic_and_todo() {
+        let module = lower(
+            r#"pub fn main() {
+  let x = todo
+  panic as "boom"
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "x".into(),
+                value: native_ir::Expression::Panic {
+                    kind: native_ir::PanicKind::Todo,
+                    message: None,
+                    function: "main".into(),
+                    line: 2,
+                },
+            }
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Expression(native_ir::Expression::Panic {
+                kind: native_ir::PanicKind::Panic,
+                message: Some(Box::new(native_ir::Expression::String("boom".into()))),
+                function: "main".into(),
+                line: 3,
+            })
         );
     }
 }

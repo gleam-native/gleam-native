@@ -185,6 +185,37 @@ mod tests {
         crate::jit::run(&[module], "app").unwrap();
     }
 
+    /// A panic expression translates and compiles; `main` must not call it,
+    /// as the runtime panic aborts the whole process, test runner included.
+    #[test]
+    fn jit_compiles_panic_expressions() {
+        let module = native_ir::Module {
+            name: "app".into(),
+            functions: vec![
+                native_ir::Function::Defined {
+                    name: "explode".into(),
+                    parameters: vec![],
+                    body: vec![native_ir::Statement::Expression(
+                        native_ir::Expression::Panic {
+                            kind: native_ir::PanicKind::Panic,
+                            message: Some(Box::new(native_ir::Expression::String(
+                                "boom".into(),
+                            ))),
+                            function: "explode".into(),
+                            line: 2,
+                        },
+                    )],
+                },
+                native_ir::Function::Defined {
+                    name: "main".into(),
+                    parameters: vec![],
+                    body: vec![native_ir::Statement::Expression(native_ir::Expression::Nil)],
+                },
+            ],
+        };
+        crate::jit::run(&[module], "app").unwrap();
+    }
+
     /// A string literal is built from constant data and can be passed to the
     /// runtime's `println` external.
     #[test]

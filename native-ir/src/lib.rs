@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -73,6 +73,21 @@ pub enum Expression {
     },
     IntAdd(Box<Expression>, Box<Expression>),
     StringConcat(Box<Expression>, Box<Expression>),
+    /// A `panic` or `todo` expression: prints an error naming the source
+    /// location and aborts the program. The message, when present, is a
+    /// string expression evaluated only if the panic is reached.
+    Panic {
+        kind: PanicKind,
+        message: Option<Box<Expression>>,
+        function: String,
+        line: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PanicKind {
+    Panic,
+    Todo,
 }
 
 pub fn encode(module: &Module) -> Result<Vec<u8>, bitcode::Error> {

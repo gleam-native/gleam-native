@@ -32,6 +32,9 @@ pub const STRING_FROM_BYTES: &str = "gleam_native_string_from_bytes";
 /// The symbol of the runtime's string concatenation function.
 pub const STRING_CONCAT: &str = "gleam_native_string_concat";
 
+/// The symbol of the runtime's panic/todo report-and-abort function.
+pub const PANIC: &str = "gleam_native_panic";
+
 /// The symbol of the generated C-convention wrapper around `main`.
 pub const ENTRY_SYMBOL: &str = "gleam_native_main_wrapper";
 
@@ -68,6 +71,7 @@ pub struct Translator<'a, M: Module> {
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
     string_concat: FuncId,
+    panic: FuncId,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -96,6 +100,9 @@ impl<'a, M: Module> Translator<'a, M> {
         let string_concat = module
             .declare_function(STRING_CONCAT, Linkage::Import, &c_signature(call_conv, 2))
             .map_err(|error| error.to_string())?;
+        let panic = module
+            .declare_function(PANIC, Linkage::Import, &c_signature(call_conv, 7))
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             module,
             functions: HashMap::new(),
@@ -104,6 +111,7 @@ impl<'a, M: Module> Translator<'a, M> {
             float_from_bits,
             string_from_bytes,
             string_concat,
+            panic,
         })
     }
 
@@ -170,7 +178,7 @@ impl<'a, M: Module> Translator<'a, M> {
             let id = self
                 .function_id(&module.name, name)
                 .expect("declared in first pass");
-            self.define_function(id, parameters, body)?;
+            self.define_function(id, &module.name, parameters, body)?;
         }
         Ok(())
     }
@@ -178,6 +186,7 @@ impl<'a, M: Module> Translator<'a, M> {
     fn define_function(
         &mut self,
         id: FuncId,
+        module_name: &str,
         parameters: &[String],
         body: &[native_ir::Statement],
     ) -> Result<(), String> {
@@ -206,6 +215,8 @@ impl<'a, M: Module> Translator<'a, M> {
             float_from_bits: self.float_from_bits,
             string_from_bytes: self.string_from_bytes,
             string_concat: self.string_concat,
+            panic: self.panic,
+            module_name,
             module: self.module,
             builder: &mut builder,
             environment,
@@ -259,20 +270,17 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
     string_concat: FuncId,
+    panic: FuncId,
+    module_name: &'a str,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
     environment: HashMap<String, Variable>,
 }
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
-    /// Embeds bytes as read-only constant data and calls a two-argument
-    /// runtime constructor with their address and length. Used for literals
-    /// that become heap objects: big integers and strings.
-    fn construct_from_constant_bytes(
-        &mut self,
-        bytes: &[u8],
-        constructor: FuncId,
-    ) -> Result<Value, String> {
+    /// Embeds bytes as read-only constant data, yielding their address and
+    /// length as values.
+    fn constant_bytes(&mut self, bytes: &[u8]) -> Result<(Value, Value), String> {
         let data = self
             .module
             .declare_anonymous_data(false, false)
@@ -287,6 +295,18 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let data_ref = self.module.declare_data_in_func(data, self.builder.func);
         let pointer = self.builder.ins().symbol_value(pointer_type, data_ref);
         let length = self.builder.ins().iconst(types::I64, bytes.len() as i64);
+        Ok((pointer, length))
+    }
+
+    /// Embeds bytes as read-only constant data and calls a two-argument
+    /// runtime constructor with their address and length. Used for literals
+    /// that become heap objects: big integers and strings.
+    fn construct_from_constant_bytes(
+        &mut self,
+        bytes: &[u8],
+        constructor: FuncId,
+    ) -> Result<Value, String> {
+        let (pointer, length) = self.constant_bytes(bytes)?;
         let constructor_ref = self.module.declare_func_in_func(constructor, self.builder.func);
         let call = self.builder.ins().call(constructor_ref, &[pointer, length]);
         Ok(self.builder.inst_results(call)[0])
@@ -378,6 +398,49 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .module
                     .declare_func_in_func(self.string_concat, self.builder.func);
                 let call = self.builder.ins().call(concat_ref, &[left, right]);
+                Ok(self.builder.inst_results(call)[0])
+            }
+
+            native_ir::Expression::Panic {
+                kind,
+                message,
+                function,
+                line,
+            } => {
+                let kind = self.builder.ins().iconst(
+                    types::I64,
+                    match kind {
+                        native_ir::PanicKind::Panic => 0,
+                        native_ir::PanicKind::Todo => 1,
+                    },
+                );
+                let message = match message {
+                    Some(message) => self.expression(message)?,
+                    None => self.builder.ins().iconst(types::I64, 0),
+                };
+                let module_name = self.module_name.to_string();
+                let (module_pointer, module_length) =
+                    self.constant_bytes(module_name.as_bytes())?;
+                let function_name = function.clone();
+                let (function_pointer, function_length) =
+                    self.constant_bytes(function_name.as_bytes())?;
+                let line = self.builder.ins().iconst(types::I64, *line as i64);
+                let panic_ref = self.module.declare_func_in_func(self.panic, self.builder.func);
+                // The runtime aborts the program and never actually returns;
+                // treating this as an ordinary call keeps the block structure
+                // simple, and the code after it is simply never reached.
+                let call = self.builder.ins().call(
+                    panic_ref,
+                    &[
+                        kind,
+                        message,
+                        module_pointer,
+                        module_length,
+                        function_pointer,
+                        function_length,
+                        line,
+                    ],
+                );
                 Ok(self.builder.inst_results(call)[0])
             }
 

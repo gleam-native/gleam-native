@@ -113,8 +113,8 @@ platform C convention.
 
 - ✅ Arbitrary precision integers (representation and overflow promotion;
   only `+` wired so far)
-- ❌ `panic`, `todo` with file/module/line/function metadata baked into the
-  call site, message support, non-zero exit
+- ✅ `panic`, `todo` with module/function/line metadata baked into the call
+  site, lazily-evaluated message expressions, exit code 1
 - ❌ `echo` (debug printing of any value; needs runtime value inspection)
 - ❌ String formatting of values for panics and `echo` (the native
   equivalent of `gleam/string.inspect`)
