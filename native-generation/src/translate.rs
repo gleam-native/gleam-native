@@ -22,6 +22,12 @@ pub const INT_ADD_SLOW: &str = "gleam_native_int_add_slow";
 pub const INT_SUB_SLOW: &str = "gleam_native_int_sub_slow";
 pub const INT_MUL_SLOW: &str = "gleam_native_int_mul_slow";
 
+/// The symbols of the runtime's integer division and remainder, which have
+/// no generated fast path: the zero-divisor rule and big integer operands
+/// live entirely in the runtime.
+pub const INT_DIV: &str = "gleam_native_int_div";
+pub const INT_REM: &str = "gleam_native_int_rem";
+
 /// The symbol of the runtime's big integer literal constructor.
 pub const BIGINT_FROM_BYTES: &str = "gleam_native_bigint_from_bytes";
 
@@ -70,6 +76,8 @@ struct RuntimeFunctions {
     int_add_slow: FuncId,
     int_sub_slow: FuncId,
     int_mul_slow: FuncId,
+    int_div: FuncId,
+    int_rem: FuncId,
     bigint_from_bytes: FuncId,
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
@@ -89,6 +97,8 @@ impl RuntimeFunctions {
             int_add_slow: declare(INT_ADD_SLOW, 2)?,
             int_sub_slow: declare(INT_SUB_SLOW, 2)?,
             int_mul_slow: declare(INT_MUL_SLOW, 2)?,
+            int_div: declare(INT_DIV, 2)?,
+            int_rem: declare(INT_REM, 2)?,
             bigint_from_bytes: declare(BIGINT_FROM_BYTES, 2)?,
             float_from_bits: declare(FLOAT_FROM_BITS, 1)?,
             string_from_bytes: declare(STRING_FROM_BYTES, 2)?,
@@ -461,10 +471,21 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         left: Value,
         right: Value,
     ) -> Result<Value, String> {
+        // Division and remainder are always runtime calls: the zero-divisor
+        // rule and truncation semantics live in one place there.
         let slow_function = match operator {
             native_ir::IntOperator::Add => self.runtime.int_add_slow,
             native_ir::IntOperator::Subtract => self.runtime.int_sub_slow,
             native_ir::IntOperator::Multiply => self.runtime.int_mul_slow,
+            native_ir::IntOperator::Divide | native_ir::IntOperator::Remainder => {
+                let function = match operator {
+                    native_ir::IntOperator::Divide => self.runtime.int_div,
+                    _ => self.runtime.int_rem,
+                };
+                let function_ref = self.module.declare_func_in_func(function, self.builder.func);
+                let call = self.builder.ins().call(function_ref, &[left, right]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
         };
 
         let fast = self.builder.create_block();
@@ -505,6 +526,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     self.builder.ins().smul_overflow(left_even, right_untagged);
                 let result = self.builder.ins().iadd_imm_s(product, 1);
                 (result, overflowed)
+            }
+            native_ir::IntOperator::Divide | native_ir::IntOperator::Remainder => {
+                unreachable!("handled by an early return above")
             }
         };
         self.builder

@@ -200,7 +200,12 @@ impl Lowerer<'_> {
             }
 
             TypedExpr::BinOp {
-                operator: operator @ (BinOp::AddInt | BinOp::SubInt | BinOp::MultInt),
+                operator:
+                    operator @ (BinOp::AddInt
+                    | BinOp::SubInt
+                    | BinOp::MultInt
+                    | BinOp::DivInt
+                    | BinOp::RemainderInt),
                 left,
                 right,
                 ..
@@ -208,7 +213,9 @@ impl Lowerer<'_> {
                 operator: match operator {
                     BinOp::AddInt => native_ir::IntOperator::Add,
                     BinOp::SubInt => native_ir::IntOperator::Subtract,
-                    _ => native_ir::IntOperator::Multiply,
+                    BinOp::MultInt => native_ir::IntOperator::Multiply,
+                    BinOp::DivInt => native_ir::IntOperator::Divide,
+                    _ => native_ir::IntOperator::Remainder,
                 },
                 left: Box::new(self.expression(left)?),
                 right: Box::new(self.expression(right)?),
@@ -382,6 +389,8 @@ mod tests {
         let module = lower(
             "pub fn main() {
   40 - 2 * 3
+  84 / 2
+  85 % 43
 }",
         );
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
@@ -397,6 +406,22 @@ mod tests {
                     left: Box::new(native_ir::Expression::Int(2)),
                     right: Box::new(native_ir::Expression::Int(3)),
                 }),
+            })
+        );
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+                operator: native_ir::IntOperator::Divide,
+                left: Box::new(native_ir::Expression::Int(84)),
+                right: Box::new(native_ir::Expression::Int(2)),
+            })
+        );
+        assert_eq!(
+            body[2],
+            native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+                operator: native_ir::IntOperator::Remainder,
+                left: Box::new(native_ir::Expression::Int(85)),
+                right: Box::new(native_ir::Expression::Int(43)),
             })
         );
     }

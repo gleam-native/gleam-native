@@ -68,6 +68,26 @@ pub extern "C" fn gleam_native_int_mul_slow(left: u64, right: u64) -> u64 {
     retag(untag(left) * untag(right))
 }
 
+/// Truncating integer division. Division by zero yields zero, following
+/// Gleam's semantics on every target.
+pub extern "C" fn gleam_native_int_div(left: u64, right: u64) -> u64 {
+    let divisor = untag(right);
+    if divisor == BigInt::ZERO {
+        return tag_small_int(0);
+    }
+    retag(untag(left) / divisor)
+}
+
+/// Integer remainder, taking the sign of the dividend. A zero divisor
+/// yields zero, following Gleam's semantics on every target.
+pub extern "C" fn gleam_native_int_rem(left: u64, right: u64) -> u64 {
+    let divisor = untag(right);
+    if divisor == BigInt::ZERO {
+        return tag_small_int(0);
+    }
+    retag(untag(left) % divisor)
+}
+
 /// Builds a big integer value from a signed little-endian byte string stored
 /// in the compiled program's data section, for integer literals too large to
 /// be tagged immediates.
@@ -220,6 +240,8 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_int_mul_slow",
             gleam_native_int_mul_slow as *const u8,
         ),
+        ("gleam_native_int_div", gleam_native_int_div as *const u8),
+        ("gleam_native_int_rem", gleam_native_int_rem as *const u8),
         (
             "gleam_native_bigint_from_bytes",
             gleam_native_bigint_from_bytes as *const u8,
@@ -310,6 +332,20 @@ mod tests {
             gleam_native_int_mul_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(2));
         assert_eq!(overflowed & 1, 0);
         assert_eq!(untag(overflowed), BigInt::from(SMALL_INT_MAX) * 2);
+    }
+
+    #[test]
+    fn division_and_remainder() {
+        let div = |a: i64, b: i64| gleam_native_int_div(tag_small_int(a), tag_small_int(b));
+        let rem = |a: i64, b: i64| gleam_native_int_rem(tag_small_int(a), tag_small_int(b));
+        assert_eq!(div(84, 2), tag_small_int(42));
+        // Truncation toward zero, remainder takes the dividend's sign.
+        assert_eq!(div(-7, 2), tag_small_int(-3));
+        assert_eq!(rem(-7, 2), tag_small_int(-1));
+        assert_eq!(rem(7, -2), tag_small_int(1));
+        // Division by zero yields zero.
+        assert_eq!(div(1, 0), tag_small_int(0));
+        assert_eq!(rem(1, 0), tag_small_int(0));
     }
 
     #[test]

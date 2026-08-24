@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -103,6 +103,10 @@ pub enum IntOperator {
     Add,
     Subtract,
     Multiply,
+    /// Truncating division; division by zero yields zero.
+    Divide,
+    /// Remainder with the sign of the dividend; a zero divisor yields zero.
+    Remainder,
 }
 
 pub fn encode(module: &Module) -> Result<Vec<u8>, bitcode::Error> {
