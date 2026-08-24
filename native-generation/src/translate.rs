@@ -45,6 +45,9 @@ pub const STRING_FROM_BYTES: &str = "gleam_native_string_from_bytes";
 /// The symbol of the runtime's string concatenation function.
 pub const STRING_CONCAT: &str = "gleam_native_string_concat";
 
+/// The symbol of the runtime's string equality function.
+pub const STRING_EQ: &str = "gleam_native_string_eq";
+
 /// The symbol of the runtime's panic/todo report-and-abort function.
 pub const PANIC: &str = "gleam_native_panic";
 
@@ -88,6 +91,7 @@ struct RuntimeFunctions {
     float_from_bits: FuncId,
     string_from_bytes: FuncId,
     string_concat: FuncId,
+    string_eq: FuncId,
     panic: FuncId,
 }
 
@@ -110,6 +114,7 @@ impl RuntimeFunctions {
             float_from_bits: declare(FLOAT_FROM_BITS, 1)?,
             string_from_bytes: declare(STRING_FROM_BYTES, 2)?,
             string_concat: declare(STRING_CONCAT, 2)?,
+            string_eq: declare(STRING_EQ, 2)?,
             panic: declare(PANIC, 7)?,
         })
     }
@@ -472,9 +477,75 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 left,
                 right,
             } => {
+                let condition = match operator {
+                    native_ir::CompareOperator::LessThan => IntCC::SignedLessThan,
+                    native_ir::CompareOperator::LessThanOrEqual => IntCC::SignedLessThanOrEqual,
+                    native_ir::CompareOperator::GreaterThan => IntCC::SignedGreaterThan,
+                    native_ir::CompareOperator::GreaterThanOrEqual => {
+                        IntCC::SignedGreaterThanOrEqual
+                    }
+                };
                 let left = self.expression(left)?;
                 let right = self.expression(right)?;
-                self.int_compare(*operator, left, right)
+                self.int_compare(condition, left, right)
+            }
+
+            native_ir::Expression::Equality {
+                kind,
+                negated,
+                left,
+                right,
+            } => {
+                let left = self.expression(left)?;
+                let right = self.expression(right)?;
+                match kind {
+                    // Bool and Nil are always tagged immediates: word
+                    // equality is value equality.
+                    native_ir::EqualityKind::Immediate => {
+                        let condition = if *negated {
+                            IntCC::NotEqual
+                        } else {
+                            IntCC::Equal
+                        };
+                        let flag = self.builder.ins().icmp(condition, left, right);
+                        Ok(self.tag_boolean_flag(flag))
+                    }
+                    // Big integers never encode values in the small range,
+                    // so the ordinary comparison diamond is exact for
+                    // equality too.
+                    native_ir::EqualityKind::Int => {
+                        let condition = if *negated {
+                            IntCC::NotEqual
+                        } else {
+                            IntCC::Equal
+                        };
+                        self.int_compare(condition, left, right)
+                    }
+                    native_ir::EqualityKind::Float => {
+                        let condition = if *negated {
+                            FloatCC::NotEqual
+                        } else {
+                            FloatCC::Equal
+                        };
+                        let left = self.load_float(left);
+                        let right = self.load_float(right);
+                        let flag = self.builder.ins().fcmp(condition, left, right);
+                        Ok(self.tag_boolean_flag(flag))
+                    }
+                    native_ir::EqualityKind::String => {
+                        let eq_ref = self
+                            .module
+                            .declare_func_in_func(self.runtime.string_eq, self.builder.func);
+                        let call = self.builder.ins().call(eq_ref, &[left, right]);
+                        let result = self.builder.inst_results(call)[0];
+                        if *negated {
+                            // Flip between the tagged booleans 1 and 3.
+                            Ok(self.builder.ins().bxor_imm_u(result, 2))
+                        } else {
+                            Ok(result)
+                        }
+                    }
+                }
             }
 
             native_ir::Expression::BoolBinary {
@@ -600,17 +671,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     /// tagged 0.
     fn int_compare(
         &mut self,
-        operator: native_ir::CompareOperator,
+        condition: IntCC,
         left: Value,
         right: Value,
     ) -> Result<Value, String> {
-        let condition = match operator {
-            native_ir::CompareOperator::LessThan => IntCC::SignedLessThan,
-            native_ir::CompareOperator::LessThanOrEqual => IntCC::SignedLessThanOrEqual,
-            native_ir::CompareOperator::GreaterThan => IntCC::SignedGreaterThan,
-            native_ir::CompareOperator::GreaterThanOrEqual => IntCC::SignedGreaterThanOrEqual,
-        };
-
         let fast = self.builder.create_block();
         let slow = self.builder.create_block();
         let join = self.builder.create_block();

@@ -195,6 +195,18 @@ pub unsafe extern "C" fn gleam_native_panic(
     std::process::exit(1);
 }
 
+/// String equality by contents, returning [`TRUE`] or [`FALSE`].
+///
+/// # Safety
+///
+/// Both arguments must be strings created by this runtime. The Gleam type
+/// system upholds this for calls from generated code.
+pub unsafe extern "C" fn gleam_native_string_eq(left: u64, right: u64) -> u64 {
+    let left = unsafe { &*(left as *const String) };
+    let right = unsafe { &*(right as *const String) };
+    if left == right { TRUE } else { FALSE }
+}
+
 /// Prints an integer followed by a newline. The standin for a real printing
 /// external until strings exist on the native target.
 pub extern "C" fn print_int(value: u64) -> u64 {
@@ -272,6 +284,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_string_concat",
             gleam_native_string_concat as *const u8,
         ),
+        (
+            "gleam_native_string_eq",
+            gleam_native_string_eq as *const u8,
+        ),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
         ("print_bool", print_bool as *const u8),
@@ -321,6 +337,16 @@ mod tests {
         };
         assert_eq!(boxed & 1, 0);
         assert_eq!(unsafe { &*(boxed as *const String) }, content);
+    }
+
+    #[test]
+    fn string_equality() {
+        let make = |content: &str| unsafe {
+            gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64)
+        };
+        assert_eq!(unsafe { gleam_native_string_eq(make("ab"), make("ab")) }, TRUE);
+        assert_eq!(unsafe { gleam_native_string_eq(make("ab"), make("ac")) }, FALSE);
+        assert_eq!(unsafe { gleam_native_string_eq(make(""), make("")) }, TRUE);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 12;
+pub const FORMAT_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -99,6 +99,14 @@ pub enum Expression {
         left: Box<Expression>,
         right: Box<Expression>,
     },
+    /// `==` or `!=`. Both operands share one static Gleam type, so the
+    /// comparison strategy is chosen at compile time.
+    Equality {
+        kind: EqualityKind,
+        negated: bool,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
     /// `&&` or `||` with short-circuit evaluation: the right expression is
     /// evaluated only when the left one does not decide the result.
     BoolBinary {
@@ -136,6 +144,19 @@ pub enum CompareOperator {
 pub enum BoolOperator {
     And,
     Or,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum EqualityKind {
+    /// Small integers compare directly; big integers via the runtime.
+    Int,
+    /// Boxed floats compare by IEEE `fcmp` on their loaded values.
+    Float,
+    /// Strings compare by contents via the runtime.
+    String,
+    /// Values that are always tagged immediates (`Bool`, `Nil`) compare as
+    /// plain words.
+    Immediate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

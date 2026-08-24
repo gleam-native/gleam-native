@@ -275,6 +275,31 @@ impl Lowerer<'_> {
                 right: Box::new(self.expression(right)?),
             }),
             TypedExpr::BinOp {
+                operator: operator @ (BinOp::Eq | BinOp::NotEq),
+                left,
+                right,
+                ..
+            } => {
+                let type_ = left.type_();
+                let kind = if type_.is_int() {
+                    native_ir::EqualityKind::Int
+                } else if type_.is_float() {
+                    native_ir::EqualityKind::Float
+                } else if type_.is_string() {
+                    native_ir::EqualityKind::String
+                } else if type_.is_bool() || type_.is_nil() {
+                    native_ir::EqualityKind::Immediate
+                } else {
+                    return Err(self.unsupported("equality between values of this type"));
+                };
+                Ok(native_ir::Expression::Equality {
+                    kind,
+                    negated: *operator == BinOp::NotEq,
+                    left: Box::new(self.expression(left)?),
+                    right: Box::new(self.expression(right)?),
+                })
+            }
+            TypedExpr::BinOp {
                 operator: operator @ (BinOp::And | BinOp::Or),
                 left,
                 right,
@@ -557,6 +582,41 @@ mod tests {
                 left: Box::new(native_ir::Expression::Int(3)),
                 right: Box::new(native_ir::Expression::Int(4)),
             })
+        );
+    }
+
+    #[test]
+    fn equality_is_type_directed() {
+        let module = lower(
+            r#"pub fn main() {
+  1 == 2
+  1.5 != 2.5
+  "a" == "b"
+  True != False
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let kinds: Vec<_> = body
+            .iter()
+            .map(|statement| match statement {
+                native_ir::Statement::Expression(native_ir::Expression::Equality {
+                    kind,
+                    negated,
+                    ..
+                }) => (*kind, *negated),
+                _ => panic!("expected an equality expression"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (native_ir::EqualityKind::Int, false),
+                (native_ir::EqualityKind::Float, true),
+                (native_ir::EqualityKind::String, false),
+                (native_ir::EqualityKind::Immediate, true),
+            ]
         );
     }
 

@@ -55,9 +55,11 @@ platform C convention.
 - ✅ Float arithmetic and comparison (`+.`, `-.`, `*.`, `/.`, `<.`, `<=.`,
   `>.`, `>=.`): unboxed register arithmetic between loads, division by zero
   yields 0.0, IEEE ordered comparisons
-- ❌ `==` / `!=` structural equality for every type (deep runtime equality,
-  the same semantics as Erlang `=:=` on Gleam data / `isEqual` in the JS
-  prelude)
+- 🚧 `==` / `!=`: type-directed at compile time for `Int` (including big
+  integers), `Float` (IEEE), `String` (by contents), `Bool`, and `Nil`.
+  Comparing generic type variables and composite types (lists, tuples,
+  custom types) needs polymorphic deep equality, which arrives with heap
+  kind headers
 - ✅ `<>` string concatenation
 - ✅ `&&`, `||` with short-circuit evaluation (pure codegen: the right
   operand's evaluation sits in a conditionally-executed block)
