@@ -209,129 +209,15 @@ impl Lowerer<'_> {
             }
 
             TypedExpr::BinOp {
-                operator:
-                    operator @ (BinOp::AddInt
-                    | BinOp::SubInt
-                    | BinOp::MultInt
-                    | BinOp::DivInt
-                    | BinOp::RemainderInt),
-                left,
-                right,
-                ..
-            } => Ok(native_ir::Expression::IntBinary {
-                operator: match operator {
-                    BinOp::AddInt => native_ir::IntOperator::Add,
-                    BinOp::SubInt => native_ir::IntOperator::Subtract,
-                    BinOp::MultInt => native_ir::IntOperator::Multiply,
-                    BinOp::DivInt => native_ir::IntOperator::Divide,
-                    _ => native_ir::IntOperator::Remainder,
-                },
-                left: Box::new(self.expression(left)?),
-                right: Box::new(self.expression(right)?),
-            }),
-            TypedExpr::BinOp {
-                operator:
-                    operator @ (BinOp::LtInt | BinOp::LtEqInt | BinOp::GtInt | BinOp::GtEqInt),
-                left,
-                right,
-                ..
-            } => Ok(native_ir::Expression::IntCompare {
-                operator: match operator {
-                    BinOp::LtInt => native_ir::CompareOperator::LessThan,
-                    BinOp::LtEqInt => native_ir::CompareOperator::LessThanOrEqual,
-                    BinOp::GtInt => native_ir::CompareOperator::GreaterThan,
-                    _ => native_ir::CompareOperator::GreaterThanOrEqual,
-                },
-                left: Box::new(self.expression(left)?),
-                right: Box::new(self.expression(right)?),
-            }),
-            TypedExpr::BinOp {
-                operator:
-                    operator @ (BinOp::AddFloat
-                    | BinOp::SubFloat
-                    | BinOp::MultFloat
-                    | BinOp::DivFloat),
-                left,
-                right,
-                ..
-            } => Ok(native_ir::Expression::FloatBinary {
-                operator: match operator {
-                    BinOp::AddFloat => native_ir::FloatOperator::Add,
-                    BinOp::SubFloat => native_ir::FloatOperator::Subtract,
-                    BinOp::MultFloat => native_ir::FloatOperator::Multiply,
-                    _ => native_ir::FloatOperator::Divide,
-                },
-                left: Box::new(self.expression(left)?),
-                right: Box::new(self.expression(right)?),
-            }),
-            TypedExpr::BinOp {
-                operator:
-                    operator @ (BinOp::LtFloat
-                    | BinOp::LtEqFloat
-                    | BinOp::GtFloat
-                    | BinOp::GtEqFloat),
-                left,
-                right,
-                ..
-            } => Ok(native_ir::Expression::FloatCompare {
-                operator: match operator {
-                    BinOp::LtFloat => native_ir::CompareOperator::LessThan,
-                    BinOp::LtEqFloat => native_ir::CompareOperator::LessThanOrEqual,
-                    BinOp::GtFloat => native_ir::CompareOperator::GreaterThan,
-                    _ => native_ir::CompareOperator::GreaterThanOrEqual,
-                },
-                left: Box::new(self.expression(left)?),
-                right: Box::new(self.expression(right)?),
-            }),
-            TypedExpr::BinOp {
-                operator: operator @ (BinOp::Eq | BinOp::NotEq),
+                operator,
                 left,
                 right,
                 ..
             } => {
-                let type_ = left.type_();
-                let kind = if type_.is_int() {
-                    native_ir::EqualityKind::Int
-                } else if type_.is_float() {
-                    native_ir::EqualityKind::Float
-                } else if type_.is_string() {
-                    native_ir::EqualityKind::String
-                } else if type_.is_bool() || type_.is_nil() {
-                    native_ir::EqualityKind::Immediate
-                } else {
-                    return Err(self.unsupported("equality between values of this type"));
-                };
-                Ok(native_ir::Expression::Equality {
-                    kind,
-                    negated: *operator == BinOp::NotEq,
-                    left: Box::new(self.expression(left)?),
-                    right: Box::new(self.expression(right)?),
-                })
-            }
-            TypedExpr::BinOp {
-                operator: operator @ (BinOp::And | BinOp::Or),
-                left,
-                right,
-                ..
-            } => Ok(native_ir::Expression::BoolBinary {
-                operator: match operator {
-                    BinOp::And => native_ir::BoolOperator::And,
-                    _ => native_ir::BoolOperator::Or,
-                },
-                left: Box::new(self.expression(left)?),
-                right: Box::new(self.expression(right)?),
-            }),
-            TypedExpr::BinOp {
-                operator: BinOp::Concatenate,
-                left,
-                right,
-                ..
-            } => Ok(native_ir::Expression::StringConcat(
-                Box::new(self.expression(left)?),
-                Box::new(self.expression(right)?),
-            )),
-            TypedExpr::BinOp { operator, .. } => {
-                Err(self.unsupported(&format!("the `{}` operator", operator.name())))
+                let left_type = left.type_();
+                let left = self.expression(left)?;
+                let right = self.expression(right)?;
+                self.binary_operator(*operator, &left_type, left, right)
             }
 
             TypedExpr::Case {
@@ -365,6 +251,152 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Lowers a binary operator applied to already-lowered operands. Shared
+    /// between ordinary expressions and clause guards.
+    fn binary_operator(
+        &self,
+        operator: BinOp,
+        left_type: &Type,
+        left: native_ir::Expression,
+        right: native_ir::Expression,
+    ) -> Result<native_ir::Expression, Error> {
+        let left = Box::new(left);
+        let right = Box::new(right);
+        match operator {
+            BinOp::AddInt | BinOp::SubInt | BinOp::MultInt | BinOp::DivInt
+            | BinOp::RemainderInt => Ok(native_ir::Expression::IntBinary {
+                operator: match operator {
+                    BinOp::AddInt => native_ir::IntOperator::Add,
+                    BinOp::SubInt => native_ir::IntOperator::Subtract,
+                    BinOp::MultInt => native_ir::IntOperator::Multiply,
+                    BinOp::DivInt => native_ir::IntOperator::Divide,
+                    _ => native_ir::IntOperator::Remainder,
+                },
+                left,
+                right,
+            }),
+            BinOp::LtInt | BinOp::LtEqInt | BinOp::GtInt | BinOp::GtEqInt => {
+                Ok(native_ir::Expression::IntCompare {
+                    operator: match operator {
+                        BinOp::LtInt => native_ir::CompareOperator::LessThan,
+                        BinOp::LtEqInt => native_ir::CompareOperator::LessThanOrEqual,
+                        BinOp::GtInt => native_ir::CompareOperator::GreaterThan,
+                        _ => native_ir::CompareOperator::GreaterThanOrEqual,
+                    },
+                    left,
+                    right,
+                })
+            }
+            BinOp::AddFloat | BinOp::SubFloat | BinOp::MultFloat | BinOp::DivFloat => {
+                Ok(native_ir::Expression::FloatBinary {
+                    operator: match operator {
+                        BinOp::AddFloat => native_ir::FloatOperator::Add,
+                        BinOp::SubFloat => native_ir::FloatOperator::Subtract,
+                        BinOp::MultFloat => native_ir::FloatOperator::Multiply,
+                        _ => native_ir::FloatOperator::Divide,
+                    },
+                    left,
+                    right,
+                })
+            }
+            BinOp::LtFloat | BinOp::LtEqFloat | BinOp::GtFloat | BinOp::GtEqFloat => {
+                Ok(native_ir::Expression::FloatCompare {
+                    operator: match operator {
+                        BinOp::LtFloat => native_ir::CompareOperator::LessThan,
+                        BinOp::LtEqFloat => native_ir::CompareOperator::LessThanOrEqual,
+                        BinOp::GtFloat => native_ir::CompareOperator::GreaterThan,
+                        _ => native_ir::CompareOperator::GreaterThanOrEqual,
+                    },
+                    left,
+                    right,
+                })
+            }
+            BinOp::Eq | BinOp::NotEq => {
+                let kind = if left_type.is_int() {
+                    native_ir::EqualityKind::Int
+                } else if left_type.is_float() {
+                    native_ir::EqualityKind::Float
+                } else if left_type.is_string() {
+                    native_ir::EqualityKind::String
+                } else if left_type.is_bool() || left_type.is_nil() {
+                    native_ir::EqualityKind::Immediate
+                } else {
+                    return Err(self.unsupported("equality between values of this type"));
+                };
+                Ok(native_ir::Expression::Equality {
+                    kind,
+                    negated: operator == BinOp::NotEq,
+                    left,
+                    right,
+                })
+            }
+            BinOp::And | BinOp::Or => Ok(native_ir::Expression::BoolBinary {
+                operator: match operator {
+                    BinOp::And => native_ir::BoolOperator::And,
+                    _ => native_ir::BoolOperator::Or,
+                },
+                left,
+                right,
+            }),
+            BinOp::Concatenate => Ok(native_ir::Expression::StringConcat(left, right)),
+        }
+    }
+
+    fn guard(&self, guard: &crate::ast::TypedClauseGuard) -> Result<native_ir::Expression, Error> {
+        use crate::ast::ClauseGuard;
+        match guard {
+            ClauseGuard::Block { value, .. } => self.guard(value),
+
+            ClauseGuard::BinaryOperator {
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                let left_type = left.type_();
+                let left = self.guard(left)?;
+                let right = self.guard(right)?;
+                self.binary_operator(*operator, &left_type, left, right)
+            }
+
+            ClauseGuard::Not { expression, .. } => Ok(native_ir::Expression::BoolNot(Box::new(
+                self.guard(expression)?,
+            ))),
+
+            ClauseGuard::Var { name, .. } => {
+                Ok(native_ir::Expression::Variable(name.clone().into()))
+            }
+
+            ClauseGuard::Constant(constant) => self.constant(constant),
+
+            ClauseGuard::TupleIndex { .. } => Err(self.unsupported("tuples in guards")),
+            ClauseGuard::FieldAccess { .. } => Err(self.unsupported("field access in guards")),
+            ClauseGuard::ModuleSelect { .. } => Err(self.unsupported("constants in guards")),
+            ClauseGuard::Invalid { .. } => Err(self.unsupported("this guard expression")),
+        }
+    }
+
+    fn constant(
+        &self,
+        constant: &crate::ast::TypedConstant,
+    ) -> Result<native_ir::Expression, Error> {
+        use crate::ast::Constant;
+        match constant {
+            Constant::Int { int_value, .. } => Ok(lower_int(int_value)),
+            Constant::Float { float_value, .. } => {
+                Ok(native_ir::Expression::Float(float_value.value()))
+            }
+            Constant::String { value, .. } => Ok(native_ir::Expression::String(
+                crate::strings::convert_string_escape_chars(value).into(),
+            )),
+            Constant::Record { name, type_, .. } if type_.is_bool() => {
+                Ok(native_ir::Expression::Bool(name == "True"))
+            }
+            Constant::Record { type_, .. } if type_.is_nil() => Ok(native_ir::Expression::Nil),
+            _ => Err(self.unsupported("this kind of constant")),
+        }
+    }
+
     fn decision(
         &self,
         decision: &exhaustiveness::Decision,
@@ -376,8 +408,31 @@ impl Lowerer<'_> {
                 self.decision_body(body, clauses, subject_indices)
             }
 
-            exhaustiveness::Decision::Guard { .. } => {
-                Err(self.unsupported("guards in case expressions"))
+            exhaustiveness::Decision::Guard {
+                guard,
+                if_true,
+                if_false,
+            } => {
+                let guard_expression = clauses
+                    .get(*guard)
+                    .expect("guard clause index in range")
+                    .guard
+                    .as_ref()
+                    .expect("guard decision on clause with a guard");
+                let bindings = self.bound_values(&if_true.bindings, subject_indices)?;
+                let clause = clauses
+                    .get(if_true.clause_index)
+                    .expect("decision tree clause index in range");
+                let body = vec![native_ir::Statement::Expression(
+                    self.expression(&clause.then)?,
+                )];
+                let if_false = self.decision(if_false, clauses, subject_indices)?;
+                Ok(native_ir::Decision::Guard {
+                    bindings,
+                    guard: Box::new(self.guard(guard_expression)?),
+                    if_true: body,
+                    if_false: Box::new(if_false),
+                })
             }
 
             exhaustiveness::Decision::Fail => Ok(native_ir::Decision::Fail),
@@ -464,8 +519,23 @@ impl Lowerer<'_> {
         clauses: &[TypedClause],
         subject_indices: &HashMap<usize, u32>,
     ) -> Result<native_ir::Decision, Error> {
-        let mut bindings = Vec::with_capacity(body.bindings.len());
-        for (name, value) in &body.bindings {
+        let bindings = self.bound_values(&body.bindings, subject_indices)?;
+        let clause = clauses
+            .get(body.clause_index)
+            .expect("decision tree clause index in range");
+        let body = vec![native_ir::Statement::Expression(
+            self.expression(&clause.then)?,
+        )];
+        Ok(native_ir::Decision::Run { bindings, body })
+    }
+
+    fn bound_values(
+        &self,
+        body_bindings: &[(EcoString, exhaustiveness::BoundValue)],
+        subject_indices: &HashMap<usize, u32>,
+    ) -> Result<Vec<(String, native_ir::Bound)>, Error> {
+        let mut bindings = Vec::with_capacity(body_bindings.len());
+        for (name, value) in body_bindings {
             let bound = match value {
                 exhaustiveness::BoundValue::Variable(variable) => native_ir::Bound::Subject(
                     *subject_indices
@@ -494,14 +564,7 @@ impl Lowerer<'_> {
             };
             bindings.push((name.clone().into(), bound));
         }
-
-        let clause = clauses
-            .get(body.clause_index)
-            .expect("decision tree clause index in range");
-        let body = vec![native_ir::Statement::Expression(
-            self.expression(&clause.then)?,
-        )];
-        Ok(native_ir::Decision::Run { bindings, body })
+        Ok(bindings)
     }
 
     fn panic_expression(
@@ -877,6 +940,54 @@ mod tests {
                     }),
                 },
             })
+        );
+    }
+
+    #[test]
+    fn case_guards() {
+        let module = lower(
+            r#"pub fn main() {
+  case 5 {
+    n if n > 3 && n != 4 -> n
+    _ -> 0
+  }
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        else {
+            panic!("expected a case expression");
+        };
+        assert_eq!(
+            tree,
+            &native_ir::Decision::Guard {
+                bindings: vec![("n".into(), native_ir::Bound::Subject(0))],
+                guard: Box::new(native_ir::Expression::BoolBinary {
+                    operator: native_ir::BoolOperator::And,
+                    left: Box::new(native_ir::Expression::IntCompare {
+                        operator: native_ir::CompareOperator::GreaterThan,
+                        left: Box::new(native_ir::Expression::Variable("n".into())),
+                        right: Box::new(native_ir::Expression::Int(3)),
+                    }),
+                    right: Box::new(native_ir::Expression::Equality {
+                        kind: native_ir::EqualityKind::Int,
+                        negated: true,
+                        left: Box::new(native_ir::Expression::Variable("n".into())),
+                        right: Box::new(native_ir::Expression::Int(4)),
+                    }),
+                }),
+                if_true: vec![native_ir::Statement::Expression(
+                    native_ir::Expression::Variable("n".into())
+                )],
+                if_false: Box::new(native_ir::Decision::Run {
+                    bindings: vec![],
+                    body: vec![native_ir::Statement::Expression(
+                        native_ir::Expression::Int(0)
+                    )],
+                }),
+            }
         );
     }
 

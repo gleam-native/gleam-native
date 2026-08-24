@@ -80,7 +80,9 @@ platform C convention.
 - ❌ Destructuring pattern kinds: tuples, constructors with fields, lists
   (`[x, ..rest]`), string prefixes, bit arrays, `as` bindings on composite
   patterns — each blocked on its data type existing natively
-- ❌ Guards (`if` clauses), including guard-legal constants and operators
+- 🚧 Guards (`if` clauses): operators, negation, variables, and scalar
+  literal constants work (sharing the expression operator lowering). Not yet:
+  tuples, field access, and module constants in guards
 - ❌ `use` expressions (desugared to callbacks; needs closures)
 - ❌ `assert` (boolean assertion with structured failure information)
 

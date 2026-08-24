@@ -565,6 +565,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
             }
 
+            native_ir::Expression::BoolNot(expression) => {
+                let value = self.expression(expression)?;
+                // Flip between the tagged booleans 1 and 3.
+                Ok(self.builder.ins().bxor_imm_u(value, 2))
+            }
+
             native_ir::Expression::BoolBinary {
                 operator,
                 left,
@@ -689,6 +695,44 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .ins()
                     .trap(TrapCode::user(1).expect("valid trap code"));
                 Ok(())
+            }
+
+            native_ir::Decision::Guard {
+                bindings,
+                guard,
+                if_true,
+                if_false,
+            } => {
+                // The pattern's bindings are in scope for the guard and the
+                // clause body, but not for the rest of the tree.
+                let saved_environment = self.environment.clone();
+                for (name, bound) in bindings {
+                    let value = match bound {
+                        native_ir::Bound::Subject(index) => subjects[*index as usize],
+                        native_ir::Bound::Value(expression) => self.expression(expression)?,
+                    };
+                    let variable = self.builder.declare_var(types::I64);
+                    self.builder.def_var(variable, value);
+                    let _ = self.environment.insert(name.clone(), variable);
+                }
+
+                let guard_value = self.expression(guard)?;
+                let is_true = self.builder.ins().band_imm_u(guard_value, 2);
+                let true_block = self.builder.create_block();
+                let false_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(is_true, true_block, &[], false_block, &[]);
+                self.builder.seal_block(true_block);
+                self.builder.seal_block(false_block);
+
+                self.builder.switch_to_block(true_block);
+                let result = self.statements(if_true)?;
+                self.builder.ins().jump(join, &[result.into()]);
+                self.environment = saved_environment;
+
+                self.builder.switch_to_block(false_block);
+                self.decision(subjects, if_false, join)
             }
 
             native_ir::Decision::Switch {
