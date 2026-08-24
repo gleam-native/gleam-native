@@ -382,6 +382,9 @@ where
                 cached_module_names,
                 app_file.as_ref(),
             ),
+            TargetCodegenConfiguration::Native => {
+                self.perform_native_codegen(modules, cached_module_names)
+            }
         }
     }
 
@@ -490,6 +493,15 @@ where
             }
         }
 
+        Ok(())
+    }
+
+    fn perform_native_codegen(
+        &mut self,
+        modules: &[Module],
+        cached_module_names: &[EcoString],
+    ) -> Result<(), Error> {
+        // TODO(native): Implement native codegen
         Ok(())
     }
 

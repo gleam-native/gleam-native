@@ -101,6 +101,7 @@ macro_rules! assert_output {
             assert_output!(&snapshot_name, Some(Target::JavaScript), Some(Runtime::Bun), $project_name);
             assert_output!(&snapshot_name, Some(Target::JavaScript), Some(Runtime::Deno), $project_name);
             assert_output!(&snapshot_name, Some(Target::JavaScript), Some(Runtime::NodeJs), $project_name);
+            assert_output!(&snapshot_name, Some(Target::Native), None, $project_name);
         }
     };
 
@@ -114,7 +115,10 @@ macro_rules! assert_output {
             },
             Target::Erlang => {
                 assert_output!(&snapshot_name, Some($target), None, $project_name);
-            }
+            },
+            Target::Native => {
+                assert_output!(&snapshot_name, Some($target), None, $project_name);
+            },
         }
     };
 
@@ -130,6 +134,7 @@ fn snapshot_name(target: Option<Target>, runtime: Option<Runtime>, suffix: &str)
     let show_target = |target: Target| match target {
         Target::Erlang => "erlang",
         Target::JavaScript => "javascript",
+        Target::Native => "native",
     };
     let show_runtime = |runtime: Runtime| match runtime {
         Runtime::NodeJs => "nodejs",

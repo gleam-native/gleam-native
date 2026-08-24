@@ -436,6 +436,9 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
 
     #[error("could not create temp file: {error}")]
     CouldNotCreateTempFile { error: String },
+
+    #[error("Unsupported target")]
+    UnsupportedTarget,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -2438,6 +2441,10 @@ satisfying {required_version} but you are using v{gleam_version}.",
                         "You can not set a runtime for Erlang. Did you mean to target JavaScript?"
                             .into(),
                     ),
+                    Target::Native => Some(
+                        "You can not set a runtime for Native. Did you mean to target JavaScript?"
+                            .into(),
+                    ),
                 };
 
                 vec![Diagnostic {
@@ -2519,6 +2526,14 @@ as this one is already in use.
                     "A package cannot depend on itself, so you cannot \
 add `gleam add {name}` in this project."
                 ),
+                level: Level::Error,
+                location: None,
+                hint: None,
+            }],
+
+            Error::UnsupportedTarget => vec![Diagnostic {
+                title: "Unsupported target".into(),
+                text: "The target you are trying to compile for is not supported.".into(),
                 level: Level::Error,
                 location: None,
                 hint: None,
@@ -4469,6 +4484,7 @@ and there is no implementation for the {} target.",
                 match current_target {
                     Target::Erlang => "Erlang",
                     Target::JavaScript => "JavaScript",
+                    Target::Native => "Native",
                 }
             );
             let hint = wrap("Did you mean to build for a different target?");
@@ -4497,6 +4513,7 @@ and there is no implementation for the {} target.",
             let target = match target {
                 Target::Erlang => "Erlang",
                 Target::JavaScript => "JavaScript",
+                Target::Native => "Native",
             };
             let text = wrap_format!(
                 "The `{name}` function is public but doesn't have an \

@@ -50,12 +50,16 @@ pub struct Implementations {
     pub gleam: bool,
     pub can_run_on_erlang: bool,
     pub can_run_on_javascript: bool,
+    pub can_run_on_native: bool,
     /// Whether the function has an implementation that uses external Erlang
     /// code.
     pub uses_erlang_externals: bool,
     /// Whether the function has an implementation that uses external javascript
     /// code.
     pub uses_javascript_externals: bool,
+    /// Whether the function has an implementation that uses external native
+    /// code.
+    pub uses_native_externals: bool,
 }
 
 impl Implementations {
@@ -64,8 +68,10 @@ impl Implementations {
             gleam: true,
             can_run_on_erlang: true,
             can_run_on_javascript: true,
+            can_run_on_native: true,
             uses_javascript_externals: false,
             uses_erlang_externals: false,
+            uses_native_externals: false,
         }
     }
 }
@@ -162,6 +168,8 @@ pub struct FunctionDefinition {
     pub has_erlang_external: bool,
     /// The function has @external(JavaScript, "...", "...")
     pub has_javascript_external: bool,
+    /// The function has @external(native, "...", "...")
+    pub has_native_external: bool,
 }
 
 impl FunctionDefinition {
@@ -169,6 +177,7 @@ impl FunctionDefinition {
         match target {
             Target::Erlang => self.has_erlang_external,
             Target::JavaScript => self.has_javascript_external,
+            Target::Native => self.has_native_external,
         }
     }
 }
@@ -188,13 +197,16 @@ impl Implementations {
             gleam,
             uses_erlang_externals: other_uses_erlang_externals,
             uses_javascript_externals: other_uses_javascript_externals,
+            uses_native_externals: other_uses_native_externals,
             can_run_on_erlang: other_can_run_on_erlang,
             can_run_on_javascript: other_can_run_on_javascript,
+            can_run_on_native: other_can_run_on_native,
         } = implementations;
         let FunctionDefinition {
             has_body: _,
             has_erlang_external,
             has_javascript_external,
+            has_native_external,
         } = current_function_definition;
 
         // If a pure-Gleam function uses a function that doesn't have a pure
@@ -207,6 +219,8 @@ impl Implementations {
             || (self.can_run_on_erlang && (*gleam || *other_can_run_on_erlang));
         self.can_run_on_javascript = *has_javascript_external
             || (self.can_run_on_javascript && (*gleam || *other_can_run_on_javascript));
+        self.can_run_on_native = *has_native_external
+            || (self.can_run_on_native && (*gleam || *other_can_run_on_native));
 
         // If a function uses a function that relies on external code (be it
         // JavaScript or Erlang) then it's considered as using external code as
@@ -229,6 +243,7 @@ impl Implementations {
         self.uses_erlang_externals = self.uses_erlang_externals || *other_uses_erlang_externals;
         self.uses_javascript_externals =
             self.uses_javascript_externals || *other_uses_javascript_externals;
+        self.uses_native_externals = self.uses_native_externals || *other_uses_native_externals;
     }
 
     /// Returns true if the current target is supported by the given
@@ -240,6 +255,7 @@ impl Implementations {
             || match target {
                 Target::Erlang => self.can_run_on_erlang,
                 Target::JavaScript => self.can_run_on_javascript,
+                Target::Native => self.can_run_on_native,
             }
     }
 }
@@ -318,13 +334,16 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             gleam: definition.has_body,
             can_run_on_erlang: definition.has_body || definition.has_erlang_external,
             can_run_on_javascript: definition.has_body || definition.has_javascript_external,
+            can_run_on_native: definition.has_body || definition.has_native_external,
             uses_erlang_externals: definition.has_erlang_external,
             uses_javascript_externals: definition.has_javascript_external,
+            uses_native_externals: definition.has_native_external,
         };
 
         let uses_externals = match environment.target {
             Target::Erlang => implementations.uses_erlang_externals,
             Target::JavaScript => implementations.uses_javascript_externals,
+            Target::Native => implementations.uses_native_externals,
         };
 
         let purity = if is_trusted_pure_module(environment) {

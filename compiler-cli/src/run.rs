@@ -161,6 +161,13 @@ pub fn setup(
                 run_javascript_bun_command(paths, &main_function.package, &module, arguments)
             }
         },
+        Target::Native => match runtime {
+            Some(r) => Err(Error::InvalidRuntime {
+                target: Target::Native,
+                invalid_runtime: r,
+            }),
+            _ => run_native_command(paths, &main_function.package, &module, arguments),
+        },
     }
 }
 
@@ -250,6 +257,15 @@ fn run_javascript_node_command(
         cwd: None,
         stdio: Stdio::Inherit,
     })
+}
+
+fn run_native_command(
+    paths: &ProjectPaths,
+    package: &str,
+    module: &str,
+    arguments: Vec<String>,
+) -> Result<Command, Error> {
+    Err(Error::UnsupportedTarget)
 }
 
 fn write_javascript_entrypoint(
