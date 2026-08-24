@@ -13,6 +13,8 @@ license = "Apache-2.0"
 gleam-core = { path = "../compiler-core" }
 # The gleam formatter
 gleam-format = { path = "../format" }
+# Cranelift-based code generation for the native target
+native-generation = { path = "../native-generation" }
 # The language server
 gleam-language-server = { path = "../language-server" }
 # OS SIGINT and SIGTERM signal handling
