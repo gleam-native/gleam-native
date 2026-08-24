@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, Value, types};
+use cranelift_codegen::ir::{
+    AbiParam, Block, InstBuilder, MemFlagsData, Signature, TrapCode, Value, types,
+};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
@@ -419,6 +421,21 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 Ok(self.builder.inst_results(call)[0])
             }
 
+            native_ir::Expression::Case { subjects, tree } => {
+                let subjects = subjects
+                    .iter()
+                    .map(|subject| self.expression(subject))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+                self.decision(&subjects, tree, join)?;
+                self.builder.seal_block(join);
+
+                self.builder.switch_to_block(join);
+                Ok(self.builder.block_params(join)[0])
+            }
+
             native_ir::Expression::Panic {
                 kind,
                 message,
@@ -632,6 +649,105 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let right = self.load_float(right);
                 let flag = self.builder.ins().fcmp(condition, left, right);
                 Ok(self.tag_boolean_flag(flag))
+            }
+        }
+    }
+
+    /// Emits a decision tree node into the current block. Every path through
+    /// the tree either jumps to `join` with the matched clause's result or
+    /// traps on the unreachable `Fail` node.
+    fn decision(
+        &mut self,
+        subjects: &[Value],
+        tree: &native_ir::Decision,
+        join: Block,
+    ) -> Result<(), String> {
+        match tree {
+            native_ir::Decision::Run { bindings, body } => {
+                // Clause bindings must not leak past this clause: another
+                // clause or the surrounding code may use the same names.
+                let saved_environment = self.environment.clone();
+                for (name, bound) in bindings {
+                    let value = match bound {
+                        native_ir::Bound::Subject(index) => subjects[*index as usize],
+                        native_ir::Bound::Value(expression) => self.expression(expression)?,
+                    };
+                    let variable = self.builder.declare_var(types::I64);
+                    self.builder.def_var(variable, value);
+                    let _ = self.environment.insert(name.clone(), variable);
+                }
+                let result = self.statements(body)?;
+                self.builder.ins().jump(join, &[result.into()]);
+                self.environment = saved_environment;
+                Ok(())
+            }
+
+            native_ir::Decision::Fail => {
+                // The type system guarantees exhaustiveness; this node is
+                // unreachable at run time.
+                self.builder
+                    .ins()
+                    .trap(TrapCode::user(1).expect("valid trap code"));
+                Ok(())
+            }
+
+            native_ir::Decision::Switch {
+                subject,
+                choices,
+                fallback,
+            } => {
+                let subject = subjects[*subject as usize];
+                for (check, decision) in choices {
+                    let matched = self.check(subject, check)?;
+                    let match_block = self.builder.create_block();
+                    let next_block = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(matched, match_block, &[], next_block, &[]);
+                    self.builder.seal_block(match_block);
+                    self.builder.seal_block(next_block);
+
+                    self.builder.switch_to_block(match_block);
+                    self.decision(subjects, decision, join)?;
+                    self.builder.switch_to_block(next_block);
+                }
+                self.decision(subjects, fallback, join)
+            }
+        }
+    }
+
+    /// Emits a runtime check against a subject, yielding a value that is
+    /// non-zero when the check succeeds.
+    fn check(&mut self, subject: Value, check: &native_ir::Check) -> Result<Value, String> {
+        match check {
+            native_ir::Check::Int(value) => {
+                let expected = self.builder.ins().iconst(types::I64, (value << 1) | 1);
+                Ok(self.builder.ins().icmp(IntCC::Equal, subject, expected))
+            }
+            native_ir::Check::Immediate(word) => {
+                let expected = self.builder.ins().iconst(types::I64, *word);
+                Ok(self.builder.ins().icmp(IntCC::Equal, subject, expected))
+            }
+            native_ir::Check::BigInt(bytes) => {
+                let literal =
+                    self.construct_from_constant_bytes(bytes, self.runtime.bigint_from_bytes)?;
+                let equal = self.int_compare(IntCC::Equal, subject, literal)?;
+                Ok(self.builder.ins().band_imm_u(equal, 2))
+            }
+            native_ir::Check::Float(value) => {
+                let subject = self.load_float(subject);
+                let expected = self.builder.ins().f64const(*value);
+                Ok(self.builder.ins().fcmp(FloatCC::Equal, subject, expected))
+            }
+            native_ir::Check::String(value) => {
+                let literal = self
+                    .construct_from_constant_bytes(value.as_bytes(), self.runtime.string_from_bytes)?;
+                let eq_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.string_eq, self.builder.func);
+                let call = self.builder.ins().call(eq_ref, &[subject, literal]);
+                let equal = self.builder.inst_results(call)[0];
+                Ok(self.builder.ins().band_imm_u(equal, 2))
             }
         }
     }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 13;
+pub const FORMAT_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -115,6 +115,13 @@ pub enum Expression {
         right: Box<Expression>,
     },
     StringConcat(Box<Expression>, Box<Expression>),
+    /// A `case` expression, lowered from the compiler's exhaustiveness
+    /// decision tree. Subjects are evaluated once, in order, then the tree
+    /// decides which clause body runs.
+    Case {
+        subjects: Vec<Expression>,
+        tree: Decision,
+    },
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
     /// string expression evaluated only if the panic is reached.
@@ -144,6 +151,50 @@ pub enum CompareOperator {
 pub enum BoolOperator {
     And,
     Or,
+}
+
+/// A node of a lowered pattern-match decision tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Decision {
+    /// A pattern matched: bind its variables, then run the clause body.
+    Run {
+        bindings: Vec<(String, Bound)>,
+        body: Vec<Statement>,
+    },
+    /// Try each check against the subject in order; on the first success
+    /// follow its decision, otherwise the fallback. The type system
+    /// guarantees the fallback always matches.
+    Switch {
+        subject: u32,
+        choices: Vec<(Check, Decision)>,
+        fallback: Box<Decision>,
+    },
+    /// Unreachable for exhaustive matches; traps if ever executed.
+    Fail,
+}
+
+/// The value bound to a pattern variable when a clause matches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Bound {
+    /// One of the case subjects.
+    Subject(u32),
+    /// A literal from the pattern itself.
+    Value(Expression),
+}
+
+/// A runtime check a decision tree performs against a subject.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Check {
+    /// The subject is a small integer equal to this tagged-encodable value.
+    Int(i64),
+    /// The subject equals this big integer (signed little-endian bytes).
+    BigInt(Vec<u8>),
+    /// The subject is a float equal to this value.
+    Float(f64),
+    /// The subject is a string with these contents.
+    String(String),
+    /// The subject is exactly this tagged word (`Bool`/`Nil` variants).
+    Immediate(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

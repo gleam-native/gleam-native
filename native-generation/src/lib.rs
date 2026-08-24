@@ -190,6 +190,46 @@ mod tests {
         crate::jit::run(&[module], "app").unwrap();
     }
 
+    /// A case expression's decision tree compiles and runs: a boolean switch
+    /// with an immediate check and a fallback.
+    #[test]
+    fn jit_runs_case_expressions() {
+        let module = native_ir::Module {
+            name: "app".into(),
+            functions: vec![native_ir::Function::Defined {
+                name: "main".into(),
+                parameters: vec![],
+                body: vec![native_ir::Statement::Expression(
+                    native_ir::Expression::Case {
+                        subjects: vec![native_ir::Expression::Bool(true)],
+                        tree: native_ir::Decision::Switch {
+                            subject: 0,
+                            choices: vec![(
+                                native_ir::Check::Immediate(3),
+                                native_ir::Decision::Run {
+                                    bindings: vec![(
+                                        "x".into(),
+                                        native_ir::Bound::Subject(0),
+                                    )],
+                                    body: vec![native_ir::Statement::Expression(
+                                        native_ir::Expression::Variable("x".into()),
+                                    )],
+                                },
+                            )],
+                            fallback: Box::new(native_ir::Decision::Run {
+                                bindings: vec![],
+                                body: vec![native_ir::Statement::Expression(
+                                    native_ir::Expression::Int(0),
+                                )],
+                            }),
+                        },
+                    },
+                )],
+            }],
+        };
+        crate::jit::run(&[module], "app").unwrap();
+    }
+
     /// A panic expression translates and compiles; `main` must not call it,
     /// as the runtime panic aborts the whole process, test runner included.
     #[test]

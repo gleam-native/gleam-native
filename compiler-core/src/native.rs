@@ -7,14 +7,33 @@
 //! outside it produces an error naming the unsupported feature rather than
 //! generating wrong code. The subset grows with the native backend.
 
+use std::collections::HashMap;
+
 use ecow::EcoString;
+use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use crate::{
-    ast::{BinOp, Pattern, Statement, TypedExpr, TypedModule, TypedStatement},
+    ast::{BinOp, Pattern, Statement, TypedClause, TypedExpr, TypedModule, TypedStatement},
     error::Error,
-    type_::{PRELUDE_MODULE_NAME, ValueConstructorVariant},
+    exhaustiveness,
+    type_::{PRELUDE_MODULE_NAME, Type, ValueConstructorVariant},
 };
+
+/// The tagged word encoding of a small integer; see `native-runtime`.
+fn tag_small_int(value: i64) -> i64 {
+    (value << 1) | 1
+}
+
+fn lower_int(value: &BigInt) -> native_ir::Expression {
+    match value
+        .to_i64()
+        .filter(|value| ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(value))
+    {
+        Some(value) => native_ir::Expression::Int(value),
+        None => native_ir::Expression::BigInt(value.to_signed_bytes_le()),
+    }
+}
 
 pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
     let mut functions = Vec::new();
@@ -124,17 +143,7 @@ impl Lowerer<'_> {
 
     fn expression(&self, expression: &TypedExpr) -> Result<native_ir::Expression, Error> {
         match expression {
-            TypedExpr::Int { int_value, .. } => {
-                match int_value
-                    .to_i64()
-                    .filter(|value| ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(value))
-                {
-                    Some(value) => Ok(native_ir::Expression::Int(value)),
-                    None => Ok(native_ir::Expression::BigInt(
-                        int_value.to_signed_bytes_le(),
-                    )),
-                }
-            }
+            TypedExpr::Int { int_value, .. } => Ok(lower_int(int_value)),
 
             TypedExpr::Float { float_value, .. } => {
                 Ok(native_ir::Expression::Float(float_value.value()))
@@ -325,6 +334,26 @@ impl Lowerer<'_> {
                 Err(self.unsupported(&format!("the `{}` operator", operator.name())))
             }
 
+            TypedExpr::Case {
+                subjects,
+                clauses,
+                compiled_case,
+                ..
+            } => {
+                let subject_indices: HashMap<usize, u32> = compiled_case
+                    .subject_variables
+                    .iter()
+                    .enumerate()
+                    .map(|(index, variable)| (variable.id, index as u32))
+                    .collect();
+                let tree = self.decision(&compiled_case.tree, clauses, &subject_indices)?;
+                let subjects = subjects
+                    .iter()
+                    .map(|subject| self.expression(subject))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(native_ir::Expression::Case { subjects, tree })
+            }
+
             TypedExpr::Panic {
                 location, message, ..
             } => self.panic_expression(native_ir::PanicKind::Panic, message, location),
@@ -334,6 +363,145 @@ impl Lowerer<'_> {
 
             _ => Err(self.unsupported("this kind of expression")),
         }
+    }
+
+    fn decision(
+        &self,
+        decision: &exhaustiveness::Decision,
+        clauses: &[TypedClause],
+        subject_indices: &HashMap<usize, u32>,
+    ) -> Result<native_ir::Decision, Error> {
+        match decision {
+            exhaustiveness::Decision::Run { body } => {
+                self.decision_body(body, clauses, subject_indices)
+            }
+
+            exhaustiveness::Decision::Guard { .. } => {
+                Err(self.unsupported("guards in case expressions"))
+            }
+
+            exhaustiveness::Decision::Fail => Ok(native_ir::Decision::Fail),
+
+            exhaustiveness::Decision::Switch {
+                var,
+                choices,
+                fallback,
+                fallback_check: _,
+            } => {
+                let subject = *subject_indices
+                    .get(&var.id)
+                    .ok_or_else(|| self.unsupported("patterns that destructure values"))?;
+                let choices = choices
+                    .iter()
+                    .map(|(check, decision)| {
+                        let check = self.runtime_check(check, &var.type_)?;
+                        let decision = self.decision(decision, clauses, subject_indices)?;
+                        Ok((check, decision))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                let fallback = self.decision(fallback, clauses, subject_indices)?;
+                Ok(native_ir::Decision::Switch {
+                    subject,
+                    choices,
+                    fallback: Box::new(fallback),
+                })
+            }
+        }
+    }
+
+    fn runtime_check(
+        &self,
+        check: &exhaustiveness::RuntimeCheck,
+        subject_type: &Type,
+    ) -> Result<native_ir::Check, Error> {
+        match check {
+            exhaustiveness::RuntimeCheck::Int { int_value } => {
+                Ok(match lower_int(int_value) {
+                    native_ir::Expression::Int(value) => native_ir::Check::Int(value),
+                    _ => native_ir::Check::BigInt(int_value.to_signed_bytes_le()),
+                })
+            }
+            exhaustiveness::RuntimeCheck::Float { float_value } => {
+                Ok(native_ir::Check::Float(float_value.value()))
+            }
+            exhaustiveness::RuntimeCheck::String { value } => Ok(native_ir::Check::String(
+                crate::strings::convert_string_escape_chars(value).into(),
+            )),
+            exhaustiveness::RuntimeCheck::Variant { index, fields, .. } if fields.is_empty() => {
+                // The only variant-shaped values so far are the tagged
+                // immediates: Bool (True is variant 0 but encodes as 1) and
+                // Nil.
+                if subject_type.is_bool() {
+                    Ok(native_ir::Check::Immediate(tag_small_int(
+                        if *index == 0 { 1 } else { 0 },
+                    )))
+                } else if subject_type.is_nil() {
+                    Ok(native_ir::Check::Immediate(tag_small_int(0)))
+                } else {
+                    Err(self.unsupported("matching on custom types"))
+                }
+            }
+            exhaustiveness::RuntimeCheck::Variant { .. } => {
+                Err(self.unsupported("matching on custom types"))
+            }
+            exhaustiveness::RuntimeCheck::StringPrefix { .. } => {
+                Err(self.unsupported("string prefix patterns"))
+            }
+            exhaustiveness::RuntimeCheck::Tuple { .. } => Err(self.unsupported("tuple patterns")),
+            exhaustiveness::RuntimeCheck::BitArray { .. } => {
+                Err(self.unsupported("bit array patterns"))
+            }
+            exhaustiveness::RuntimeCheck::EmptyList
+            | exhaustiveness::RuntimeCheck::NonEmptyList { .. } => {
+                Err(self.unsupported("list patterns"))
+            }
+        }
+    }
+
+    fn decision_body(
+        &self,
+        body: &exhaustiveness::Body,
+        clauses: &[TypedClause],
+        subject_indices: &HashMap<usize, u32>,
+    ) -> Result<native_ir::Decision, Error> {
+        let mut bindings = Vec::with_capacity(body.bindings.len());
+        for (name, value) in &body.bindings {
+            let bound = match value {
+                exhaustiveness::BoundValue::Variable(variable) => native_ir::Bound::Subject(
+                    *subject_indices
+                        .get(&variable.id)
+                        .ok_or_else(|| self.unsupported("patterns that destructure values"))?,
+                ),
+                exhaustiveness::BoundValue::LiteralInt(value) => {
+                    native_ir::Bound::Value(lower_int(value))
+                }
+                exhaustiveness::BoundValue::LiteralFloat(value) => {
+                    let value = crate::parse::LiteralFloatValue::parse(value)
+                        .ok_or_else(|| self.unsupported("this float literal"))?;
+                    native_ir::Bound::Value(native_ir::Expression::Float(value.value()))
+                }
+                exhaustiveness::BoundValue::LiteralString(value) => {
+                    native_ir::Bound::Value(native_ir::Expression::String(
+                        crate::strings::convert_string_escape_chars(value).into(),
+                    ))
+                }
+                exhaustiveness::BoundValue::BitArraySlice { .. } => {
+                    return Err(self.unsupported("bit array patterns"));
+                }
+                exhaustiveness::BoundValue::StringSlice { .. } => {
+                    return Err(self.unsupported("string prefix patterns"));
+                }
+            };
+            bindings.push((name.clone().into(), bound));
+        }
+
+        let clause = clauses
+            .get(body.clause_index)
+            .expect("decision tree clause index in range");
+        let body = vec![native_ir::Statement::Expression(
+            self.expression(&clause.then)?,
+        )];
+        Ok(native_ir::Decision::Run { bindings, body })
     }
 
     fn panic_expression(
@@ -671,6 +839,69 @@ mod tests {
                 value: native_ir::Expression::Bool(false),
             }
         );
+    }
+
+    #[test]
+    fn case_expressions() {
+        let module = lower(
+            r#"pub fn main() {
+  case 5 {
+    1 -> 10
+    n -> n
+  }
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Expression(native_ir::Expression::Case {
+                subjects: vec![native_ir::Expression::Int(5)],
+                tree: native_ir::Decision::Switch {
+                    subject: 0,
+                    choices: vec![(
+                        native_ir::Check::Int(1),
+                        native_ir::Decision::Run {
+                            bindings: vec![],
+                            body: vec![native_ir::Statement::Expression(
+                                native_ir::Expression::Int(10)
+                            )],
+                        },
+                    )],
+                    fallback: Box::new(native_ir::Decision::Run {
+                        bindings: vec![("n".into(), native_ir::Bound::Subject(0))],
+                        body: vec![native_ir::Statement::Expression(
+                            native_ir::Expression::Variable("n".into())
+                        )],
+                    }),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn case_on_booleans_maps_variant_indices() {
+        let module = lower(
+            "pub fn check(value: Bool) {
+  case value {
+    True -> 1
+    False -> 0
+  }
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        else {
+            panic!("expected a case expression");
+        };
+        let native_ir::Decision::Switch { choices, .. } = tree else {
+            panic!("expected a switch");
+        };
+        // The `True` pattern must check for the tagged word 3.
+        assert_eq!(choices[0].0, native_ir::Check::Immediate(3));
     }
 
     #[test]

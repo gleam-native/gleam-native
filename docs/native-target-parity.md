@@ -71,13 +71,15 @@ platform C convention.
 - ✅ Blocks
 - ❌ `let` with arbitrary patterns (tuple destructuring etc.)
 - ❌ `let assert` (pattern match or panic, with optional `as` message)
-- ❌ `case` expressions — lower the `CompiledCase` decision tree attached to
-  the typed AST (`compiler-core/src/exhaustiveness.rs`); do not reimplement
-  pattern matching. Blocks-with-parameters map directly onto decision nodes
-- ❌ Pattern kinds within `case`: literals, variables, discards, tuples,
-  constructors, lists (`[x, ..rest]`), strings and string prefixes
-  (UTF-8, `StringEncoding::Utf8`), bit arrays, `as` bindings, alternative
+- 🚧 `case` expressions — lowered from the `CompiledCase` decision tree as
+  planned. Working: multi-subject matches, literal checks (small and big
+  integers, floats, strings), `Bool`/`Nil` variant checks (with the
+  variant-index-to-tagged-word mapping: `True` is variant 0 but encodes
+  as 1), variable and discard patterns, pattern bindings, alternative
   patterns (`a | b`)
+- ❌ Destructuring pattern kinds: tuples, constructors with fields, lists
+  (`[x, ..rest]`), string prefixes, bit arrays, `as` bindings on composite
+  patterns — each blocked on its data type existing natively
 - ❌ Guards (`if` clauses), including guard-legal constants and operators
 - ❌ `use` expressions (desugared to callbacks; needs closures)
 - ❌ `assert` (boolean assertion with structured failure information)
