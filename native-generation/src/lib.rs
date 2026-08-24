@@ -184,4 +184,34 @@ mod tests {
         };
         crate::jit::run(&[module], "app").unwrap();
     }
+
+    /// A string literal is built from constant data and can be passed to the
+    /// runtime's `println` external.
+    #[test]
+    fn jit_runs_string_literals() {
+        let module = native_ir::Module {
+            name: "app".into(),
+            functions: vec![
+                native_ir::Function::External {
+                    name: "println".into(),
+                    arity: 1,
+                    symbol: "println".into(),
+                },
+                native_ir::Function::Defined {
+                    name: "main".into(),
+                    parameters: vec![],
+                    body: vec![native_ir::Statement::Expression(
+                        native_ir::Expression::Call {
+                            module: "app".into(),
+                            function: "println".into(),
+                            arguments: vec![native_ir::Expression::String(
+                                "Hello from the JIT! 🌍".into(),
+                            )],
+                        },
+                    )],
+                },
+            ],
+        };
+        crate::jit::run(&[module], "app").unwrap();
+    }
 }

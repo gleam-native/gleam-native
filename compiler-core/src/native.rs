@@ -130,6 +130,10 @@ impl Lowerer {
                 Ok(native_ir::Expression::Float(float_value.value()))
             }
 
+            TypedExpr::String { value, .. } => Ok(native_ir::Expression::String(
+                crate::strings::convert_string_escape_chars(value).into(),
+            )),
+
             TypedExpr::Block { statements, .. } => Ok(native_ir::Expression::Block(
                 self.statements(statements.iter())?,
             )),
@@ -269,6 +273,26 @@ mod tests {
             native_ir::Statement::Let {
                 name: "y".into(),
                 value: native_ir::Expression::Float(-300.0),
+            }
+        );
+    }
+
+    #[test]
+    fn string_literals_are_unescaped() {
+        let module = lower(
+            r#"pub fn main() {
+  let x = "hello\n\u{1F30D}"
+  0
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "x".into(),
+                value: native_ir::Expression::String("hello\n🌍".into()),
             }
         );
     }

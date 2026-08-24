@@ -9,11 +9,12 @@
 //! - low bit 0: a pointer to a heap allocation (8-byte aligned)
 //!
 //! `Nil` is the small integer 0. Heap objects so far are big integers
-//! (a raw `Box<BigInt>`) and floats (a raw `Box<f64>`); they are currently
-//! leaked, as reference counting is not yet implemented. Heap objects carry
-//! no kind header yet: Gleam's type system statically separates which
-//! functions receive which types, so none is needed until polymorphic
-//! runtime services (structural equality, `echo`) exist.
+//! (a raw `Box<BigInt>`), floats (a raw `Box<f64>`), and strings (a raw
+//! `Box<String>`, always valid UTF-8); they are currently leaked, as
+//! reference counting is not yet implemented. Heap objects carry no kind
+//! header yet: Gleam's type system statically separates which functions
+//! receive which types, so none is needed until polymorphic runtime
+//! services (structural equality, `echo`) exist.
 //!
 //! These functions use the platform C calling convention and are registered
 //! with the JIT by name via [`symbols`], so they need no `#[no_mangle]`.
@@ -71,10 +72,37 @@ pub extern "C" fn gleam_native_float_from_bits(bits: u64) -> u64 {
     Box::into_raw(Box::new(f64::from_bits(bits))) as u64
 }
 
+/// Builds a string value from UTF-8 bytes stored in the compiled program's
+/// data section.
+///
+/// # Safety
+///
+/// `bytes` must point to `length` readable bytes of valid UTF-8. Generated
+/// code always passes a pointer into its own constant data, containing
+/// compiler-validated string contents.
+pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length: u64) -> u64 {
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
+    let string = unsafe { std::str::from_utf8_unchecked(bytes) };
+    Box::into_raw(Box::new(string.to_string())) as u64
+}
+
 /// Prints an integer followed by a newline. The standin for a real printing
 /// external until strings exist on the native target.
 pub extern "C" fn print_int(value: u64) -> u64 {
     println!("{}", untag(value));
+    NIL
+}
+
+/// Prints a string followed by a newline, the native implementation for a
+/// `gleam/io.println`-style external.
+///
+/// # Safety
+///
+/// `value` must be a string created by this runtime. The Gleam type system
+/// upholds this for calls from generated code.
+pub unsafe extern "C" fn println(value: u64) -> u64 {
+    let string = unsafe { &*(value as *const String) };
+    println!("{string}");
     NIL
 }
 
@@ -106,8 +134,13 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_float_from_bits",
             gleam_native_float_from_bits as *const u8,
         ),
+        (
+            "gleam_native_string_from_bytes",
+            gleam_native_string_from_bytes as *const u8,
+        ),
         ("print_int", print_int as *const u8),
         ("print_float", print_float as *const u8),
+        ("println", println as *const u8),
     ]
 }
 
@@ -142,6 +175,16 @@ mod tests {
         let boxed = gleam_native_float_from_bits(1.5_f64.to_bits());
         assert_eq!(boxed & 1, 0);
         assert_eq!(unsafe { *(boxed as *const f64) }, 1.5);
+    }
+
+    #[test]
+    fn string_round_trip() {
+        let content = "Hello, 🌍!";
+        let boxed = unsafe {
+            gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64)
+        };
+        assert_eq!(boxed & 1, 0);
+        assert_eq!(unsafe { &*(boxed as *const String) }, content);
     }
 
     #[test]

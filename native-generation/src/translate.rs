@@ -26,6 +26,9 @@ pub const BIGINT_FROM_BYTES: &str = "gleam_native_bigint_from_bytes";
 /// The symbol of the runtime's float constructor.
 pub const FLOAT_FROM_BITS: &str = "gleam_native_float_from_bits";
 
+/// The symbol of the runtime's string literal constructor.
+pub const STRING_FROM_BYTES: &str = "gleam_native_string_from_bytes";
+
 /// The symbol of the generated C-convention wrapper around `main`.
 pub const ENTRY_SYMBOL: &str = "gleam_native_main_wrapper";
 
@@ -60,6 +63,7 @@ pub struct Translator<'a, M: Module> {
     int_add_slow: FuncId,
     bigint_from_bytes: FuncId,
     float_from_bits: FuncId,
+    string_from_bytes: FuncId,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -78,12 +82,20 @@ impl<'a, M: Module> Translator<'a, M> {
         let float_from_bits = module
             .declare_function(FLOAT_FROM_BITS, Linkage::Import, &c_signature(call_conv, 1))
             .map_err(|error| error.to_string())?;
+        let string_from_bytes = module
+            .declare_function(
+                STRING_FROM_BYTES,
+                Linkage::Import,
+                &c_signature(call_conv, 2),
+            )
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             module,
             functions: HashMap::new(),
             int_add_slow,
             bigint_from_bytes,
             float_from_bits,
+            string_from_bytes,
         })
     }
 
@@ -184,6 +196,7 @@ impl<'a, M: Module> Translator<'a, M> {
             int_add_slow: self.int_add_slow,
             bigint_from_bytes: self.bigint_from_bytes,
             float_from_bits: self.float_from_bits,
+            string_from_bytes: self.string_from_bytes,
             module: self.module,
             builder: &mut builder,
             environment,
@@ -235,12 +248,40 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     int_add_slow: FuncId,
     bigint_from_bytes: FuncId,
     float_from_bits: FuncId,
+    string_from_bytes: FuncId,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
     environment: HashMap<String, Variable>,
 }
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
+    /// Embeds bytes as read-only constant data and calls a two-argument
+    /// runtime constructor with their address and length. Used for literals
+    /// that become heap objects: big integers and strings.
+    fn construct_from_constant_bytes(
+        &mut self,
+        bytes: &[u8],
+        constructor: FuncId,
+    ) -> Result<Value, String> {
+        let data = self
+            .module
+            .declare_anonymous_data(false, false)
+            .map_err(|error| error.to_string())?;
+        let mut description = DataDescription::new();
+        description.define(bytes.to_vec().into_boxed_slice());
+        self.module
+            .define_data(data, &description)
+            .map_err(|error| error.to_string())?;
+
+        let pointer_type = self.module.target_config().pointer_type();
+        let data_ref = self.module.declare_data_in_func(data, self.builder.func);
+        let pointer = self.builder.ins().symbol_value(pointer_type, data_ref);
+        let length = self.builder.ins().iconst(types::I64, bytes.len() as i64);
+        let constructor_ref = self.module.declare_func_in_func(constructor, self.builder.func);
+        let call = self.builder.ins().call(constructor_ref, &[pointer, length]);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
     /// Translates a statement sequence, returning the value of the last one.
     fn statements(&mut self, statements: &[native_ir::Statement]) -> Result<Value, String> {
         let mut last = None;
@@ -270,25 +311,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 .iconst(types::I64, (value << 1) | 1)),
 
             native_ir::Expression::BigInt(bytes) => {
-                let data = self
-                    .module
-                    .declare_anonymous_data(false, false)
-                    .map_err(|error| error.to_string())?;
-                let mut description = DataDescription::new();
-                description.define(bytes.clone().into_boxed_slice());
-                self.module
-                    .define_data(data, &description)
-                    .map_err(|error| error.to_string())?;
+                self.construct_from_constant_bytes(bytes, self.bigint_from_bytes)
+            }
 
-                let pointer_type = self.module.target_config().pointer_type();
-                let data_ref = self.module.declare_data_in_func(data, self.builder.func);
-                let pointer = self.builder.ins().symbol_value(pointer_type, data_ref);
-                let length = self.builder.ins().iconst(types::I64, bytes.len() as i64);
-                let from_bytes_ref = self
-                    .module
-                    .declare_func_in_func(self.bigint_from_bytes, self.builder.func);
-                let call = self.builder.ins().call(from_bytes_ref, &[pointer, length]);
-                Ok(self.builder.inst_results(call)[0])
+            native_ir::Expression::String(string) => {
+                self.construct_from_constant_bytes(string.as_bytes(), self.string_from_bytes)
             }
 
             native_ir::Expression::Float(value) => {

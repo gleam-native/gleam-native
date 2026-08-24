@@ -35,7 +35,8 @@ platform C convention.
 - ✅ Float literals (boxed f64 heap objects; heap objects carry no kind
   header yet — the type system separates them until polymorphic equality and
   `echo` exist)
-- ❌ String literals (immutable UTF-8 heap objects, constant data section)
+- ✅ String literals (immutable UTF-8 heap strings built from constant data;
+  escape sequences processed at lowering time; `println` runtime external)
 - ❌ `True` / `False` (prelude custom type; likely tagged immediates)
 - ✅ Number literal notations already accepted by the parser: `0x`, `0o`,
   `0b`, underscores, scientific notation for floats (parsed values arrive
