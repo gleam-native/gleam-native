@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 20;
+pub const FORMAT_VERSION: u32 = 21;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -187,6 +187,14 @@ pub enum Expression {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
     },
+    /// An `echo` expression: prints the source location and the value to
+    /// standard error and evaluates to the value.
+    Echo {
+        kind: EchoKind,
+        value: Box<Expression>,
+        message: Option<Box<Expression>>,
+        line: u32,
+    },
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
     /// string expression evaluated only if the panic is reached.
@@ -295,6 +303,21 @@ pub enum EqualityKind {
     /// Values that are always tagged immediates (`Bool`, `Nil`) compare as
     /// plain words.
     Immediate,
+    /// Any other type: structural deep equality in the runtime, walking
+    /// heap object headers.
+    Deep,
+}
+
+/// How `echo` renders its value: exactly, when the compiler knew the static
+/// type at the echo site, or structurally otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum EchoKind {
+    Structural,
+    Int,
+    Float,
+    String,
+    Bool,
+    Nil,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -439,6 +462,12 @@ fn expression_free(
                 let _ = scope.insert(parameter.clone());
             }
             statements_free(body, &mut scope, free);
+        }
+        Expression::Echo { value, message, .. } => {
+            expression_free(value, bound, free);
+            if let Some(message) = message {
+                expression_free(message, bound, free);
+            }
         }
         Expression::Panic { message, .. } => {
             if let Some(message) = message {

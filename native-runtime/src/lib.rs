@@ -8,15 +8,21 @@
 //! - low bit 1: a small integer, the value in the upper 63 bits (`(n << 1) | 1`)
 //! - low bit 0: a pointer to a heap allocation (8-byte aligned)
 //!
-//! `Nil` is the small integer 0. Heap objects so far are big integers
-//! (a raw `Box<BigInt>`), floats (a raw `Box<f64>`), strings (a raw
-//! `Box<String>`, always valid UTF-8), and custom type records (a variant
-//! tag word followed by the field values, allocated by
-//! [`gleam_native_record_new`] and written by generated code); they are
-//! currently leaked, as reference counting is not yet implemented. Heap
-//! objects carry no kind header yet: Gleam's type system statically
-//! separates which functions receive which types, so none is needed until
-//! polymorphic runtime services (structural equality, `echo`) exist.
+//! `Nil`, `False`/`True`, and the empty list are the small integers 0, 0/1,
+//! and 0 respectively; Gleam's type system keeps them apart.
+//!
+//! Every heap object starts with a header word: the object kind in the low
+//! 16 bits, and for records the variant tag in bits 16..32 and the field
+//! count in bits 32..48. This lets polymorphic operations (deep equality,
+//! `echo`) walk any value at run time. Layouts:
+//!
+//! - record (custom types, tuples, cons cells): `[header, fields...]`
+//! - big integer / string: a header followed by the inline Rust value
+//! - float: `[header, f64]` — generated code loads the payload directly
+//! - closure: `[header, code pointer, captures...]`
+//!
+//! Heap allocations are currently leaked: reference counting is not yet
+//! implemented.
 //!
 //! These functions use the platform C calling convention and are registered
 //! with the JIT by name via [`symbols`], so they need no `#[no_mangle]`.
@@ -33,23 +39,110 @@ pub const TRUE: u64 = 3;
 pub const SMALL_INT_MIN: i64 = i64::MIN >> 1;
 pub const SMALL_INT_MAX: i64 = i64::MAX >> 1;
 
+pub const KIND_RECORD: u64 = 0;
+pub const KIND_BIGINT: u64 = 1;
+pub const KIND_FLOAT: u64 = 2;
+pub const KIND_STRING: u64 = 3;
+pub const KIND_CLOSURE: u64 = 4;
+
+/// The header word of a record with the given variant tag and field count.
+/// Code generation computes expected headers with this same formula, so a
+/// variant check is a single word comparison.
+pub const fn record_header(tag: u32, arity: u32) -> u64 {
+    KIND_RECORD | ((tag as u64) << 16) | ((arity as u64) << 32)
+}
+
+const fn closure_header(captures: u32) -> u64 {
+    KIND_CLOSURE | ((captures as u64) << 32)
+}
+
+fn header_kind(header: u64) -> u64 {
+    header & 0xFFFF
+}
+
+fn record_tag(header: u64) -> u32 {
+    ((header >> 16) & 0xFFFF) as u32
+}
+
+fn record_arity(header: u64) -> u32 {
+    ((header >> 32) & 0xFFFF) as u32
+}
+
+#[repr(C)]
+struct HeapBigInt {
+    header: u64,
+    value: BigInt,
+}
+
+#[repr(C)]
+struct HeapFloat {
+    header: u64,
+    value: f64,
+}
+
+#[repr(C)]
+struct HeapString {
+    header: u64,
+    value: String,
+}
+
 pub fn tag_small_int(value: i64) -> u64 {
     ((value << 1) | 1) as u64
+}
+
+fn box_bigint(value: BigInt) -> u64 {
+    Box::into_raw(Box::new(HeapBigInt {
+        header: KIND_BIGINT,
+        value,
+    })) as u64
+}
+
+fn box_float(value: f64) -> u64 {
+    Box::into_raw(Box::new(HeapFloat {
+        header: KIND_FLOAT,
+        value,
+    })) as u64
+}
+
+fn box_string(value: String) -> u64 {
+    Box::into_raw(Box::new(HeapString {
+        header: KIND_STRING,
+        value,
+    })) as u64
+}
+
+fn heap_header(value: u64) -> u64 {
+    unsafe { *(value as *const u64) }
+}
+
+fn bigint_value(value: u64) -> &'static BigInt {
+    unsafe { &(*(value as *const HeapBigInt)).value }
+}
+
+fn float_value(value: u64) -> f64 {
+    unsafe { (*(value as *const HeapFloat)).value }
+}
+
+fn string_value(value: u64) -> &'static String {
+    unsafe { &(*(value as *const HeapString)).value }
+}
+
+fn record_field(value: u64, index: u32) -> u64 {
+    unsafe { *((value as *const u64).add(1 + index as usize)) }
 }
 
 fn untag(value: u64) -> BigInt {
     if value & 1 == 1 {
         BigInt::from((value as i64) >> 1)
     } else {
-        let pointer = value as *const BigInt;
-        unsafe { (*pointer).clone() }
+        bigint_value(value).clone()
     }
 }
 
 fn retag(value: BigInt) -> u64 {
     match value.to_i64() {
         Some(small) if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&small) => tag_small_int(small),
-        _ => Box::into_raw(Box::new(value)) as u64,
+        _ => box_bigint(value),
     }
 }
 
@@ -116,7 +209,7 @@ pub unsafe extern "C" fn gleam_native_bigint_from_bytes(bytes: *const u8, length
 /// Boxes a float value given its IEEE 754 bit pattern. Taking the bits as an
 /// integer keeps every generated call signature uniformly i64.
 pub extern "C" fn gleam_native_float_from_bits(bits: u64) -> u64 {
-    Box::into_raw(Box::new(f64::from_bits(bits))) as u64
+    box_float(f64::from_bits(bits))
 }
 
 /// Builds a string value from UTF-8 bytes stored in the compiled program's
@@ -130,7 +223,7 @@ pub extern "C" fn gleam_native_float_from_bits(bits: u64) -> u64 {
 pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length: u64) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
     let string = unsafe { std::str::from_utf8_unchecked(bytes) };
-    Box::into_raw(Box::new(string.to_string())) as u64
+    box_string(string.to_string())
 }
 
 /// Concatenates two strings into a new string, the implementation of the
@@ -141,21 +234,154 @@ pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length
 /// Both arguments must be strings created by this runtime. The Gleam type
 /// system upholds this for calls from generated code.
 pub unsafe extern "C" fn gleam_native_string_concat(left: u64, right: u64) -> u64 {
-    let left = unsafe { &*(left as *const String) };
-    let right = unsafe { &*(right as *const String) };
+    let left = string_value(left);
+    let right = string_value(right);
     let mut result = String::with_capacity(left.len() + right.len());
     result.push_str(left);
     result.push_str(right);
-    Box::into_raw(Box::new(result)) as u64
+    box_string(result)
 }
 
-/// Reports a `panic` or `todo` and aborts the program with exit code 1.
+/// String equality by contents, returning [`TRUE`] or [`FALSE`].
 ///
-/// `kind` is 0 for `panic` and 1 for `todo`. `message` is a string value or
-/// 0 when the source gave no message. The module and function names arrive
-/// as pointers into the compiled program's constant data. Declared as
-/// returning a value so generated code can treat it as an ordinary call, but
-/// it never returns.
+/// # Safety
+///
+/// Both arguments must be strings created by this runtime. The Gleam type
+/// system upholds this for calls from generated code.
+pub unsafe extern "C" fn gleam_native_string_eq(left: u64, right: u64) -> u64 {
+    if string_value(left) == string_value(right) {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// Allocates a custom type record: a header word encoding the variant tag
+/// and field count, followed by `arity` field words which generated code
+/// stores immediately after this call.
+pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64) -> u64 {
+    let pointer = allocate_words(1 + arity as usize);
+    unsafe { *pointer = record_header(tag as u32, arity as u32) };
+    pointer as u64
+}
+
+/// Allocates a closure: a header word, a slot for the code pointer, and
+/// `captures` capture words, all stored by generated code after this call.
+pub extern "C" fn gleam_native_closure_new(captures: u64) -> u64 {
+    let pointer = allocate_words(2 + captures as usize);
+    unsafe { *pointer = closure_header(captures as u32) };
+    pointer as u64
+}
+
+fn allocate_words(words: usize) -> *mut u64 {
+    let layout = std::alloc::Layout::array::<u64>(words).expect("heap object layout");
+    let pointer = unsafe { std::alloc::alloc(layout) } as *mut u64;
+    assert!(!pointer.is_null(), "heap allocation failed");
+    pointer
+}
+
+/// Structural equality between two values of the same Gleam type, returning
+/// [`TRUE`] or [`FALSE`]. Closures compare by identity.
+pub extern "C" fn gleam_native_eq(left: u64, right: u64) -> u64 {
+    if deep_eq(left, right) { TRUE } else { FALSE }
+}
+
+fn deep_eq(left: u64, right: u64) -> bool {
+    if left == right {
+        return true;
+    }
+    // Different immediates, or an immediate against a heap value, are never
+    // equal: big integers never encode small-range values.
+    if left & 1 == 1 || right & 1 == 1 {
+        return false;
+    }
+    let left_header = heap_header(left);
+    if left_header != heap_header(right) {
+        return false;
+    }
+    match header_kind(left_header) {
+        KIND_BIGINT => bigint_value(left) == bigint_value(right),
+        KIND_FLOAT => float_value(left) == float_value(right),
+        KIND_STRING => string_value(left) == string_value(right),
+        KIND_RECORD => {
+            // Headers match, so tags and arities do too.
+            (0..record_arity(left_header))
+                .all(|index| deep_eq(record_field(left, index), record_field(right, index)))
+        }
+        // Closures are equal only when identical, handled above.
+        _ => false,
+    }
+}
+
+/// Renders a value for `echo`. Scalars print exactly; records print
+/// structurally as `@tag(field, ...)` since constructor names do not exist
+/// at run time. Booleans and other immediates nested inside structures
+/// print as their integer encoding.
+fn inspect(value: u64) -> String {
+    if value & 1 == 1 {
+        return format!("{}", (value as i64) >> 1);
+    }
+    let header = heap_header(value);
+    match header_kind(header) {
+        KIND_BIGINT => format!("{}", bigint_value(value)),
+        KIND_FLOAT => format!("{:?}", float_value(value)),
+        KIND_STRING => format!("{:?}", string_value(value)),
+        KIND_CLOSURE => "//fn".to_string(),
+        KIND_RECORD => {
+            let fields: Vec<String> = (0..record_arity(header))
+                .map(|index| inspect(record_field(value, index)))
+                .collect();
+            format!("@{}({})", record_tag(header), fields.join(", "))
+        }
+        kind => format!("<unknown kind {kind}>"),
+    }
+}
+
+/// The implementation of `echo`: prints the source location and the value
+/// to standard error, then returns the value. `kind` selects exact printing
+/// for values whose static type the compiler knew at the echo site:
+/// 0 structural, 1 int, 2 float, 3 string, 4 bool, 5 nil.
+///
+/// # Safety
+///
+/// The module name pointer must be valid as described for
+/// [`gleam_native_panic`]; `message` is a string value or 0.
+pub unsafe extern "C" fn gleam_native_echo(
+    kind: u64,
+    value: u64,
+    message: u64,
+    module: *const u8,
+    module_length: u64,
+    line: u64,
+) -> u64 {
+    let module = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(module, module_length as usize))
+    };
+    let rendered = match kind {
+        1 => format!("{}", untag(value)),
+        2 => format!("{:?}", float_value(value)),
+        3 => format!("{:?}", string_value(value)),
+        4 => (if value == TRUE { "True" } else { "False" }).to_string(),
+        5 => "Nil".to_string(),
+        _ => inspect(value),
+    };
+    eprint!("{module}:{line}");
+    if message != 0 {
+        eprint!(" {}", string_value(message));
+    }
+    eprintln!();
+    eprintln!("{rendered}");
+    value
+}
+
+/// Reports a `panic`, `todo`, or failed `let assert` and aborts the program
+/// with exit code 1.
+///
+/// `kind` is 0 for `panic`, 1 for `todo`, and 2 for `let assert`. `message`
+/// is a string value or 0 when the source gave no message. The module and
+/// function names arrive as pointers into the compiled program's constant
+/// data. Declared as returning a value so generated code can treat it as an
+/// ordinary call, but it never returns.
 ///
 /// # Safety
 ///
@@ -191,7 +417,7 @@ pub unsafe extern "C" fn gleam_native_panic(
     let message = if message == 0 {
         default_message
     } else {
-        unsafe { &*(message as *const String) }
+        string_value(message)
     };
     eprintln!("runtime error: {name}");
     eprintln!();
@@ -199,30 +425,6 @@ pub unsafe extern "C" fn gleam_native_panic(
     eprintln!();
     eprintln!("    {module}.{function}:{line}");
     std::process::exit(1);
-}
-
-/// Allocates a custom type record: one word for the variant tag followed by
-/// `arity` words for the fields, which generated code stores immediately
-/// after this call.
-pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64) -> u64 {
-    let words = 1 + arity as usize;
-    let layout = std::alloc::Layout::array::<u64>(words).expect("record layout");
-    let pointer = unsafe { std::alloc::alloc(layout) } as *mut u64;
-    assert!(!pointer.is_null(), "record allocation failed");
-    unsafe { *pointer = tag };
-    pointer as u64
-}
-
-/// String equality by contents, returning [`TRUE`] or [`FALSE`].
-///
-/// # Safety
-///
-/// Both arguments must be strings created by this runtime. The Gleam type
-/// system upholds this for calls from generated code.
-pub unsafe extern "C" fn gleam_native_string_eq(left: u64, right: u64) -> u64 {
-    let left = unsafe { &*(left as *const String) };
-    let right = unsafe { &*(right as *const String) };
-    if left == right { TRUE } else { FALSE }
 }
 
 /// Prints an integer followed by a newline. The standin for a real printing
@@ -239,19 +441,6 @@ pub extern "C" fn print_bool(value: u64) -> u64 {
     NIL
 }
 
-/// Prints a string followed by a newline, the native implementation for a
-/// `gleam/io.println`-style external.
-///
-/// # Safety
-///
-/// `value` must be a string created by this runtime. The Gleam type system
-/// upholds this for calls from generated code.
-pub unsafe extern "C" fn println(value: u64) -> u64 {
-    let string = unsafe { &*(value as *const String) };
-    println!("{string}");
-    NIL
-}
-
 /// Prints a float followed by a newline, formatted the way Gleam floats are
 /// written (always with a decimal point or exponent).
 ///
@@ -260,8 +449,19 @@ pub unsafe extern "C" fn println(value: u64) -> u64 {
 /// `value` must be a float created by this runtime. The Gleam type system
 /// upholds this for calls from generated code.
 pub unsafe extern "C" fn print_float(value: u64) -> u64 {
-    let float = unsafe { *(value as *const f64) };
-    println!("{float:?}");
+    println!("{:?}", float_value(value));
+    NIL
+}
+
+/// Prints a string followed by a newline, the native implementation for a
+/// `gleam/io.println`-style external.
+///
+/// # Safety
+///
+/// `value` must be a string created by this runtime. The Gleam type system
+/// upholds this for calls from generated code.
+pub unsafe extern "C" fn println(value: u64) -> u64 {
+    println!("{}", string_value(value));
     NIL
 }
 
@@ -310,6 +510,12 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_record_new",
             gleam_native_record_new as *const u8,
         ),
+        (
+            "gleam_native_closure_new",
+            gleam_native_closure_new as *const u8,
+        ),
+        ("gleam_native_eq", gleam_native_eq as *const u8),
+        ("gleam_native_echo", gleam_native_echo as *const u8),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
         ("print_bool", print_bool as *const u8),
@@ -321,6 +527,18 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_string(content: &str) -> u64 {
+        unsafe { gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64) }
+    }
+
+    fn make_record(tag: u64, fields: &[u64]) -> u64 {
+        let record = gleam_native_record_new(tag, fields.len() as u64);
+        for (index, field) in fields.iter().enumerate() {
+            unsafe { *((record as *mut u64).add(1 + index)) = *field };
+        }
+        record
+    }
 
     #[test]
     fn small_int_addition() {
@@ -345,58 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn float_round_trip() {
-        let boxed = gleam_native_float_from_bits(1.5_f64.to_bits());
-        assert_eq!(boxed & 1, 0);
-        assert_eq!(unsafe { *(boxed as *const f64) }, 1.5);
-    }
-
-    #[test]
-    fn string_round_trip() {
-        let content = "Hello, 🌍!";
-        let boxed = unsafe {
-            gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64)
-        };
-        assert_eq!(boxed & 1, 0);
-        assert_eq!(unsafe { &*(boxed as *const String) }, content);
-    }
-
-    #[test]
-    fn string_equality() {
-        let make = |content: &str| unsafe {
-            gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64)
-        };
-        assert_eq!(unsafe { gleam_native_string_eq(make("ab"), make("ab")) }, TRUE);
-        assert_eq!(unsafe { gleam_native_string_eq(make("ab"), make("ac")) }, FALSE);
-        assert_eq!(unsafe { gleam_native_string_eq(make(""), make("")) }, TRUE);
-    }
-
-    #[test]
-    fn string_concatenation() {
-        let make = |content: &str| unsafe {
-            gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64)
-        };
-        let result = unsafe { gleam_native_string_concat(make("Hello, "), make("🌍!")) };
-        assert_eq!(unsafe { &*(result as *const String) }, "Hello, 🌍!");
-    }
-
-    #[test]
-    fn subtraction_and_multiplication() {
-        assert_eq!(
-            gleam_native_int_sub_slow(tag_small_int(40), tag_small_int(-2)),
-            tag_small_int(42)
-        );
-        assert_eq!(
-            gleam_native_int_mul_slow(tag_small_int(6), tag_small_int(7)),
-            tag_small_int(42)
-        );
-        let overflowed =
-            gleam_native_int_mul_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(2));
-        assert_eq!(overflowed & 1, 0);
-        assert_eq!(untag(overflowed), BigInt::from(SMALL_INT_MAX) * 2);
-    }
-
-    #[test]
     fn integer_comparison() {
         let compare = |a: u64, b: u64| gleam_native_int_compare(a, b);
         assert_eq!(
@@ -417,13 +583,26 @@ mod tests {
         let div = |a: i64, b: i64| gleam_native_int_div(tag_small_int(a), tag_small_int(b));
         let rem = |a: i64, b: i64| gleam_native_int_rem(tag_small_int(a), tag_small_int(b));
         assert_eq!(div(84, 2), tag_small_int(42));
-        // Truncation toward zero, remainder takes the dividend's sign.
         assert_eq!(div(-7, 2), tag_small_int(-3));
         assert_eq!(rem(-7, 2), tag_small_int(-1));
         assert_eq!(rem(7, -2), tag_small_int(1));
-        // Division by zero yields zero.
         assert_eq!(div(1, 0), tag_small_int(0));
         assert_eq!(rem(1, 0), tag_small_int(0));
+    }
+
+    #[test]
+    fn subtraction_and_multiplication() {
+        assert_eq!(
+            gleam_native_int_sub_slow(tag_small_int(40), tag_small_int(-2)),
+            tag_small_int(42)
+        );
+        assert_eq!(
+            gleam_native_int_mul_slow(tag_small_int(6), tag_small_int(7)),
+            tag_small_int(42)
+        );
+        let overflowed = gleam_native_int_mul_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(2));
+        assert_eq!(overflowed & 1, 0);
+        assert_eq!(untag(overflowed), BigInt::from(SMALL_INT_MAX) * 2);
     }
 
     #[test]
@@ -434,5 +613,83 @@ mod tests {
         );
         assert_eq!(result & 1, 0);
         assert_eq!(untag(result), BigInt::from(SMALL_INT_MAX) * 2);
+    }
+
+    #[test]
+    fn float_round_trip() {
+        let boxed = gleam_native_float_from_bits(1.5_f64.to_bits());
+        assert_eq!(boxed & 1, 0);
+        assert_eq!(float_value(boxed), 1.5);
+    }
+
+    #[test]
+    fn string_round_trip() {
+        let content = "Hello, 🌍!";
+        let boxed = make_string(content);
+        assert_eq!(boxed & 1, 0);
+        assert_eq!(string_value(boxed), content);
+    }
+
+    #[test]
+    fn string_equality() {
+        assert_eq!(
+            unsafe { gleam_native_string_eq(make_string("ab"), make_string("ab")) },
+            TRUE
+        );
+        assert_eq!(
+            unsafe { gleam_native_string_eq(make_string("ab"), make_string("ac")) },
+            FALSE
+        );
+        assert_eq!(
+            unsafe { gleam_native_string_eq(make_string(""), make_string("")) },
+            TRUE
+        );
+    }
+
+    #[test]
+    fn string_concatenation() {
+        let result =
+            unsafe { gleam_native_string_concat(make_string("Hello, "), make_string("🌍!")) };
+        assert_eq!(string_value(result), "Hello, 🌍!");
+    }
+
+    #[test]
+    fn deep_equality() {
+        // Identical immediates and different immediates.
+        assert_eq!(gleam_native_eq(tag_small_int(4), tag_small_int(4)), TRUE);
+        assert_eq!(gleam_native_eq(tag_small_int(4), tag_small_int(5)), FALSE);
+
+        // Records compare structurally, including nested strings.
+        let a = make_record(1, &[tag_small_int(7), make_string("x")]);
+        let b = make_record(1, &[tag_small_int(7), make_string("x")]);
+        let c = make_record(1, &[tag_small_int(8), make_string("x")]);
+        let d = make_record(2, &[tag_small_int(7), make_string("x")]);
+        assert_eq!(gleam_native_eq(a, b), TRUE);
+        assert_eq!(gleam_native_eq(a, c), FALSE);
+        assert_eq!(gleam_native_eq(a, d), FALSE);
+
+        // Nested records (a cons list of records).
+        let list_a = make_record(1, &[a, NIL]);
+        let list_b = make_record(1, &[b, NIL]);
+        assert_eq!(gleam_native_eq(list_a, list_b), TRUE);
+
+        // Immediate against heap value.
+        assert_eq!(gleam_native_eq(NIL, a), FALSE);
+
+        // Floats and big integers by value.
+        let big_a = gleam_native_int_add_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(1));
+        let big_b = gleam_native_int_add_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(1));
+        assert_eq!(gleam_native_eq(big_a, big_b), TRUE);
+        let float_a = gleam_native_float_from_bits(1.5_f64.to_bits());
+        let float_b = gleam_native_float_from_bits(1.5_f64.to_bits());
+        assert_eq!(gleam_native_eq(float_a, float_b), TRUE);
+    }
+
+    #[test]
+    fn inspect_renders_structurally() {
+        let record = make_record(1, &[tag_small_int(7), make_string("hi")]);
+        assert_eq!(inspect(record), "@1(7, \"hi\")");
+        assert_eq!(inspect(tag_small_int(-3)), "-3");
+        assert_eq!(inspect(gleam_native_float_from_bits(2.5_f64.to_bits())), "2.5");
     }
 }

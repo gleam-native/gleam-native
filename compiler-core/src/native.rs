@@ -243,7 +243,6 @@ impl Lowerer<'_> {
                 ValueConstructorVariant::ModuleConstant { literal, .. } => {
                     self.constant(literal)
                 }
-                _ => Err(self.unsupported("this kind of value")),
             },
 
             TypedExpr::Call {
@@ -439,6 +438,41 @@ impl Lowerer<'_> {
                 })
             }
 
+            TypedExpr::Echo {
+                expression: echo_expression,
+                message,
+                location,
+                ..
+            } => {
+                let value = echo_expression
+                    .as_ref()
+                    .ok_or_else(|| self.unsupported("echo inside a pipeline"))?;
+                let type_ = value.type_();
+                let kind = if type_.is_int() {
+                    native_ir::EchoKind::Int
+                } else if type_.is_float() {
+                    native_ir::EchoKind::Float
+                } else if type_.is_string() {
+                    native_ir::EchoKind::String
+                } else if type_.is_bool() {
+                    native_ir::EchoKind::Bool
+                } else if type_.is_nil() {
+                    native_ir::EchoKind::Nil
+                } else {
+                    native_ir::EchoKind::Structural
+                };
+                let message = match message {
+                    Some(message) => Some(Box::new(self.expression(message)?)),
+                    None => None,
+                };
+                Ok(native_ir::Expression::Echo {
+                    kind,
+                    value: Box::new(self.expression(value)?),
+                    message,
+                    line: self.line_numbers.line_number(location.start),
+                })
+            }
+
             TypedExpr::Panic {
                 location, message, ..
             } => self.panic_expression(native_ir::PanicKind::Panic, message, location),
@@ -520,7 +554,9 @@ impl Lowerer<'_> {
                 } else if left_type.is_bool() || left_type.is_nil() {
                     native_ir::EqualityKind::Immediate
                 } else {
-                    return Err(self.unsupported("equality between values of this type"));
+                    // Custom types, lists, tuples, and generics: structural
+                    // deep equality in the runtime.
+                    native_ir::EqualityKind::Deep
                 };
                 Ok(native_ir::Expression::Equality {
                     kind,

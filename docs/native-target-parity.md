@@ -22,7 +22,9 @@ to the IR in the `native-ir` crate, serialized per module into
 `build/{mode}/native/{package}/_gleam_artefacts/*.nir`, then translated to
 Cranelift IR and JIT-executed by the `native-generation` crate against the
 `native-runtime` crate. Values are tagged 64-bit words (low bit 1 = 63-bit
-small integer, low bit 0 = 8-byte-aligned heap pointer). Gleam functions use
+small integer, low bit 0 = 8-byte-aligned heap pointer). Every heap object
+starts with a header word (kind, and for records the variant tag and field
+count), enabling polymorphic deep equality and `echo`. Gleam functions use
 Cranelift's `tail` calling convention; runtime and external calls use the
 platform C convention.
 
@@ -55,11 +57,11 @@ platform C convention.
 - ✅ Float arithmetic and comparison (`+.`, `-.`, `*.`, `/.`, `<.`, `<=.`,
   `>.`, `>=.`): unboxed register arithmetic between loads, division by zero
   yields 0.0, IEEE ordered comparisons
-- 🚧 `==` / `!=`: type-directed at compile time for `Int` (including big
-  integers), `Float` (IEEE), `String` (by contents), `Bool`, and `Nil`.
-  Comparing generic type variables and composite types (lists, tuples,
-  custom types) needs polymorphic deep equality, which arrives with heap
-  kind headers
+- ✅ `==` / `!=`: type-directed fast paths for `Int` (including big
+  integers), `Float` (IEEE), `String` (by contents), `Bool`, and `Nil`;
+  every other type (custom types, lists, tuples, generics) uses the
+  runtime's structural deep equality, which walks heap object headers.
+  Closures compare by identity
 - ✅ `<>` string concatenation
 - ✅ `&&`, `||` with short-circuit evaluation (pure codegen: the right
   operand's evaluation sits in a conditionally-executed block)
@@ -142,9 +144,15 @@ platform C convention.
   all arithmetic and comparison operators)
 - ✅ `panic`, `todo` with module/function/line metadata baked into the call
   site, lazily-evaluated message expressions, exit code 1
-- ❌ `echo` (debug printing of any value; needs runtime value inspection)
-- ❌ String formatting of values for panics and `echo` (the native
-  equivalent of `gleam/string.inspect`)
+- 🚧 `echo`: prints `module:line` (plus the optional `as` message) and the
+  value to standard error, returning the value. Scalars and strings print
+  exactly (using the static type at the echo site); composites print
+  structurally as `@tag(field, ...)` because constructor names do not exist
+  at run time — Gleam-pretty output needs constructor-name metadata in
+  record headers or static descriptors. `echo` inside a pipeline is not yet
+  lowered
+- 🚧 Value formatting exists as the runtime's structural `inspect`; a
+  `gleam/string.inspect` equivalent with constructor names is future work
 - ❌ Reference counting — currently every heap allocation leaks. Gleam data
   is immutable and acyclic so plain RC is sound; insertion as an IR-to-IR
   pass with liveness-based drops, Perceus-style reuse later

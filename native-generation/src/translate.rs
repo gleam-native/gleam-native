@@ -53,6 +53,15 @@ pub const STRING_EQ: &str = "gleam_native_string_eq";
 /// The symbol of the runtime's custom type record allocator.
 pub const RECORD_NEW: &str = "gleam_native_record_new";
 
+/// The symbol of the runtime's closure allocator.
+pub const CLOSURE_NEW: &str = "gleam_native_closure_new";
+
+/// The symbol of the runtime's structural deep equality.
+pub const DEEP_EQ: &str = "gleam_native_eq";
+
+/// The symbol of the runtime's `echo` implementation.
+pub const ECHO: &str = "gleam_native_echo";
+
 /// The symbol of the runtime's panic/todo report-and-abort function.
 pub const PANIC: &str = "gleam_native_panic";
 
@@ -98,6 +107,9 @@ struct RuntimeFunctions {
     string_concat: FuncId,
     string_eq: FuncId,
     record_new: FuncId,
+    closure_new: FuncId,
+    deep_eq: FuncId,
+    echo: FuncId,
     panic: FuncId,
 }
 
@@ -122,6 +134,9 @@ impl RuntimeFunctions {
             string_concat: declare(STRING_CONCAT, 2)?,
             string_eq: declare(STRING_EQ, 2)?,
             record_new: declare(RECORD_NEW, 2)?,
+            closure_new: declare(CLOSURE_NEW, 1)?,
+            deep_eq: declare(DEEP_EQ, 2)?,
+            echo: declare(ECHO, 6)?,
             panic: declare(PANIC, 7)?,
         })
     }
@@ -290,7 +305,7 @@ impl<'a, M: Module> Translator<'a, M> {
                 types::I64,
                 MemFlagsData::trusted(),
                 closure,
-                8 + 8 * index as i32,
+                16 + 8 * index as i32,
             );
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
@@ -452,12 +467,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     /// Allocates a closure: one word for the code pointer followed by the
     /// captured values, read out of the current environment.
     fn make_closure(&mut self, function: FuncId, captures: &[String]) -> Result<Value, String> {
-        let tag = self.builder.ins().iconst(types::I64, 0);
-        let arity = self.builder.ins().iconst(types::I64, captures.len() as i64);
-        let record_new_ref = self
+        let capture_count = self.builder.ins().iconst(types::I64, captures.len() as i64);
+        let closure_new_ref = self
             .module
-            .declare_func_in_func(self.runtime.record_new, self.builder.func);
-        let call = self.builder.ins().call(record_new_ref, &[tag, arity]);
+            .declare_func_in_func(self.runtime.closure_new, self.builder.func);
+        let call = self.builder.ins().call(closure_new_ref, &[capture_count]);
         let closure = self.builder.inst_results(call)[0];
 
         let function_ref = self.module.declare_func_in_func(function, self.builder.func);
@@ -466,7 +480,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let _ = self
             .builder
             .ins()
-            .store(MemFlagsData::trusted(), address, closure, 0);
+            .store(MemFlagsData::trusted(), address, closure, 8);
 
         for (index, name) in captures.iter().enumerate() {
             let variable = self
@@ -478,7 +492,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 MemFlagsData::trusted(),
                 value,
                 closure,
-                8 + 8 * index as i32,
+                16 + 8 * index as i32,
             );
         }
         Ok(closure)
@@ -812,11 +826,47 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let code = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::trusted(), callee, 0);
+                    .load(types::I64, MemFlagsData::trusted(), callee, 8);
                 let signature = self
                     .builder
                     .import_signature(gleam_signature(values.len()));
                 let call = self.builder.ins().call_indirect(signature, code, &values);
+                Ok(self.builder.inst_results(call)[0])
+            }
+
+            native_ir::Expression::Echo {
+                kind,
+                value,
+                message,
+                line,
+            } => {
+                let kind = self.builder.ins().iconst(
+                    types::I64,
+                    match kind {
+                        native_ir::EchoKind::Structural => 0,
+                        native_ir::EchoKind::Int => 1,
+                        native_ir::EchoKind::Float => 2,
+                        native_ir::EchoKind::String => 3,
+                        native_ir::EchoKind::Bool => 4,
+                        native_ir::EchoKind::Nil => 5,
+                    },
+                );
+                let value = self.expression(value)?;
+                let message = match message {
+                    Some(message) => self.expression(message)?,
+                    None => self.builder.ins().iconst(types::I64, 0),
+                };
+                let module_name = self.module_name.to_string();
+                let (module_pointer, module_length) =
+                    self.constant_bytes(module_name.as_bytes())?;
+                let line = self.builder.ins().iconst(types::I64, *line as i64);
+                let echo_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.echo, self.builder.func);
+                let call = self.builder.ins().call(
+                    echo_ref,
+                    &[kind, value, message, module_pointer, module_length, line],
+                );
                 Ok(self.builder.inst_results(call)[0])
             }
 
@@ -904,6 +954,19 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         let right = self.load_float(right);
                         let flag = self.builder.ins().fcmp(condition, left, right);
                         Ok(self.tag_boolean_flag(flag))
+                    }
+                    native_ir::EqualityKind::Deep => {
+                        let eq_ref = self
+                            .module
+                            .declare_func_in_func(self.runtime.deep_eq, self.builder.func);
+                        let call = self.builder.ins().call(eq_ref, &[left, right]);
+                        let result = self.builder.inst_results(call)[0];
+                        if *negated {
+                            // Flip between the tagged booleans 1 and 3.
+                            Ok(self.builder.ins().bxor_imm_u(result, 2))
+                        } else {
+                            Ok(result)
+                        }
                     }
                     native_ir::EqualityKind::String => {
                         let eq_ref = self
@@ -1132,14 +1195,17 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .ok_or_else(|| format!("unbound decision variable {var}"))?;
                 for (check, decision) in choices {
                     let matched = match check {
-                        native_ir::Check::Variant { tag, .. } => {
+                        native_ir::Check::Variant { tag, fields } => {
                             let actual = self.builder.ins().load(
                                 types::I64,
                                 MemFlagsData::trusted(),
                                 subject,
                                 0,
                             );
-                            let expected = self.builder.ins().iconst(types::I64, *tag as i64);
+                            let expected = self.builder.ins().iconst(
+                                types::I64,
+                                native_runtime::record_header(*tag, fields.len() as u32) as i64,
+                            );
                             self.builder.ins().icmp(IntCC::Equal, actual, expected)
                         }
                         // Tuples always match: the type system guarantees it.
@@ -1251,11 +1317,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         }
     }
 
-    /// Loads the f64 out of a boxed float value.
+    /// Loads the f64 out of a boxed float value, past its header word.
     fn load_float(&mut self, boxed: Value) -> Value {
         self.builder
             .ins()
-            .load(types::F64, MemFlagsData::trusted(), boxed, 0)
+            .load(types::F64, MemFlagsData::trusted(), boxed, 8)
     }
 
     /// Boxes an f64 register value via the runtime's float constructor.
