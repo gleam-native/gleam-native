@@ -419,6 +419,8 @@ impl<'a, M: Module> Translator<'a, M> {
             scope_owned,
             dying: HashSet::new(),
             consumed: Vec::new(),
+            reuse_token: None,
+            branch_depth: 0,
         };
         // The capture slots take their own references, then the closure
         // itself (owned by this call) is released.
@@ -534,6 +536,8 @@ impl<'a, M: Module> Translator<'a, M> {
             scope_owned,
             dying: HashSet::new(),
             consumed: Vec::new(),
+            reuse_token: None,
+            branch_depth: 0,
         };
         if let Some(result) =
             function_translator.statements_scoped(body, 0, Some(Vec::new()))?
@@ -645,6 +649,148 @@ fn straight_line(expression: &native_ir::Expression) -> bool {
     }
 }
 
+/// Scans a clause body in evaluation order for the first record
+/// construction of `arity` fields. `Some(true)` means it is evaluated
+/// unconditionally whenever the body runs, so a claimed reuse token is
+/// guaranteed to be consumed; `Some(false)` means it sits behind a branch;
+/// `None` means the body never constructs that shape. Lambda bodies are
+/// skipped: they translate as separate functions and cannot consume this
+/// clause's token. Nested decision trees are conservatively treated as
+/// containing a conditional site.
+fn first_reuse_site(
+    statements: &[native_ir::Statement],
+    arity: usize,
+    conditional: bool,
+) -> Option<bool> {
+    for statement in statements {
+        let found = match statement {
+            native_ir::Statement::Let { value, .. }
+            | native_ir::Statement::Expression(value) => reuse_site_in(value, arity, conditional),
+            native_ir::Statement::Destructure { subject, .. } => reuse_site_in(subject, arity, conditional)
+                // The tree and failure message may construct behind checks.
+                .or(Some(false)),
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// [`first_reuse_site`] for one expression, walking in evaluation order.
+fn reuse_site_in(
+    expression: &native_ir::Expression,
+    arity: usize,
+    conditional: bool,
+) -> Option<bool> {
+    use native_ir::Expression;
+    match expression {
+        Expression::Constructor { arguments, .. } => {
+            for argument in arguments {
+                if let Some(found) = reuse_site_in(argument, arity, conditional) {
+                    return Some(found);
+                }
+            }
+            if arguments.len() == arity {
+                Some(!conditional)
+            } else {
+                None
+            }
+        }
+        Expression::Case { subjects, .. } => {
+            for subject in subjects {
+                if let Some(found) = reuse_site_in(subject, arity, conditional) {
+                    return Some(found);
+                }
+            }
+            // Clause bodies run behind checks; treat the tree as holding a
+            // conditional site rather than walking it.
+            Some(false)
+        }
+        Expression::BoolBinary { left, right, .. } => {
+            if let Some(found) = reuse_site_in(left, arity, conditional) {
+                return Some(found);
+            }
+            // The right side only runs when the left does not decide.
+            reuse_site_in(right, arity, true)
+        }
+        Expression::Lambda { .. } => None,
+        Expression::Block(statements) => first_reuse_site(statements, arity, conditional),
+        Expression::Call { arguments, .. } => {
+            for argument in arguments {
+                if let Some(found) = reuse_site_in(argument, arity, conditional) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Expression::CallValue { callee, arguments } => {
+            if let Some(found) = reuse_site_in(callee, arity, conditional) {
+                return Some(found);
+            }
+            for argument in arguments {
+                if let Some(found) = reuse_site_in(argument, arity, conditional) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Expression::IntBinary { left, right, .. }
+        | Expression::IntCompare { left, right, .. }
+        | Expression::FloatBinary { left, right, .. }
+        | Expression::FloatCompare { left, right, .. }
+        | Expression::Equality { left, right, .. }
+        | Expression::StringConcat(left, right) => {
+            if let Some(found) = reuse_site_in(left, arity, conditional) {
+                return Some(found);
+            }
+            reuse_site_in(right, arity, conditional)
+        }
+        Expression::BoolNot(inner) => reuse_site_in(inner, arity, conditional),
+        Expression::FieldAccess { record, .. } => reuse_site_in(record, arity, conditional),
+        Expression::BitArray(segments) => {
+            for segment in segments {
+                if let Some(found) = reuse_site_in(&segment.value, arity, conditional) {
+                    return Some(found);
+                }
+                let bits = match &segment.kind {
+                    native_ir::BitSegmentKind::Int { bits, .. }
+                    | native_ir::BitSegmentKind::Float { bits, .. } => Some(bits),
+                    native_ir::BitSegmentKind::BitArraySplice { bits } => bits.as_ref(),
+                    native_ir::BitSegmentKind::String { .. }
+                    | native_ir::BitSegmentKind::Codepoint { .. } => None,
+                };
+                if let Some(bits) = bits
+                    && let Some(found) = reuse_site_in(bits, arity, conditional)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Expression::Echo { value, message, .. } => {
+            if let Some(found) = reuse_site_in(value, arity, conditional) {
+                return Some(found);
+            }
+            message
+                .as_deref()
+                .and_then(|message| reuse_site_in(message, arity, conditional))
+        }
+        Expression::Panic { message, .. } => message
+            .as_deref()
+            .and_then(|message| reuse_site_in(message, arity, conditional)),
+        Expression::Int(_)
+        | Expression::BigInt(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Nil
+        | Expression::Bool(_)
+        | Expression::Variable(_)
+        | Expression::EmptyList
+        | Expression::FunctionReference { .. } => None,
+    }
+}
+
 /// Emits an inline reference count increment: nothing for immediates, one
 /// added to the count word before the object for heap values.
 fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
@@ -720,6 +866,9 @@ enum DecisionMode<'a> {
         /// In tail position: the owned values (enclosing scopes, subjects)
         /// to release before a tail transfer inside a clause.
         tail: Option<Cleanups>,
+        /// The case's subject values: the only values a clause may claim
+        /// for drop-reuse (nested switches scrutinize borrowed fields).
+        subjects: Vec<Value>,
     },
     Assignment {
         result: Value,
@@ -754,6 +903,24 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     /// The names consumed while [`Self::dying`] was armed, so a pending
     /// tail-transfer release list can skip their entries.
     consumed: Vec<String>,
+    /// A claimed drop-reuse token: a variable holding either the memory of
+    /// a uniquely-owned, already-deconstructed record of the given field
+    /// count, or zero. The first constructor of that field count writes
+    /// into it instead of allocating.
+    reuse_token: Option<(Variable, usize)>,
+    /// How many decision-tree clause bodies enclose the current
+    /// translation point. Subject-position consumption is sound only at
+    /// depth zero: inside a clause, sibling paths that did not run the
+    /// subject evaluation would need a different release state at the
+    /// join.
+    branch_depth: usize,
+}
+
+/// A subject a clause may deconstruct in place: the matched record value
+/// and the decision variables its fields were extracted into.
+struct ReuseCandidate {
+    subject: Value,
+    fields: Vec<u32>,
 }
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
@@ -1054,9 +1221,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         }
     }
 
-    /// Releases a tail transfer's owed values, minus the entries consumed
-    /// during argument evaluation (innermost entry per consumed name).
-    fn release_cleanups(&mut self, mut cleanups: Cleanups) {
+    /// Removes the entries whose names were consumed while [`Self::dying`]
+    /// was armed (innermost entry per consumed name) and disarms.
+    fn remove_consumed(&mut self, cleanups: &mut Cleanups) {
         self.dying.clear();
         for name in std::mem::take(&mut self.consumed) {
             if let Some(position) = cleanups
@@ -1066,9 +1233,87 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let _ = cleanups.remove(position);
             }
         }
+    }
+
+    /// Releases a tail transfer's owed values, minus the entries consumed
+    /// during argument evaluation.
+    fn release_cleanups(&mut self, mut cleanups: Cleanups) {
+        self.remove_consumed(&mut cleanups);
         for (_, value) in cleanups {
             self.dec(value);
         }
+    }
+
+    /// Whether a clause body in tail position is certain to end in a tail
+    /// transfer, so its join path is unreachable.
+    fn body_transfers(&self, body: &[native_ir::Statement]) -> bool {
+        match body.last() {
+            Some(native_ir::Statement::Expression(native_ir::Expression::Call {
+                module,
+                function,
+                ..
+            })) => self
+                .functions
+                .get(&(module.clone(), function.clone()))
+                .is_some_and(|(_, external)| !external),
+            Some(native_ir::Statement::Expression(native_ir::Expression::CallValue {
+                ..
+            })) => true,
+            _ => false,
+        }
+    }
+
+    /// Emits the release of a matched subject at clause entry. When its
+    /// count is one this claims the block as a drop-reuse token, releasing
+    /// the fields it owned (pattern bindings hold their own references);
+    /// otherwise the count just drops, other owners keeping the record
+    /// alive. Returns the token variable: the block's value pointer, or
+    /// zero when the record was shared.
+    fn emit_reuse_claim(
+        &mut self,
+        candidate: &ReuseCandidate,
+        variables: &HashMap<u32, Value>,
+    ) -> Result<Variable, String> {
+        let token = self.builder.declare_var(types::I64);
+        let claim = self.builder.create_block();
+        let shared = self.builder.create_block();
+        let done = self.builder.create_block();
+        let count = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            candidate.subject,
+            -8,
+        );
+        let unique = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
+        self.builder.ins().brif(unique, claim, &[], shared, &[]);
+        self.builder.seal_block(claim);
+        self.builder.seal_block(shared);
+
+        self.builder.switch_to_block(claim);
+        for field in &candidate.fields {
+            let value = *variables
+                .get(field)
+                .ok_or_else(|| format!("unbound decision variable {field}"))?;
+            self.dec(value);
+        }
+        self.builder.def_var(token, candidate.subject);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(shared);
+        let decremented = self.builder.ins().iadd_imm_s(count, -1);
+        let _ = self.builder.ins().store(
+            MemFlagsData::trusted(),
+            decremented,
+            candidate.subject,
+            -8,
+        );
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.def_var(token, zero);
+        self.builder.ins().jump(done, &[]);
+        self.builder.seal_block(done);
+
+        self.builder.switch_to_block(done);
+        Ok(token)
     }
 
     /// Translates a statement sequence with ownership bookkeeping: values of
@@ -1190,6 +1435,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             result: value,
                             on_failure: on_failure.as_ref(),
                         },
+                        None,
                     )?;
                     self.builder.seal_block(join);
                     self.builder.switch_to_block(join);
@@ -1283,6 +1529,29 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 subject_ids,
                 tree,
             } => {
+                // Arm last-use consumption for subject evaluation: a binding
+                // owed a release whose single mention in the whole case is
+                // one subject moves into the subject temporary. This is what
+                // keeps a scrutinized value uniquely owned, so a clause can
+                // claim it for drop-reuse.
+                self.dying.clear();
+                self.consumed.clear();
+                if self.branch_depth == 0 && subjects.iter().all(straight_line) {
+                    let mut subject_counts = HashMap::new();
+                    for subject in subjects {
+                        native_ir::expression_mentions(subject, &mut subject_counts);
+                    }
+                    let mut tree_counts = HashMap::new();
+                    native_ir::decision_mentions(tree, &mut tree_counts);
+                    for (name, _) in &cleanups {
+                        if let Some(name) = name
+                            && subject_counts.get(name) == Some(&1)
+                            && !tree_counts.contains_key(name)
+                        {
+                            let _ = self.dying.insert(name.clone());
+                        }
+                    }
+                }
                 let mut variables = HashMap::new();
                 let mut subject_values = Vec::with_capacity(subjects.len());
                 for (id, subject) in subject_ids.iter().zip(subjects) {
@@ -1290,6 +1559,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     let _ = variables.insert(*id, value);
                     subject_values.push(value);
                 }
+                let mut cleanups = cleanups;
+                self.remove_consumed(&mut cleanups);
                 let mut tail_cleanups = cleanups;
                 tail_cleanups.extend(subject_values.iter().map(|value| (None, *value)));
 
@@ -1301,7 +1572,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     join,
                     DecisionMode::Case {
                         tail: Some(tail_cleanups),
+                        subjects: subject_values.clone(),
                     },
+                    None,
                 )?;
                 self.builder.seal_block(join);
                 self.builder.switch_to_block(join);
@@ -1436,20 +1709,31 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 tree,
             } => {
                 let mut variables = HashMap::new();
+                let mut subject_values = Vec::with_capacity(subjects.len());
                 for (id, subject) in subject_ids.iter().zip(subjects) {
                     let value = self.expression(subject)?;
                     let _ = variables.insert(*id, value);
+                    subject_values.push(value);
                 }
 
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
-                let _ = self.decision(&variables, tree, join, DecisionMode::Case { tail: None })?;
+                let _ = self.decision(
+                    &variables,
+                    tree,
+                    join,
+                    DecisionMode::Case {
+                        tail: None,
+                        subjects: subject_values.clone(),
+                    },
+                    None,
+                )?;
                 self.builder.seal_block(join);
 
                 self.builder.switch_to_block(join);
                 let result = self.builder.block_params(join)[0];
-                for subject in variables.values() {
-                    self.dec(*subject);
+                for subject in subject_values {
+                    self.dec(subject);
                 }
                 Ok(result)
             }
@@ -1488,7 +1772,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 // runtime allocator's formula.
                 let header = native_runtime::record_header(*tag, arity as u32)
                     | ((display as u64) << 48);
-                let record = self.pool_alloc(1 + arity, header, |this| {
+                let slow = |this: &mut Self| {
                     let tag = this.builder.ins().iconst(types::I64, *tag as i64);
                     let arity = this.builder.ins().iconst(types::I64, arity as i64);
                     let display = this.builder.ins().iconst(types::I64, display as i64);
@@ -1500,7 +1784,50 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         .ins()
                         .call(record_new_ref, &[tag, arity, display]);
                     Ok(this.builder.inst_results(call)[0])
-                })?;
+                };
+                let reusable = match self.reuse_token {
+                    Some((token, fields)) if fields == arity => {
+                        self.reuse_token = None;
+                        Some(token)
+                    }
+                    _ => None,
+                };
+                let record = match reusable {
+                    // A drop-reuse token of this shape: when it captured a
+                    // block (the deconstructed record was uniquely owned),
+                    // write the new header over it — its count is already
+                    // one — and skip allocation entirely.
+                    Some(token_slot) => {
+                        let token = self.builder.use_var(token_slot);
+                        let reused = self.builder.create_block();
+                        let fresh = self.builder.create_block();
+                        let joined = self.builder.create_block();
+                        self.builder.append_block_param(joined, types::I64);
+                        self.builder.ins().brif(token, reused, &[], fresh, &[]);
+                        self.builder.seal_block(reused);
+                        self.builder.seal_block(fresh);
+
+                        self.builder.switch_to_block(reused);
+                        let header_value =
+                            self.builder.ins().iconst(types::I64, header as i64);
+                        let _ = self.builder.ins().store(
+                            MemFlagsData::trusted(),
+                            header_value,
+                            token,
+                            0,
+                        );
+                        self.builder.ins().jump(joined, &[token.into()]);
+
+                        self.builder.switch_to_block(fresh);
+                        let allocated = self.pool_alloc(1 + arity, header, slow)?;
+                        self.builder.ins().jump(joined, &[allocated.into()]);
+                        self.builder.seal_block(joined);
+
+                        self.builder.switch_to_block(joined);
+                        self.builder.block_params(joined)[0]
+                    }
+                    None => self.pool_alloc(1 + arity, header, slow)?,
+                };
                 for (index, value) in values.into_iter().enumerate() {
                     let _ = self.builder.ins().store(
                         MemFlagsData::trusted(),
@@ -1981,6 +2308,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         tree: &native_ir::Decision,
         join: Block,
         mode: DecisionMode<'_>,
+        reuse: Option<ReuseCandidate>,
     ) -> Result<bool, String> {
         match tree {
             native_ir::Decision::Run { bindings, body } => {
@@ -2098,7 +2426,32 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     binding_slots.push((name.clone(), variable));
                 }
                 let result = match mode {
-                    DecisionMode::Case { tail } => {
+                    DecisionMode::Case { tail, .. } => {
+                        // Drop-reuse: when this clause deconstructed one of
+                        // the case's own subjects, is certain to end in a
+                        // tail transfer (so the join path cannot release
+                        // the subject again), and unconditionally constructs
+                        // a record of the matched shape, the subject is
+                        // released here instead of at the transfer — and a
+                        // uniquely owned one keeps its memory as a token
+                        // for that construction to reuse.
+                        let mut tail = tail;
+                        let mut claimed = false;
+                        if let Some(candidate) = reuse
+                            && self.reuse_token.is_none()
+                            && let Some(chain) = &mut tail
+                            && first_reuse_site(body, candidate.fields.len(), false)
+                                == Some(true)
+                            && self.body_transfers(body)
+                            && let Some(position) = chain.iter().rposition(|(name, value)| {
+                                name.is_none() && *value == candidate.subject
+                            })
+                        {
+                            let _ = chain.remove(position);
+                            let token = self.emit_reuse_claim(&candidate, variables)?;
+                            self.reuse_token = Some((token, candidate.fields.len()));
+                            claimed = true;
+                        }
                         // Clause bindings join the scope machinery: the
                         // body's last-use analysis can consume them, and
                         // its scope release frees whatever survives. A
@@ -2110,7 +2463,17 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         let saved_owned = self.scope_owned.clone();
                         let scope_start = self.scope_owned.len();
                         self.scope_owned.extend(binding_slots.iter().cloned());
-                        match self.statements_scoped(body, scope_start, tail)? {
+                        self.branch_depth += 1;
+                        let outcome = self.statements_scoped(body, scope_start, tail);
+                        self.branch_depth -= 1;
+                        let outcome = outcome?;
+                        if claimed && self.reuse_token.take().is_some() {
+                            // The scan proved an unconditional construction
+                            // consumes the token; reaching here with it
+                            // still armed is a translator bug.
+                            return Err("drop-reuse token was not consumed".into());
+                        }
+                        match outcome {
                             None => {
                                 // The clause tail-transferred; nothing joins.
                                 self.scope_owned = saved_owned;
@@ -2290,7 +2653,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
                 self.builder.switch_to_block(true_block);
                 let jumped = match &mode {
-                    DecisionMode::Case { tail: Some(outer) } => {
+                    DecisionMode::Case {
+                        tail: Some(outer), ..
+                    } => {
                         let mut cleanups = outer.clone();
                         // Guard bindings are released outside the scope
                         // machinery, so their entries carry no name and are
@@ -2304,7 +2669,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         // body case above).
                         let saved_owned = self.scope_owned.clone();
                         let scope_start = self.scope_owned.len();
-                        let outcome = self.statements_scoped(if_true, scope_start, Some(cleanups))?;
+                        self.branch_depth += 1;
+                        let outcome = self.statements_scoped(if_true, scope_start, Some(cleanups));
+                        self.branch_depth -= 1;
+                        let outcome = outcome?;
                         self.scope_owned = saved_owned;
                         match outcome {
                             None => false,
@@ -2319,7 +2687,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         }
                     }
                     _ => {
-                        let result = self.statements(if_true)?;
+                        self.branch_depth += 1;
+                        let result = self.statements(if_true);
+                        self.branch_depth -= 1;
+                        let result = result?;
                         for slot in &binding_slots {
                             let value = self.builder.use_var(*slot);
                             self.dec(value);
@@ -2335,7 +2706,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     let value = self.builder.use_var(*slot);
                     self.dec(value);
                 }
-                Ok(self.decision(variables, if_false, join, mode)? || jumped)
+                Ok(self.decision(variables, if_false, join, mode, None)? || jumped)
             }
 
             native_ir::Decision::Switch {
@@ -2347,6 +2718,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let subject = *variables
                     .get(var)
                     .ok_or_else(|| format!("unbound decision variable {var}"))?;
+                // Only a case's own subject may be claimed for drop-reuse:
+                // nested switches scrutinize fields borrowed from their
+                // containers.
+                let reusable_subject = matches!(
+                    &mode,
+                    DecisionMode::Case { tail: Some(_), subjects } if subjects.contains(&subject)
+                );
                 let mut joined = false;
                 for (check, decision) in choices {
                     let matched = match check {
@@ -2400,7 +2778,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         _ => vec![],
                     };
                     if extracted.is_empty() {
-                        joined |= self.decision(variables, decision, join, mode.clone())?;
+                        joined |= self.decision(variables, decision, join, mode.clone(), None)?;
                     } else {
                         let mut extended = variables.clone();
                         for (index, field) in extracted.iter().enumerate() {
@@ -2412,14 +2790,25 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             );
                             let _ = extended.insert(*field, value);
                         }
-                        joined |= self.decision(&extended, decision, join, mode.clone())?;
+                        let candidate = if reusable_subject
+                            && matches!(decision, native_ir::Decision::Run { .. })
+                        {
+                            Some(ReuseCandidate {
+                                subject,
+                                fields: extracted.clone(),
+                            })
+                        } else {
+                            None
+                        };
+                        joined |=
+                            self.decision(&extended, decision, join, mode.clone(), candidate)?;
                     }
                     self.builder.switch_to_block(next_block);
                 }
                 // An exhaustive match's final variant is not tag-tested,
                 // but its fields still become decision variables.
                 if fallback_fields.is_empty() {
-                    Ok(self.decision(variables, fallback, join, mode)? || joined)
+                    Ok(self.decision(variables, fallback, join, mode, None)? || joined)
                 } else {
                     let mut extended = variables.clone();
                     for (index, field) in fallback_fields.iter().enumerate() {
@@ -2431,7 +2820,17 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         );
                         let _ = extended.insert(*field, value);
                     }
-                    Ok(self.decision(&extended, fallback, join, mode)? || joined)
+                    let candidate = if reusable_subject
+                        && matches!(fallback.as_ref(), native_ir::Decision::Run { .. })
+                    {
+                        Some(ReuseCandidate {
+                            subject,
+                            fields: fallback_fields.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    Ok(self.decision(&extended, fallback, join, mode, candidate)? || joined)
                 }
             }
         }

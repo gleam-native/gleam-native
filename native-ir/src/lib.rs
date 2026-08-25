@@ -550,6 +550,14 @@ pub fn expression_mentions(expression: &Expression, counts: &mut HashMap<String,
     });
 }
 
+/// Adds a decision tree's free-variable mention counts into `counts`.
+pub fn decision_mentions(decision: &Decision, counts: &mut HashMap<String, usize>) {
+    let mut bound = HashSet::new();
+    decision_free(decision, &mut bound, &mut |name| {
+        *counts.entry(name.to_string()).or_insert(0) += 1;
+    }, false);
+}
+
 fn statements_free(
     statements: &[Statement],
     bound: &mut HashSet<String>,
