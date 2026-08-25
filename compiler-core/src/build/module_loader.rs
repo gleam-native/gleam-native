@@ -68,6 +68,18 @@ where
             return read_source(name).map(|module| Input::New(Box::new(module)));
         }
 
+        // On the native target codegen writes a versioned artifact next to
+        // the cache. A missing or outdated one (a compiler upgrade changed
+        // the format) must recompile the module so the artifact is
+        // regenerated, rather than failing when the program is run.
+        if self.codegen.is_required()
+            && self.target == Target::Native
+            && !self.native_artifact_is_current(&file)
+        {
+            tracing::debug!(?name, "native_artifact_stale");
+            return read_source(name).map(|module| Input::New(Box::new(module)));
+        }
+
         // If the timestamp of the source is newer than the cache entry and
         // the hash of the source differs from the one in the cache entry,
         // then we need to recompile.
@@ -85,6 +97,17 @@ where
         }
 
         Ok(Input::Cached(self.cached(file, meta)))
+    }
+
+    /// Whether the module's compiled native artifact exists and has the
+    /// current format version.
+    fn native_artifact_is_current(&self, source_file: &GleamFile) -> bool {
+        let path = source_file
+            .cache_files(self.artefact_directory)
+            .native_ir_path;
+        self.io
+            .read_bytes(&path)
+            .is_ok_and(|bytes| native_ir::artifact_is_current(&bytes))
     }
 
     /// Read the cache metadata file from the artefact directory for the given

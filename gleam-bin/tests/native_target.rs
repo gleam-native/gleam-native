@@ -200,6 +200,50 @@ stdout: {stdout}"
 }
 
 #[test]
+fn outdated_artifacts_are_regenerated() {
+    // An artifact from an older compiler (a format version bump, or plain
+    // corruption) must make the build recompile the module and regenerate
+    // it — never leave the project failing at run time until a manual
+    // clean build.
+    let project = TestProject::new(
+        "outdated_artifact",
+        r#"pub fn main() -> Nil {
+  echo "healed"
+  Nil
+}
+"#,
+    );
+    let output = project.run();
+    assert!(
+        output.status.success(),
+        "the first build should run.
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Overwrite the compiled artifact with bytes that are not a current
+    // artifact, standing in for any older format.
+    let artifact = project
+        .root
+        .join("build/dev/native/outdated_artifact/_gleam_artefacts/outdated_artifact.nir");
+    assert!(artifact.is_file(), "no artifact at {artifact:?}");
+    std::fs::write(&artifact, b"stale-old-format").expect("overwrite artifact");
+
+    let output = project.run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the rebuild should regenerate the outdated artifact and run.
+stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("\"healed\""),
+        "unexpected output.
+stderr: {stderr}"
+    );
+}
+
+#[test]
 fn removed_modules_do_not_leave_stale_artifacts() {
     // Deleting a module must also drop its compiled `.nir` artifact on the
     // next build: the native runner loads every artifact in the build

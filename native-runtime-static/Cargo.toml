@@ -10,6 +10,13 @@ license = "Apache-2.0"
 
 [lib]
 crate-type = ["staticlib"]
+# This crate provides the C `main` for ahead-of-time compiled executables,
+# which clashes with the entry point of any Rust test or bench harness, so
+# those targets must never be built. The runtime's tests live in
+# `native-runtime`; end-to-end coverage is in `gleam-bin` and `test-output`.
+test = false
+doctest = false
+bench = false
 
 [dependencies]
 native-runtime = { path = "../native-runtime" }

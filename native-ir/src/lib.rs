@@ -16,12 +16,15 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 28;
+pub const FORMAT_VERSION: u32 = 29;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Artifact {
-    pub version: u32,
-    pub module: Module,
+/// Whether the bytes are an artifact of the current format version, from
+/// the four-byte little-endian version header alone. The build uses this to
+/// treat modules with outdated artifacts as stale, so a compiler upgrade
+/// regenerates them instead of failing at run time.
+pub fn artifact_is_current(bytes: &[u8]) -> bool {
+    bytes.len() >= 4
+        && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == FORMAT_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,28 +491,28 @@ pub enum IntOperator {
     Remainder,
 }
 
+/// Encodes a module as a four-byte little-endian [`FORMAT_VERSION`] header
+/// followed by the serialized module.
 pub fn encode(module: &Module) -> Result<Vec<u8>, bitcode::Error> {
-    bitcode::serialize(&Artifact {
-        version: FORMAT_VERSION,
-        module: module.clone(),
-    })
+    let mut bytes = FORMAT_VERSION.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&bitcode::serialize(module)?);
+    Ok(bytes)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Module, String> {
-    let artifact: Artifact = bitcode::deserialize(bytes).map_err(|error| {
+    if !artifact_is_current(bytes) {
+        return Err(
+            "outdated or corrupt native artifact. \
+Delete the project's `build` directory and rebuild."
+                .into(),
+        );
+    }
+    bitcode::deserialize(&bytes[4..]).map_err(|error| {
         format!(
-            "corrupt or outdated native artifact ({error}). \
+            "corrupt native artifact ({error}). \
 Delete the project's `build` directory and rebuild."
         )
-    })?;
-    if artifact.version != FORMAT_VERSION {
-        return Err(format!(
-            "native artifact format version {} does not match compiler version {}. \
-Delete the project's `build` directory and rebuild.",
-            artifact.version, FORMAT_VERSION
-        ));
-    }
-    Ok(artifact.module)
+    })
 }
 
 /// The free variables of a statement sequence, in deterministic order:
