@@ -48,6 +48,7 @@ pub const KIND_BIGINT: u64 = 1;
 pub const KIND_FLOAT: u64 = 2;
 pub const KIND_STRING: u64 = 3;
 pub const KIND_CLOSURE: u64 = 4;
+pub const KIND_BITARRAY: u64 = 5;
 
 /// The header word of a record with the given variant tag and field count.
 /// Code generation computes expected headers with this same formula, so a
@@ -125,6 +126,32 @@ fn float_value(value: u64) -> f64 {
 
 fn string_value(value: u64) -> &'static String {
     unsafe { &(*container::<String>(value)).value }
+}
+
+/// A bit array's payload. Only byte-aligned sizes are supported so far, so
+/// `bits` is always `bytes.len() * 8`; the field exists for future
+/// unaligned support.
+struct BitArrayPayload {
+    bits: u64,
+    bytes: Vec<u8>,
+}
+
+fn box_bitarray(bytes: Vec<u8>) -> u64 {
+    box_heap(
+        KIND_BITARRAY,
+        BitArrayPayload {
+            bits: bytes.len() as u64 * 8,
+            bytes,
+        },
+    )
+}
+
+fn bitarray_value(value: u64) -> &'static BitArrayPayload {
+    unsafe { &(*container::<BitArrayPayload>(value)).value }
+}
+
+fn bitarray_value_mut(value: u64) -> &'static mut BitArrayPayload {
+    unsafe { &mut (*container::<BitArrayPayload>(value)).value }
 }
 
 fn record_field(value: u64, index: u32) -> u64 {
@@ -289,6 +316,161 @@ pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u6
     box_string(string_value(subject)[offset as usize..].to_string())
 }
 
+/// A new empty bit array, the start of a construction chain.
+pub extern "C" fn gleam_native_bitarray_empty() -> u64 {
+    box_bitarray(Vec::new())
+}
+
+/// Appends an integer segment of `bits` bits (a multiple of 8, at most 64),
+/// truncating the value to the segment size. Construction chains own their
+/// array uniquely, so it is mutated in place and returned.
+pub extern "C" fn gleam_native_bitarray_append_int(
+    array: u64,
+    value: u64,
+    bits: u64,
+    little_endian: u64,
+) -> u64 {
+    // Truncation keeps the low `bits` bits, so only the low 64 bits of a
+    // big integer can matter.
+    let value = if value & 1 == 1 {
+        ((value as i64) >> 1) as u64
+    } else {
+        // to_signed_bytes_le is two's complement, so the low eight bytes
+        // are exactly the truncated value.
+        let mut low: u64 = 0;
+        for (index, byte) in bigint_value(value)
+            .to_signed_bytes_le()
+            .iter()
+            .take(8)
+            .enumerate()
+        {
+            low |= (*byte as u64) << (8 * index);
+        }
+        low
+    };
+    let payload = bitarray_value_mut(array);
+    let byte_count = (bits / 8) as usize;
+    for index in 0..byte_count {
+        let shift = if little_endian == 0 {
+            8 * (byte_count - 1 - index)
+        } else {
+            8 * index
+        };
+        payload.bytes.push((value >> shift) as u8);
+    }
+    payload.bits += bits;
+    array
+}
+
+/// Appends a string segment's UTF-8 bytes.
+///
+/// # Safety
+///
+/// `string` must be a string created by this runtime.
+pub unsafe extern "C" fn gleam_native_bitarray_append_string(array: u64, string: u64) -> u64 {
+    let bytes = string_value(string).as_bytes();
+    let payload = bitarray_value_mut(array);
+    payload.bytes.extend_from_slice(bytes);
+    payload.bits += bytes.len() as u64 * 8;
+    array
+}
+
+/// Appends another bit array's contents.
+pub extern "C" fn gleam_native_bitarray_append_bits(array: u64, other: u64) -> u64 {
+    let other = bitarray_value(other);
+    let payload = bitarray_value_mut(array);
+    payload.bytes.extend_from_slice(&other.bytes);
+    payload.bits += other.bits;
+    array
+}
+
+/// Whether the array is exactly (`exact` non-zero) or at least `bits` bits.
+pub extern "C" fn gleam_native_bitarray_size_test(array: u64, bits: u64, exact: u64) -> u64 {
+    let size = bitarray_value(array).bits;
+    let passed = if exact == 0 { size >= bits } else { size == bits };
+    if passed { TRUE } else { FALSE }
+}
+
+/// Whether the bytes at bit offset `offset` (a multiple of 8) equal the
+/// given constant bytes.
+///
+/// # Safety
+///
+/// `bytes` must point to `length` readable bytes.
+pub unsafe extern "C" fn gleam_native_bitarray_bytes_test(
+    array: u64,
+    offset: u64,
+    bytes: *const u8,
+    length: u64,
+) -> u64 {
+    let expected = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
+    let payload = bitarray_value(array);
+    let start = (offset / 8) as usize;
+    let end = start + expected.len();
+    if end <= payload.bytes.len() && &payload.bytes[start..end] == expected {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// Whether the rest of the array past bit offset `offset` is a whole number
+/// of bytes. Always true while only byte-aligned arrays exist, but kept as
+/// a real test for future unaligned support.
+pub extern "C" fn gleam_native_bitarray_rest_is_bytes(array: u64, offset: u64) -> u64 {
+    if (bitarray_value(array).bits - offset) % 8 == 0 {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// Reads an integer of `bits` bits (a multiple of 8, at most 64) at bit
+/// offset `offset` (a multiple of 8).
+pub extern "C" fn gleam_native_bitarray_read_int(
+    array: u64,
+    offset: u64,
+    bits: u64,
+    little_endian: u64,
+    signed: u64,
+) -> u64 {
+    let payload = bitarray_value(array);
+    let start = (offset / 8) as usize;
+    let byte_count = (bits / 8) as usize;
+    let bytes = &payload.bytes[start..start + byte_count];
+    let mut value: u64 = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        let shift = if little_endian == 0 {
+            8 * (byte_count - 1 - index)
+        } else {
+            8 * index
+        };
+        value |= (*byte as u64) << shift;
+    }
+    if signed != 0 && bits < 64 && value >> (bits - 1) & 1 == 1 {
+        // Sign-extend.
+        value |= u64::MAX << bits;
+    }
+    if signed != 0 {
+        retag(BigInt::from(value as i64))
+    } else {
+        retag(BigInt::from(value))
+    }
+}
+
+/// A new bit array holding `bits` bits from bit offset `offset`, or
+/// everything from `offset` onwards when `bits` is `u64::MAX`.
+pub extern "C" fn gleam_native_bitarray_slice(array: u64, offset: u64, bits: u64) -> u64 {
+    let payload = bitarray_value(array);
+    let start = (offset / 8) as usize;
+    let end = if bits == u64::MAX {
+        payload.bytes.len()
+    } else {
+        start + (bits / 8) as usize
+    };
+    box_bitarray(payload.bytes[start..end].to_vec())
+}
+
 /// Allocates a custom type record: a header word encoding the variant tag
 /// and field count, followed by `arity` field words which generated code
 /// stores immediately after this call.
@@ -366,6 +548,9 @@ pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
             KIND_BIGINT => drop(unsafe { Box::from_raw(container::<BigInt>(value)) }),
             KIND_FLOAT => drop(unsafe { Box::from_raw(container::<f64>(value)) }),
             KIND_STRING => drop(unsafe { Box::from_raw(container::<String>(value)) }),
+            KIND_BITARRAY => {
+                drop(unsafe { Box::from_raw(container::<BitArrayPayload>(value)) })
+            }
             _ => {}
         }
     }
@@ -400,6 +585,11 @@ fn deep_eq(left: u64, right: u64) -> bool {
             (0..record_arity(left_header))
                 .all(|index| deep_eq(record_field(left, index), record_field(right, index)))
         }
+        KIND_BITARRAY => {
+            let left = bitarray_value(left);
+            let right = bitarray_value(right);
+            left.bits == right.bits && left.bytes == right.bytes
+        }
         // Closures are equal only when identical, handled above.
         _ => false,
     }
@@ -419,6 +609,14 @@ fn inspect(value: u64) -> String {
         KIND_FLOAT => format!("{:?}", float_value(value)),
         KIND_STRING => format!("{:?}", string_value(value)),
         KIND_CLOSURE => "//fn".to_string(),
+        KIND_BITARRAY => {
+            let bytes: Vec<String> = bitarray_value(value)
+                .bytes
+                .iter()
+                .map(|byte| byte.to_string())
+                .collect();
+            format!("<<{}>>", bytes.join(", "))
+        }
         KIND_RECORD => {
             let fields: Vec<String> = (0..record_arity(header))
                 .map(|index| inspect(record_field(value, index)))
@@ -609,6 +807,42 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_string_slice_from as *const u8,
         ),
         (
+            "gleam_native_bitarray_empty",
+            gleam_native_bitarray_empty as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_append_int",
+            gleam_native_bitarray_append_int as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_append_string",
+            gleam_native_bitarray_append_string as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_append_bits",
+            gleam_native_bitarray_append_bits as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_size_test",
+            gleam_native_bitarray_size_test as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_bytes_test",
+            gleam_native_bitarray_bytes_test as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_rest_is_bytes",
+            gleam_native_bitarray_rest_is_bytes as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_read_int",
+            gleam_native_bitarray_read_int as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_slice",
+            gleam_native_bitarray_slice as *const u8,
+        ),
+        (
             "gleam_native_record_new",
             gleam_native_record_new as *const u8,
         ),
@@ -767,6 +1001,58 @@ mod tests {
             unsafe { gleam_native_string_eq(make_string(""), make_string("")) },
             TRUE
         );
+    }
+
+    #[test]
+    fn bit_array_operations() {
+        // <<1, 258:16, "ok":utf8>> — 258 big-endian is [1, 2].
+        let array = gleam_native_bitarray_empty();
+        let array = gleam_native_bitarray_append_int(array, tag_small_int(1), 8, 0);
+        let array = gleam_native_bitarray_append_int(array, tag_small_int(258), 16, 0);
+        let array = unsafe { gleam_native_bitarray_append_string(array, make_string("ok")) };
+        assert_eq!(bitarray_value(array).bytes, vec![1, 1, 2, b'o', b'k']);
+
+        assert_eq!(gleam_native_bitarray_size_test(array, 40, 1), TRUE);
+        assert_eq!(gleam_native_bitarray_size_test(array, 16, 0), TRUE);
+        assert_eq!(gleam_native_bitarray_size_test(array, 48, 0), FALSE);
+
+        let expected = [1u8, 2];
+        assert_eq!(
+            unsafe { gleam_native_bitarray_bytes_test(array, 8, expected.as_ptr(), 2) },
+            TRUE
+        );
+
+        assert_eq!(
+            gleam_native_bitarray_read_int(array, 8, 16, 0, 0),
+            tag_small_int(258)
+        );
+        // Little-endian read of the same bytes: 0x0201.
+        assert_eq!(
+            gleam_native_bitarray_read_int(array, 8, 16, 1, 0),
+            tag_small_int(513)
+        );
+        // Signed read of 0xFF is -1.
+        let negative = gleam_native_bitarray_empty();
+        let negative = gleam_native_bitarray_append_int(negative, tag_small_int(-1), 8, 0);
+        assert_eq!(
+            gleam_native_bitarray_read_int(negative, 0, 8, 0, 1),
+            tag_small_int(-1)
+        );
+        assert_eq!(
+            gleam_native_bitarray_read_int(negative, 0, 8, 0, 0),
+            tag_small_int(255)
+        );
+
+        let rest = gleam_native_bitarray_slice(array, 24, u64::MAX);
+        assert_eq!(bitarray_value(rest).bytes, vec![b'o', b'k']);
+        let sized = gleam_native_bitarray_slice(array, 0, 16);
+        assert_eq!(bitarray_value(sized).bytes, vec![1, 1]);
+
+        // Structural equality and inspection.
+        let again = gleam_native_bitarray_slice(array, 0, u64::MAX);
+        assert_eq!(gleam_native_eq(array, again), TRUE);
+        assert_eq!(gleam_native_eq(array, rest), FALSE);
+        assert_eq!(inspect(sized), "<<1, 1>>");
     }
 
     #[test]

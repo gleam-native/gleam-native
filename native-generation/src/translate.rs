@@ -54,6 +54,17 @@ pub const STRING_EQ: &str = "gleam_native_string_eq";
 pub const STRING_STARTS_WITH: &str = "gleam_native_string_starts_with";
 pub const STRING_SLICE_FROM: &str = "gleam_native_string_slice_from";
 
+/// The symbols of the runtime's bit array operations.
+pub const BITARRAY_EMPTY: &str = "gleam_native_bitarray_empty";
+pub const BITARRAY_APPEND_INT: &str = "gleam_native_bitarray_append_int";
+pub const BITARRAY_APPEND_STRING: &str = "gleam_native_bitarray_append_string";
+pub const BITARRAY_APPEND_BITS: &str = "gleam_native_bitarray_append_bits";
+pub const BITARRAY_SIZE_TEST: &str = "gleam_native_bitarray_size_test";
+pub const BITARRAY_BYTES_TEST: &str = "gleam_native_bitarray_bytes_test";
+pub const BITARRAY_REST_IS_BYTES: &str = "gleam_native_bitarray_rest_is_bytes";
+pub const BITARRAY_READ_INT: &str = "gleam_native_bitarray_read_int";
+pub const BITARRAY_SLICE: &str = "gleam_native_bitarray_slice";
+
 /// The symbol of the runtime's custom type record allocator.
 pub const RECORD_NEW: &str = "gleam_native_record_new";
 
@@ -116,6 +127,15 @@ struct RuntimeFunctions {
     string_eq: FuncId,
     string_starts_with: FuncId,
     string_slice_from: FuncId,
+    bitarray_empty: FuncId,
+    bitarray_append_int: FuncId,
+    bitarray_append_string: FuncId,
+    bitarray_append_bits: FuncId,
+    bitarray_size_test: FuncId,
+    bitarray_bytes_test: FuncId,
+    bitarray_rest_is_bytes: FuncId,
+    bitarray_read_int: FuncId,
+    bitarray_slice: FuncId,
     record_new: FuncId,
     closure_new: FuncId,
     deep_eq: FuncId,
@@ -147,6 +167,15 @@ impl RuntimeFunctions {
             string_eq: declare(STRING_EQ, 2)?,
             string_starts_with: declare(STRING_STARTS_WITH, 3)?,
             string_slice_from: declare(STRING_SLICE_FROM, 2)?,
+            bitarray_empty: declare(BITARRAY_EMPTY, 0)?,
+            bitarray_append_int: declare(BITARRAY_APPEND_INT, 4)?,
+            bitarray_append_string: declare(BITARRAY_APPEND_STRING, 2)?,
+            bitarray_append_bits: declare(BITARRAY_APPEND_BITS, 2)?,
+            bitarray_size_test: declare(BITARRAY_SIZE_TEST, 3)?,
+            bitarray_bytes_test: declare(BITARRAY_BYTES_TEST, 4)?,
+            bitarray_rest_is_bytes: declare(BITARRAY_REST_IS_BYTES, 2)?,
+            bitarray_read_int: declare(BITARRAY_READ_INT, 5)?,
+            bitarray_slice: declare(BITARRAY_SLICE, 3)?,
             record_new: declare(RECORD_NEW, 2)?,
             closure_new: declare(CLOSURE_NEW, 1)?,
             deep_eq: declare(DEEP_EQ, 2)?,
@@ -940,6 +969,56 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 Ok(result)
             }
 
+            native_ir::Expression::BitArray(segments) => {
+                let empty_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.bitarray_empty, self.builder.func);
+                let call = self.builder.ins().call(empty_ref, &[]);
+                let mut array = self.builder.inst_results(call)[0];
+                for segment in segments {
+                    let value = self.expression(&segment.value)?;
+                    array = match segment.kind {
+                        native_ir::BitSegmentKind::Int {
+                            bits,
+                            little_endian,
+                        } => {
+                            let bits = self.builder.ins().iconst(types::I64, bits as i64);
+                            let little = self
+                                .builder
+                                .ins()
+                                .iconst(types::I64, little_endian as i64);
+                            let append_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_append_int,
+                                self.builder.func,
+                            );
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(append_ref, &[array, value, bits, little]);
+                            self.builder.inst_results(call)[0]
+                        }
+                        native_ir::BitSegmentKind::Utf8String => {
+                            let append_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_append_string,
+                                self.builder.func,
+                            );
+                            let call = self.builder.ins().call(append_ref, &[array, value]);
+                            self.builder.inst_results(call)[0]
+                        }
+                        native_ir::BitSegmentKind::BitArraySplice => {
+                            let append_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_append_bits,
+                                self.builder.func,
+                            );
+                            let call = self.builder.ins().call(append_ref, &[array, value]);
+                            self.builder.inst_results(call)[0]
+                        }
+                    };
+                    self.dec(value);
+                }
+                Ok(array)
+            }
+
             native_ir::Expression::Echo {
                 kind,
                 value,
@@ -1246,6 +1325,52 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             let call = self.builder.ins().call(slice_ref, &[subject, offset]);
                             self.builder.inst_results(call)[0]
                         }
+                        native_ir::Bound::BitsReadInt {
+                            subject,
+                            offset,
+                            bits,
+                            little_endian,
+                            signed,
+                        } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                            let bits = self.builder.ins().iconst(types::I64, *bits as i64);
+                            let little =
+                                self.builder.ins().iconst(types::I64, *little_endian as i64);
+                            let signed = self.builder.ins().iconst(types::I64, *signed as i64);
+                            let read_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_read_int,
+                                self.builder.func,
+                            );
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(read_ref, &[subject, offset, bits, little, signed]);
+                            self.builder.inst_results(call)[0]
+                        }
+                        native_ir::Bound::BitsSlice {
+                            subject,
+                            offset,
+                            bits,
+                        } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                            let bits = self
+                                .builder
+                                .ins()
+                                .iconst(types::I64, bits.map_or(u64::MAX as i64, |bits| bits as i64));
+                            let slice_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_slice,
+                                self.builder.func,
+                            );
+                            let call =
+                                self.builder.ins().call(slice_ref, &[subject, offset, bits]);
+                            self.builder.inst_results(call)[0]
+                        }
                     };
                     let variable = self.builder.declare_var(types::I64);
                     self.builder.def_var(variable, value);
@@ -1329,6 +1454,52 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                                 self.builder.func,
                             );
                             let call = self.builder.ins().call(slice_ref, &[subject, offset]);
+                            self.builder.inst_results(call)[0]
+                        }
+                        native_ir::Bound::BitsReadInt {
+                            subject,
+                            offset,
+                            bits,
+                            little_endian,
+                            signed,
+                        } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                            let bits = self.builder.ins().iconst(types::I64, *bits as i64);
+                            let little =
+                                self.builder.ins().iconst(types::I64, *little_endian as i64);
+                            let signed = self.builder.ins().iconst(types::I64, *signed as i64);
+                            let read_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_read_int,
+                                self.builder.func,
+                            );
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(read_ref, &[subject, offset, bits, little, signed]);
+                            self.builder.inst_results(call)[0]
+                        }
+                        native_ir::Bound::BitsSlice {
+                            subject,
+                            offset,
+                            bits,
+                        } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                            let bits = self
+                                .builder
+                                .ins()
+                                .iconst(types::I64, bits.map_or(u64::MAX as i64, |bits| bits as i64));
+                            let slice_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_slice,
+                                self.builder.func,
+                            );
+                            let call =
+                                self.builder.ins().call(slice_ref, &[subject, offset, bits]);
                             self.builder.inst_results(call)[0]
                         }
                     };
@@ -1495,6 +1666,39 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .builder
                     .ins()
                     .call(starts_with_ref, &[subject, pointer, length]);
+                let matched = self.builder.inst_results(call)[0];
+                Ok(self.builder.ins().band_imm_u(matched, 2))
+            }
+            native_ir::Check::True => Ok(self.builder.ins().iconst(types::I64, 1)),
+            native_ir::Check::BitArraySize { bits, exact } => {
+                let bits = self.builder.ins().iconst(types::I64, *bits as i64);
+                let exact = self.builder.ins().iconst(types::I64, *exact as i64);
+                let test_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.bitarray_size_test, self.builder.func);
+                let call = self.builder.ins().call(test_ref, &[subject, bits, exact]);
+                let matched = self.builder.inst_results(call)[0];
+                Ok(self.builder.ins().band_imm_u(matched, 2))
+            }
+            native_ir::Check::BitArrayBytes { offset, bytes } => {
+                let (pointer, length) = self.constant_bytes(bytes)?;
+                let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                let test_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.bitarray_bytes_test, self.builder.func);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(test_ref, &[subject, offset, pointer, length]);
+                let matched = self.builder.inst_results(call)[0];
+                Ok(self.builder.ins().band_imm_u(matched, 2))
+            }
+            native_ir::Check::BitArrayRestIsBytes { offset } => {
+                let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                let test_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.bitarray_rest_is_bytes, self.builder.func);
+                let call = self.builder.ins().call(test_ref, &[subject, offset]);
                 let matched = self.builder.inst_results(call)[0];
                 Ok(self.builder.ins().band_imm_u(matched, 2))
             }

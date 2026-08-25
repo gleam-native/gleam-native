@@ -86,7 +86,8 @@ platform C convention.
   (`[x, ..rest]`, nested patterns), and string prefixes
   (`"pre" <> rest`, including `as` bindings, in `case` and `let assert`)
   work, including untested final variants of exhaustive matches, whose
-  fields arrive via the fallback. Still missing: bit arrays
+  fields arrive via the fallback. Bit array patterns work within the
+  byte-aligned constant-size subset
 - 🚧 Guards (`if` clauses): operators, negation, variables, tuple indexing,
   and scalar literal constants work (sharing the expression operator
   lowering). Not yet: field access and module constants in guards
@@ -134,9 +135,14 @@ platform C convention.
 - 🚧 Strings: UTF-8 heap objects with literals, concatenation, and equality
   done; ordering comparison and the grapheme operations the stdlib relies on
   still need runtime support
-- ❌ Bit arrays: construction and patterns with size/unit/signedness/
-  endianness options, UTF codepoint segments; the per-target feature gates in
-  `compiler-core/src/bit_array.rs` need `Native` rules
+- 🚧 Bit arrays: byte-aligned, constant-sized segments work — construction
+  (int segments with size/unit and endianness, truncation, utf8 strings,
+  bit array splices) and patterns (literal int/string matches via the
+  compiler's pre-encoded bytes, sized and endian/signed integer reads,
+  `rest:bits` captures, in `case` and `let assert`), plus structural
+  equality and `echo`. Not yet: dynamic sizes (`size(n)`), non-byte-aligned
+  segments, floats, UTF-16/32, codepoints; the per-target gates in
+  `compiler-core/src/bit_array.rs` still treat native like Erlang
 - ✅ Constants (`const x = …`): inlined at use sites like the Erlang
   target, covering scalars, tuples, lists, records, references to other
   constants and to functions, `<>`, and module-qualified constants in

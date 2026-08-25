@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 23;
+pub const FORMAT_VERSION: u32 = 24;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -167,6 +167,9 @@ pub enum Expression {
     /// The empty list, a tagged immediate. Cons cells are two-field records
     /// with tag 1, built with [`Expression::Constructor`].
     EmptyList,
+    /// Bit array construction: segments appended in order onto an empty
+    /// array. Only byte-aligned, constant-sized segments are supported.
+    BitArray(Vec<BitSegment>),
     /// An anonymous function. Lambda-lifted at code generation time: its
     /// free variables become the captures of a heap closure
     /// `[code pointer, captures...]`.
@@ -228,6 +231,23 @@ pub enum BoolOperator {
     Or,
 }
 
+/// One segment of a bit array construction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BitSegment {
+    pub value: Box<Expression>,
+    pub kind: BitSegmentKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BitSegmentKind {
+    /// An integer of `bits` bits (a multiple of 8, at most 64), truncated.
+    Int { bits: u32, little_endian: bool },
+    /// A string's UTF-8 bytes.
+    Utf8String,
+    /// Another bit array spliced in whole.
+    BitArraySplice,
+}
+
 /// A node of a lowered pattern-match decision tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Decision {
@@ -271,6 +291,21 @@ pub enum Bound {
     /// The rest of a string prefix pattern: a fresh string holding the
     /// subject's contents from the given byte offset onwards.
     StringSlice { subject: u32, offset: u32 },
+    /// An integer read out of a bit array segment.
+    BitsReadInt {
+        subject: u32,
+        offset: u64,
+        bits: u32,
+        little_endian: bool,
+        signed: bool,
+    },
+    /// A fresh bit array sliced out of another; `bits` of `None` means
+    /// everything from the offset onwards.
+    BitsSlice {
+        subject: u32,
+        offset: u64,
+        bits: Option<u64>,
+    },
 }
 
 /// A runtime check a decision tree performs against a subject.
@@ -298,6 +333,16 @@ pub enum Check {
     /// sequences already processed). The rest is bound separately via
     /// [`Bound::StringSlice`].
     StringPrefix { prefix: String },
+    /// The subject bit array is exactly (or at least) `bits` bits long.
+    BitArraySize { bits: u64, exact: bool },
+    /// The subject bit array holds exactly these bytes at the given bit
+    /// offset (the compiler pre-encodes literal segment matches).
+    BitArrayBytes { offset: u64, bytes: Vec<u8> },
+    /// The subject bit array's remainder past the offset is a whole number
+    /// of bytes.
+    BitArrayRestIsBytes { offset: u64 },
+    /// A check the type system already guarantees; always succeeds.
+    True,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -470,6 +515,11 @@ fn expression_free(
                 let _ = scope.insert(parameter.clone());
             }
             statements_free(body, &mut scope, free);
+        }
+        Expression::BitArray(segments) => {
+            for segment in segments {
+                expression_free(&segment.value, bound, free);
+            }
         }
         Expression::Echo { value, message, .. } => {
             expression_free(value, bound, free);

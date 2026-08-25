@@ -434,6 +434,18 @@ impl Lowerer<'_> {
                 }
             }
 
+            TypedExpr::BitArray { segments, .. } => {
+                let mut lowered = Vec::with_capacity(segments.len());
+                for segment in segments {
+                    let kind = self.bit_segment_kind(segment)?;
+                    lowered.push(native_ir::BitSegment {
+                        value: Box::new(self.expression(&segment.value)?),
+                        kind,
+                    });
+                }
+                Ok(native_ir::Expression::BitArray(lowered))
+            }
+
             TypedExpr::RecordAccess { record, index, .. } => {
                 Ok(native_ir::Expression::FieldAccess {
                     record: Box::new(self.expression(record)?),
@@ -748,6 +760,124 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Works out how a bit array expression segment is written: its
+    /// compile-time size, type, and endianness. Anything dynamic or not
+    /// byte-aligned is unsupported for now.
+    fn bit_segment_kind(
+        &self,
+        segment: &crate::ast::TypedExprBitArraySegment,
+    ) -> Result<native_ir::BitSegmentKind, Error> {
+        use crate::ast::BitArrayOption;
+        let mut size: Option<u32> = None;
+        let mut unit: u32 = 1;
+        let mut little_endian = false;
+        let mut is_utf8 = false;
+        let mut is_splice = false;
+        for option in &segment.options {
+            match option {
+                BitArrayOption::Int { .. } | BitArrayOption::Big { .. } => {}
+                BitArrayOption::Signed { .. } | BitArrayOption::Unsigned { .. } => {}
+                BitArrayOption::Little { .. } => little_endian = true,
+                BitArrayOption::Utf8 { .. } => is_utf8 = true,
+                BitArrayOption::Bytes { .. } | BitArrayOption::Bits { .. } => is_splice = true,
+                BitArrayOption::Size { value, .. } => match value.as_ref() {
+                    TypedExpr::Int { int_value, .. } => {
+                        size = Some(int_value.to_u32().ok_or_else(|| {
+                            self.unsupported("this bit array segment size")
+                        })?);
+                    }
+                    _ => return Err(self.unsupported("dynamic bit array segment sizes")),
+                },
+                BitArrayOption::Unit { value, .. } => unit = *value as u32,
+                _ => return Err(self.unsupported("this bit array segment")),
+            }
+        }
+        if is_utf8 || segment.type_.is_string() {
+            return Ok(native_ir::BitSegmentKind::Utf8String);
+        }
+        if is_splice || segment.type_.is_bit_array() {
+            return Ok(native_ir::BitSegmentKind::BitArraySplice);
+        }
+        if !segment.type_.is_int() {
+            return Err(self.unsupported("this bit array segment"));
+        }
+        let bits = size.unwrap_or(8) * unit;
+        if bits == 0 || bits % 8 != 0 || bits > 64 {
+            return Err(self.unsupported("bit array segments that are not whole bytes"));
+        }
+        Ok(native_ir::BitSegmentKind::Int {
+            bits,
+            little_endian,
+        })
+    }
+
+    /// A compile-time-constant bit offset or size; dynamic ones are
+    /// unsupported for now.
+    fn constant_bits(&self, offset: &exhaustiveness::Offset) -> Result<u64, Error> {
+        if !offset.variables.is_empty() || !offset.calculations.is_empty() {
+            return Err(self.unsupported("dynamically sized bit array patterns"));
+        }
+        offset
+            .constant
+            .to_u64()
+            .ok_or_else(|| self.unsupported("this bit array pattern"))
+    }
+
+    fn bit_array_test(
+        &self,
+        test: &exhaustiveness::BitArrayTest,
+    ) -> Result<native_ir::Check, Error> {
+        use exhaustiveness::{BitArrayMatchedValue, BitArrayTest, SizeOperator};
+        match test {
+            BitArrayTest::Size(size_test) => Ok(native_ir::Check::BitArraySize {
+                bits: self.constant_bits(&size_test.size)?,
+                exact: size_test.operator == SizeOperator::Equal,
+            }),
+            BitArrayTest::CatchAllIsBytes { size_so_far } => {
+                Ok(native_ir::Check::BitArrayRestIsBytes {
+                    offset: self.constant_bits(size_so_far)?,
+                })
+            }
+            BitArrayTest::Match(match_test) => {
+                let offset = self.constant_bits(&match_test.read_action.from)?;
+                let mut value = &match_test.value;
+                while let BitArrayMatchedValue::Assign { value: inner, .. } = value {
+                    value = inner;
+                }
+                match value {
+                    BitArrayMatchedValue::LiteralInt { bits: Ok(bits), .. }
+                        if bits.len() % 8 == 0 =>
+                    {
+                        Ok(native_ir::Check::BitArrayBytes {
+                            offset,
+                            bytes: bits.clone().into_vec(),
+                        })
+                    }
+                    BitArrayMatchedValue::LiteralString {
+                        encoding: exhaustiveness::StringEncoding::Utf8,
+                        bytes,
+                        ..
+                    } => Ok(native_ir::Check::BitArrayBytes {
+                        offset,
+                        bytes: bytes.clone(),
+                    }),
+                    // Variables and discards always match; the read happens
+                    // at binding time.
+                    BitArrayMatchedValue::Variable(_) | BitArrayMatchedValue::Discard(_) => {
+                        Ok(native_ir::Check::True)
+                    }
+                    _ => Err(self.unsupported("this bit array pattern")),
+                }
+            }
+            BitArrayTest::ReadSizeIsNotNegative { .. } => {
+                Err(self.unsupported("dynamically sized bit array patterns"))
+            }
+            BitArrayTest::SegmentIsFiniteFloat { .. } => {
+                Err(self.unsupported("float bit array patterns"))
+            }
+        }
+    }
+
     fn decision(
         &self,
         decision: &exhaustiveness::Decision,
@@ -881,9 +1011,7 @@ impl Lowerer<'_> {
                     fields: elements.iter().map(|element| element.id as u32).collect(),
                 })
             }
-            exhaustiveness::RuntimeCheck::BitArray { .. } => {
-                Err(self.unsupported("bit array patterns"))
-            }
+            exhaustiveness::RuntimeCheck::BitArray { test } => self.bit_array_test(test),
             exhaustiveness::RuntimeCheck::EmptyList => {
                 Ok(native_ir::Check::Immediate(tag_small_int(0)))
             }
@@ -948,8 +1076,56 @@ impl Lowerer<'_> {
                         crate::strings::convert_string_escape_chars(value).into(),
                     ))
                 }
-                exhaustiveness::BoundValue::BitArraySlice { .. } => {
-                    return Err(self.unsupported("bit array patterns"));
+                exhaustiveness::BoundValue::BitArraySlice {
+                    bit_array,
+                    read_action,
+                } => {
+                    use exhaustiveness::{ReadSize, ReadType};
+                    let subject = bit_array.id as u32;
+                    let offset = self.constant_bits(&read_action.from)?;
+                    match (&read_action.type_, &read_action.size) {
+                        (ReadType::Int, ReadSize::ConstantBits(bits)) => {
+                            let bits = bits
+                                .to_u32()
+                                .filter(|bits| *bits > 0 && bits % 8 == 0 && *bits <= 64)
+                                .ok_or_else(|| {
+                                    self.unsupported(
+                                        "bit array segments that are not whole bytes",
+                                    )
+                                })?;
+                            native_ir::Bound::BitsReadInt {
+                                subject,
+                                offset,
+                                bits,
+                                little_endian: read_action.endianness
+                                    == crate::ast::Endianness::Little,
+                                signed: read_action.signed,
+                            }
+                        }
+                        (ReadType::BitArray, ReadSize::ConstantBits(bits)) => {
+                            let bits = bits.to_u64().filter(|bits| bits % 8 == 0).ok_or_else(
+                                || {
+                                    self.unsupported(
+                                        "bit array segments that are not whole bytes",
+                                    )
+                                },
+                            )?;
+                            native_ir::Bound::BitsSlice {
+                                subject,
+                                offset,
+                                bits: Some(bits),
+                            }
+                        }
+                        (
+                            ReadType::BitArray,
+                            ReadSize::RemainingBits | ReadSize::RemainingBytes,
+                        ) => native_ir::Bound::BitsSlice {
+                            subject,
+                            offset,
+                            bits: None,
+                        },
+                        _ => return Err(self.unsupported("this bit array pattern")),
+                    }
                 }
                 exhaustiveness::BoundValue::StringSlice { subject, prefix } => {
                     let prefix: String =
