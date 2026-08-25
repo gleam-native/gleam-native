@@ -63,7 +63,7 @@ platform C convention.
 - ✅ `<>` string concatenation
 - ✅ `&&`, `||` with short-circuit evaluation (pure codegen: the right
   operand's evaluation sits in a conditionally-executed block)
-- ❌ Pipe operator `|>` (desugared by the compiler; needs function values)
+- ✅ Pipe operator `|>` (lowered from the type checker's step assignments)
 
 ## Bindings and control flow
 
@@ -86,7 +86,8 @@ platform C convention.
 - 🚧 Guards (`if` clauses): operators, negation, variables, tuple indexing,
   and scalar literal constants work (sharing the expression operator
   lowering). Not yet: field access and module constants in guards
-- ❌ `use` expressions (desugared to callbacks; needs closures)
+- ✅ `use` expressions (the type checker's desugared callback call is
+  lowered directly)
 - ❌ `assert` (boolean assertion with structured failure information)
 
 ## Functions
@@ -95,15 +96,16 @@ platform C convention.
 - ✅ Direct calls, including cross-module calls
 - ✅ Guaranteed tail calls between Gleam functions (`tail` calling
   convention, in place from day one)
-- ❌ Anonymous functions and closures (closure conversion pass; closure
-  environment as a heap object)
-- ❌ Function values / references (`let f = some_function`) and calls through
-  values (`call_indirect`)
-- ❌ Function captures (`add(1, _)`)
-- ❌ Labelled arguments (compile-time reordering; mostly free once calls are
-  complete)
-- ❌ Generic functions — handled by the uniform value representation, but
-  needs coverage the moment closures and data structures exist
+- ✅ Anonymous functions and closures: lambda-lifted at code generation
+  time with free-variable analysis for captures; a closure is a heap object
+  `[code pointer, captures...]` and indirect calls use the closure calling
+  convention (closure first, `tail` convention, `call_indirect`)
+- ✅ Function values: module functions and constructors used as values get
+  generated adapter wrappers; calls through values work
+- ✅ Function captures (`add(1, _)`, via the type checker's desugaring)
+- ✅ Labelled arguments (the type checker reorders them)
+- ✅ Generic functions through the uniform value representation (exercised
+  by generic `map`/`fold` over closures and module functions)
 - ❌ Recursion depth: native stacks are finite where the BEAM's are not;
   self- and mutual tail recursion must not grow the stack (covered by tail
   calls), and deep non-tail recursion needs at least a sensible crash
@@ -117,8 +119,8 @@ platform C convention.
   including nested ones like `[_, _]`)
 - ✅ Custom types: heap records (variant tag word + field words),
   constructors (labelled and positional), field access (`wibble.name`),
-  destructuring in `case`; `Result` works as a plain custom type. Not yet:
-  constructors used as function values, and equality (needs polymorphic
+  destructuring in `case`; `Result` works as a plain custom type;
+  constructors as function values. Not yet: equality (needs polymorphic
   deep equality)
 - ✅ Record updates (`Wibble(..old, name: "new")`): the type checker's
   desugaring lowers onto existing constructor and field access nodes,

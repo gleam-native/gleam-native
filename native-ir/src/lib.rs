@@ -8,12 +8,15 @@
 //! artifacts and translates them to Cranelift IR. This crate must stay free
 //! of Cranelift so that `compiler-core` remains compilable to WebAssembly.
 
+use std::collections::BTreeSet;
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 19;
+pub const FORMAT_VERSION: u32 = 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -164,6 +167,26 @@ pub enum Expression {
     /// The empty list, a tagged immediate. Cons cells are two-field records
     /// with tag 1, built with [`Expression::Constructor`].
     EmptyList,
+    /// An anonymous function. Lambda-lifted at code generation time: its
+    /// free variables become the captures of a heap closure
+    /// `[code pointer, captures...]`.
+    Lambda {
+        parameters: Vec<String>,
+        body: Vec<Statement>,
+    },
+    /// A module function (or external) used as a value: becomes a closure
+    /// around a generated wrapper.
+    FunctionReference {
+        module: String,
+        function: String,
+        arity: u32,
+    },
+    /// Calling a function value: load the code pointer out of the closure
+    /// and call it with the closure as the first argument.
+    CallValue {
+        callee: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
     /// A `panic` or `todo` expression: prints an error naming the source
     /// location and aborts the program. The message, when present, is a
     /// string expression evaluated only if the panic is reached.
@@ -316,4 +339,224 @@ Delete the project's `build` directory and rebuild.",
         ));
     }
     Ok(artifact.module)
+}
+
+/// The free variables of a statement sequence, in deterministic order:
+/// variables referenced but not bound within it. Used to compute lambda
+/// captures. Over-approximation is harmless (captured values are immutable);
+/// a missed variable fails loudly at code generation as an unbound variable.
+pub fn free_variables(statements: &[Statement], bound: &HashSet<String>) -> BTreeSet<String> {
+    let mut free = BTreeSet::new();
+    let mut bound = bound.clone();
+    statements_free(statements, &mut bound, &mut free);
+    free
+}
+
+fn statements_free(
+    statements: &[Statement],
+    bound: &mut HashSet<String>,
+    free: &mut BTreeSet<String>,
+) {
+    for statement in statements {
+        match statement {
+            Statement::Let { name, value } => {
+                expression_free(value, bound, free);
+                let _ = bound.insert(name.clone());
+            }
+            Statement::Destructure { subject, tree, on_failure, .. } => {
+                expression_free(subject, bound, free);
+                if let Some(failure) = on_failure
+                    && let Some(message) = &failure.message
+                {
+                    expression_free(message, bound, free);
+                }
+                // Assignment bindings persist for the following statements.
+                decision_free(tree, bound, free, true);
+            }
+            Statement::Expression(expression) => expression_free(expression, bound, free),
+        }
+    }
+}
+
+fn expression_free(
+    expression: &Expression,
+    bound: &mut HashSet<String>,
+    free: &mut BTreeSet<String>,
+) {
+    match expression {
+        Expression::Variable(name) => {
+            if !bound.contains(name) {
+                let _ = free.insert(name.clone());
+            }
+        }
+        Expression::Int(_)
+        | Expression::BigInt(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Nil
+        | Expression::Bool(_)
+        | Expression::EmptyList
+        | Expression::FunctionReference { .. } => {}
+        Expression::Block(statements) => {
+            let mut scope = bound.clone();
+            statements_free(statements, &mut scope, free);
+        }
+        Expression::Call { arguments, .. } | Expression::Constructor { arguments, .. } => {
+            for argument in arguments {
+                expression_free(argument, bound, free);
+            }
+        }
+        Expression::CallValue { callee, arguments } => {
+            expression_free(callee, bound, free);
+            for argument in arguments {
+                expression_free(argument, bound, free);
+            }
+        }
+        Expression::IntBinary { left, right, .. }
+        | Expression::IntCompare { left, right, .. }
+        | Expression::FloatBinary { left, right, .. }
+        | Expression::FloatCompare { left, right, .. }
+        | Expression::Equality { left, right, .. }
+        | Expression::BoolBinary { left, right, .. } => {
+            expression_free(left, bound, free);
+            expression_free(right, bound, free);
+        }
+        Expression::StringConcat(left, right) => {
+            expression_free(left, bound, free);
+            expression_free(right, bound, free);
+        }
+        Expression::BoolNot(inner) => expression_free(inner, bound, free),
+        Expression::FieldAccess { record, .. } => expression_free(record, bound, free),
+        Expression::Case { subjects, tree, .. } => {
+            for subject in subjects {
+                expression_free(subject, bound, free);
+            }
+            decision_free(tree, bound, free, false);
+        }
+        Expression::Lambda { parameters, body } => {
+            let mut scope = bound.clone();
+            for parameter in parameters {
+                let _ = scope.insert(parameter.clone());
+            }
+            statements_free(body, &mut scope, free);
+        }
+        Expression::Panic { message, .. } => {
+            if let Some(message) = message {
+                expression_free(message, bound, free);
+            }
+        }
+    }
+}
+
+fn decision_free(
+    decision: &Decision,
+    bound: &mut HashSet<String>,
+    free: &mut BTreeSet<String>,
+    bindings_persist: bool,
+) {
+    match decision {
+        Decision::Run { bindings, body } => {
+            let mut scope = if bindings_persist {
+                None
+            } else {
+                Some(bound.clone())
+            };
+            let scope = scope.as_mut().unwrap_or(bound);
+            for (name, value) in bindings {
+                if let Bound::Value(expression) = value {
+                    expression_free(expression, scope, free);
+                }
+                let _ = scope.insert(name.clone());
+            }
+            statements_free(body, scope, free);
+        }
+        Decision::Switch {
+            choices, fallback, ..
+        } => {
+            for (_, decision) in choices {
+                decision_free(decision, bound, free, bindings_persist);
+            }
+            decision_free(fallback, bound, free, bindings_persist);
+        }
+        Decision::Guard {
+            bindings,
+            guard,
+            if_true,
+            if_false,
+        } => {
+            let mut scope = bound.clone();
+            for (name, value) in bindings {
+                if let Bound::Value(expression) = value {
+                    expression_free(expression, &mut scope, free);
+                }
+                let _ = scope.insert(name.clone());
+            }
+            expression_free(guard, &mut scope, free);
+            statements_free(if_true, &mut scope, free);
+            decision_free(if_false, bound, free, bindings_persist);
+        }
+        Decision::Fail => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_variable_analysis() {
+        // fn(x) { let y = x + outer case z { n -> n + y } }
+        let body = vec![
+            Statement::Let {
+                name: "y".into(),
+                value: Expression::IntBinary {
+                    operator: IntOperator::Add,
+                    left: Box::new(Expression::Variable("x".into())),
+                    right: Box::new(Expression::Variable("outer".into())),
+                },
+            },
+            Statement::Expression(Expression::Case {
+                subjects: vec![Expression::Variable("z".into())],
+                subject_ids: vec![0],
+                tree: Decision::Switch {
+                    var: 0,
+                    choices: vec![],
+                    fallback: Box::new(Decision::Run {
+                        bindings: vec![("n".into(), Bound::Variable(0))],
+                        body: vec![Statement::Expression(Expression::IntBinary {
+                            operator: IntOperator::Add,
+                            left: Box::new(Expression::Variable("n".into())),
+                            right: Box::new(Expression::Variable("y".into())),
+                        })],
+                    }),
+                    fallback_fields: vec![],
+                },
+            }),
+        ];
+        let bound = HashSet::from(["x".to_string()]);
+        let free: Vec<String> = free_variables(&body, &bound).into_iter().collect();
+        // `x` is a parameter, `y` and `n` are locally bound; `outer` and
+        // `z` are captured.
+        assert_eq!(free, vec!["outer".to_string(), "z".to_string()]);
+    }
+
+    #[test]
+    fn nested_lambdas_compose_scopes() {
+        // fn(a) { fn(b) { a + b + c } }
+        let body = vec![Statement::Expression(Expression::Lambda {
+            parameters: vec!["b".into()],
+            body: vec![Statement::Expression(Expression::IntBinary {
+                operator: IntOperator::Add,
+                left: Box::new(Expression::IntBinary {
+                    operator: IntOperator::Add,
+                    left: Box::new(Expression::Variable("a".into())),
+                    right: Box::new(Expression::Variable("b".into())),
+                }),
+                right: Box::new(Expression::Variable("c".into())),
+            })],
+        })];
+        let bound = HashSet::from(["a".to_string()]);
+        let free: Vec<String> = free_variables(&body, &bound).into_iter().collect();
+        assert_eq!(free, vec!["c".to_string()]);
+    }
 }

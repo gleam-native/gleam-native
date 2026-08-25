@@ -158,7 +158,11 @@ impl Lowerer<'_> {
                 })
             }
 
-            Statement::Use(_) => Err(self.unsupported("use expressions")),
+            // The type checker has already desugared `use` into a call with
+            // a callback function.
+            Statement::Use(use_) => Ok(native_ir::Statement::Expression(
+                self.expression(&use_.call)?,
+            )),
             Statement::Assert(_) => Err(self.unsupported("assert")),
         }
     }
@@ -209,12 +213,39 @@ impl Lowerer<'_> {
                     tag: *variant_index as u32,
                     arguments: vec![],
                 }),
-                ValueConstructorVariant::Record { .. } => {
-                    Err(self.unsupported("constructors as function values"))
+                // A constructor used as a function value: a lambda that
+                // allocates the record.
+                ValueConstructorVariant::Record {
+                    arity,
+                    variant_index,
+                    ..
+                } => {
+                    let parameters: Vec<String> =
+                        (0..*arity).map(|index| format!("$field{index}")).collect();
+                    let arguments = parameters
+                        .iter()
+                        .map(|name| native_ir::Expression::Variable(name.clone()))
+                        .collect();
+                    Ok(native_ir::Expression::Lambda {
+                        parameters,
+                        body: vec![native_ir::Statement::Expression(
+                            native_ir::Expression::Constructor {
+                                tag: *variant_index as u32,
+                                arguments,
+                            },
+                        )],
+                    })
                 }
-                ValueConstructorVariant::ModuleFn { .. } => {
-                    Err(self.unsupported("function values"))
-                }
+                ValueConstructorVariant::ModuleFn {
+                    module,
+                    name,
+                    arity,
+                    ..
+                } => Ok(native_ir::Expression::FunctionReference {
+                    module: module.clone().into(),
+                    function: name.clone().into(),
+                    arity: *arity as u32,
+                }),
                 _ => Err(self.unsupported("this kind of value")),
             },
 
@@ -240,10 +271,58 @@ impl Lowerer<'_> {
                                 arguments,
                             })
                         }
-                        _ => Err(self.unsupported("calling non-function values")),
+                        _ => Ok(native_ir::Expression::CallValue {
+                            callee: Box::new(self.expression(fun)?),
+                            arguments,
+                        }),
                     },
-                    _ => Err(self.unsupported("calling expressions")),
+                    _ => Ok(native_ir::Expression::CallValue {
+                        callee: Box::new(self.expression(fun)?),
+                        arguments,
+                    }),
                 }
+            }
+
+            TypedExpr::Fn {
+                arguments, body, ..
+            } => {
+                let mut parameters = Vec::with_capacity(arguments.len());
+                for (index, argument) in arguments.iter().enumerate() {
+                    let parameter = match argument.get_variable_name() {
+                        Some(name) => name.clone().into(),
+                        None => format!("_discarded${index}"),
+                    };
+                    parameters.push(parameter);
+                }
+                Ok(native_ir::Expression::Lambda {
+                    parameters,
+                    body: self.statements(body.iter())?,
+                })
+            }
+
+            // A pipeline is a series of named steps followed by a final
+            // expression.
+            TypedExpr::Pipeline {
+                first_value,
+                assignments,
+                finally,
+                ..
+            } => {
+                let mut statements = Vec::with_capacity(assignments.len() + 2);
+                statements.push(native_ir::Statement::Let {
+                    name: first_value.name.clone().into(),
+                    value: self.expression(&first_value.value)?,
+                });
+                for (assignment, _kind) in assignments {
+                    statements.push(native_ir::Statement::Let {
+                        name: assignment.name.clone().into(),
+                        value: self.expression(&assignment.value)?,
+                    });
+                }
+                statements.push(native_ir::Statement::Expression(
+                    self.expression(finally)?,
+                ));
+                Ok(native_ir::Expression::Block(statements))
             }
 
             TypedExpr::Tuple { elements, .. } => {
@@ -1463,6 +1542,62 @@ pub fn main() {
         );
         assert_eq!(failure.function, "main");
         assert_eq!(failure.line, 3);
+    }
+
+    #[test]
+    fn closures_and_function_values() {
+        let module = lower(
+            "fn double(x: Int) -> Int {
+  x * 2
+}
+
+pub fn main() {
+  let n = 10
+  let adder = fn(x) { x + n }
+  let doubler = double
+  adder(doubler(1))
+}",
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[1] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Let {
+                name: "adder".into(),
+                value: native_ir::Expression::Lambda {
+                    parameters: vec!["x".into()],
+                    body: vec![native_ir::Statement::Expression(
+                        native_ir::Expression::IntBinary {
+                            operator: native_ir::IntOperator::Add,
+                            left: Box::new(native_ir::Expression::Variable("x".into())),
+                            right: Box::new(native_ir::Expression::Variable("n".into())),
+                        }
+                    )],
+                },
+            }
+        );
+        assert_eq!(
+            body[2],
+            native_ir::Statement::Let {
+                name: "doubler".into(),
+                value: native_ir::Expression::FunctionReference {
+                    module: "test_module".into(),
+                    function: "double".into(),
+                    arity: 1,
+                },
+            }
+        );
+        assert_eq!(
+            body[3],
+            native_ir::Statement::Expression(native_ir::Expression::CallValue {
+                callee: Box::new(native_ir::Expression::Variable("adder".into())),
+                arguments: vec![native_ir::Expression::CallValue {
+                    callee: Box::new(native_ir::Expression::Variable("doubler".into())),
+                    arguments: vec![native_ir::Expression::Int(1)],
+                }],
+            })
+        );
     }
 
     #[test]

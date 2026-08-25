@@ -127,11 +127,32 @@ impl RuntimeFunctions {
     }
 }
 
+/// A function generated during translation whose body is defined after the
+/// function that created it: a lifted lambda or a function-value wrapper.
+enum PendingFunction {
+    Lambda {
+        id: FuncId,
+        module_name: String,
+        parameters: Vec<String>,
+        captures: Vec<String>,
+        body: Vec<native_ir::Statement>,
+    },
+    Wrapper {
+        id: FuncId,
+        target: FuncId,
+        arity: u32,
+    },
+}
+
 pub struct Translator<'a, M: Module> {
     module: &'a mut M,
     /// Gleam (module, function) to declared Cranelift function.
     functions: HashMap<(String, String), FuncId>,
     runtime: RuntimeFunctions,
+    pending: Vec<PendingFunction>,
+    /// One wrapper per module function used as a value.
+    wrappers: HashMap<(String, String), FuncId>,
+    generated_counter: u32,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -141,6 +162,9 @@ impl<'a, M: Module> Translator<'a, M> {
             module,
             functions: HashMap::new(),
             runtime,
+            pending: Vec::new(),
+            wrappers: HashMap::new(),
+            generated_counter: 0,
         })
     }
 
@@ -208,7 +232,117 @@ impl<'a, M: Module> Translator<'a, M> {
                 .function_id(&module.name, name)
                 .expect("declared in first pass");
             self.define_function(id, &module.name, parameters, body)?;
+            self.define_pending()?;
         }
+        Ok(())
+    }
+
+    /// Defines the bodies of functions generated during translation. Their
+    /// bodies may generate further pending functions (nested lambdas).
+    fn define_pending(&mut self) -> Result<(), String> {
+        while let Some(pending) = self.pending.pop() {
+            match pending {
+                PendingFunction::Lambda {
+                    id,
+                    module_name,
+                    parameters,
+                    captures,
+                    body,
+                } => self.define_lambda(id, &module_name, &parameters, &captures, &body)?,
+                PendingFunction::Wrapper { id, target, arity } => {
+                    self.define_wrapper(id, target, arity)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Defines a lifted lambda: parameters arrive after the closure
+    /// argument, and captures load out of the closure.
+    fn define_lambda(
+        &mut self,
+        id: FuncId,
+        module_name: &str,
+        parameters: &[String],
+        captures: &[String],
+        body: &[native_ir::Statement],
+    ) -> Result<(), String> {
+        let mut context = self.module.make_context();
+        context.func.signature = gleam_signature(1 + parameters.len());
+
+        let mut builder_context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let closure = builder.block_params(entry)[0];
+        let mut environment = HashMap::new();
+        for (index, parameter) in parameters.iter().enumerate() {
+            let value = builder.block_params(entry)[1 + index];
+            let variable = builder.declare_var(types::I64);
+            builder.def_var(variable, value);
+            let _ = environment.insert(parameter.clone(), variable);
+        }
+        for (index, capture) in captures.iter().enumerate() {
+            let value = builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                closure,
+                8 + 8 * index as i32,
+            );
+            let variable = builder.declare_var(types::I64);
+            builder.def_var(variable, value);
+            let _ = environment.insert(capture.clone(), variable);
+        }
+
+        let mut function_translator = FunctionTranslator {
+            functions: &self.functions,
+            runtime: self.runtime,
+            module_name,
+            module: self.module,
+            builder: &mut builder,
+            environment,
+            pending: &mut self.pending,
+            wrappers: &mut self.wrappers,
+            generated_counter: &mut self.generated_counter,
+        };
+        let result = function_translator.statements(body)?;
+        builder.ins().return_(&[result]);
+        builder.finalize(self.module.target_config());
+
+        self.module
+            .define_function(id, &mut context)
+            .map_err(|error| error.to_string())?;
+        self.module.clear_context(&mut context);
+        Ok(())
+    }
+
+    /// Defines the wrapper that adapts a directly-callable function to the
+    /// closure calling convention: ignore the closure, forward the rest.
+    fn define_wrapper(&mut self, id: FuncId, target: FuncId, arity: u32) -> Result<(), String> {
+        let mut context = self.module.make_context();
+        context.func.signature = gleam_signature(1 + arity as usize);
+
+        let mut builder_context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let arguments: Vec<Value> = builder.block_params(entry)[1..].to_vec();
+        let target_ref = self.module.declare_func_in_func(target, builder.func);
+        let call = builder.ins().call(target_ref, &arguments);
+        let result = builder.inst_results(call)[0];
+        builder.ins().return_(&[result]);
+        builder.finalize(self.module.target_config());
+
+        self.module
+            .define_function(id, &mut context)
+            .map_err(|error| error.to_string())?;
+        self.module.clear_context(&mut context);
         Ok(())
     }
 
@@ -244,6 +378,9 @@ impl<'a, M: Module> Translator<'a, M> {
             module: self.module,
             builder: &mut builder,
             environment,
+            pending: &mut self.pending,
+            wrappers: &mut self.wrappers,
+            generated_counter: &mut self.generated_counter,
         };
         let result = function_translator.statements(body)?;
         builder.ins().return_(&[result]);
@@ -306,9 +443,47 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
     environment: HashMap<String, Variable>,
+    pending: &'a mut Vec<PendingFunction>,
+    wrappers: &'a mut HashMap<(String, String), FuncId>,
+    generated_counter: &'a mut u32,
 }
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
+    /// Allocates a closure: one word for the code pointer followed by the
+    /// captured values, read out of the current environment.
+    fn make_closure(&mut self, function: FuncId, captures: &[String]) -> Result<Value, String> {
+        let tag = self.builder.ins().iconst(types::I64, 0);
+        let arity = self.builder.ins().iconst(types::I64, captures.len() as i64);
+        let record_new_ref = self
+            .module
+            .declare_func_in_func(self.runtime.record_new, self.builder.func);
+        let call = self.builder.ins().call(record_new_ref, &[tag, arity]);
+        let closure = self.builder.inst_results(call)[0];
+
+        let function_ref = self.module.declare_func_in_func(function, self.builder.func);
+        let pointer_type = self.module.target_config().pointer_type();
+        let address = self.builder.ins().func_addr(pointer_type, function_ref);
+        let _ = self
+            .builder
+            .ins()
+            .store(MemFlagsData::trusted(), address, closure, 0);
+
+        for (index, name) in captures.iter().enumerate() {
+            let variable = self
+                .environment
+                .get(name)
+                .ok_or_else(|| format!("unbound capture `{name}`"))?;
+            let value = self.builder.use_var(*variable);
+            let _ = self.builder.ins().store(
+                MemFlagsData::trusted(),
+                value,
+                closure,
+                8 + 8 * index as i32,
+            );
+        }
+        Ok(closure)
+    }
+
     /// Emits a call to the runtime's report-and-abort function. It never
     /// actually returns; treating it as an ordinary call keeps the block
     /// structure simple, and the code after it is simply never reached.
@@ -558,6 +733,91 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     record,
                     8 + 8 * *index as i32,
                 ))
+            }
+
+            native_ir::Expression::Lambda { parameters, body } => {
+                // Captures: the lambda's free variables that are in scope
+                // here. A missed one fails loudly when the lifted body is
+                // defined; extras would be harmless.
+                let bound: std::collections::HashSet<String> =
+                    parameters.iter().cloned().collect();
+                let captures: Vec<String> = native_ir::free_variables(body, &bound)
+                    .into_iter()
+                    .filter(|name| self.environment.contains_key(name))
+                    .collect();
+
+                *self.generated_counter += 1;
+                let symbol = format!("gleam$lambda${}", self.generated_counter);
+                let id = self
+                    .module
+                    .declare_function(
+                        &symbol,
+                        Linkage::Export,
+                        &gleam_signature(1 + parameters.len()),
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.pending.push(PendingFunction::Lambda {
+                    id,
+                    module_name: self.module_name.to_string(),
+                    parameters: parameters.clone(),
+                    captures: captures.clone(),
+                    body: body.clone(),
+                });
+                self.make_closure(id, &captures)
+            }
+
+            native_ir::Expression::FunctionReference {
+                module,
+                function,
+                arity,
+            } => {
+                let target = self
+                    .functions
+                    .get(&(module.clone(), function.clone()))
+                    .copied()
+                    .ok_or_else(|| format!("unknown function `{module}.{function}`"))?;
+                let key = (module.clone(), function.clone());
+                let id = match self.wrappers.get(&key) {
+                    Some(id) => *id,
+                    None => {
+                        *self.generated_counter += 1;
+                        let symbol = format!("gleam$wrapper${}", self.generated_counter);
+                        let id = self
+                            .module
+                            .declare_function(
+                                &symbol,
+                                Linkage::Export,
+                                &gleam_signature(1 + *arity as usize),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        self.pending.push(PendingFunction::Wrapper {
+                            id,
+                            target,
+                            arity: *arity,
+                        });
+                        let _ = self.wrappers.insert(key, id);
+                        id
+                    }
+                };
+                self.make_closure(id, &[])
+            }
+
+            native_ir::Expression::CallValue { callee, arguments } => {
+                let callee = self.expression(callee)?;
+                let mut values = Vec::with_capacity(1 + arguments.len());
+                values.push(callee);
+                for argument in arguments {
+                    values.push(self.expression(argument)?);
+                }
+                let code = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), callee, 0);
+                let signature = self
+                    .builder
+                    .import_signature(gleam_signature(values.len()));
+                let call = self.builder.ins().call_indirect(signature, code, &values);
+                Ok(self.builder.inst_results(call)[0])
             }
 
             native_ir::Expression::Panic {
