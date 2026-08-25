@@ -1609,7 +1609,56 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::String(string) => {
-                self.construct_from_constant_bytes(string.as_bytes(), self.runtime.string_from_bytes)
+                // A literal builds its heap string once: a writable data
+                // slot per site caches the value, holding one permanent
+                // reference, and every evaluation takes its own. Loops
+                // re-running a literal stop allocating for it.
+                let slot = self
+                    .module
+                    .declare_anonymous_data(true, false)
+                    .map_err(|error| error.to_string())?;
+                let mut description = DataDescription::new();
+                description.define_zeroinit(8);
+                description.set_align(8);
+                self.module
+                    .define_data(slot, &description)
+                    .map_err(|error| error.to_string())?;
+                let slot_ref = self.module.declare_data_in_func(slot, self.builder.func);
+                let pointer_type = self.module.target_config().pointer_type();
+                let slot_address = self.builder.ins().symbol_value(pointer_type, slot_ref);
+                let cached = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    slot_address,
+                    0,
+                );
+
+                let build = self.builder.create_block();
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+                self.builder
+                    .ins()
+                    .brif(cached, join, &[cached.into()], build, &[]);
+                self.builder.seal_block(build);
+                self.builder.set_cold_block(build);
+
+                self.builder.switch_to_block(build);
+                let built = self.construct_from_constant_bytes(
+                    string.as_bytes(),
+                    self.runtime.string_from_bytes,
+                )?;
+                let _ = self.builder.ins().store(
+                    MemFlagsData::trusted(),
+                    built,
+                    slot_address,
+                    0,
+                );
+                self.builder.ins().jump(join, &[built.into()]);
+                self.builder.seal_block(join);
+
+                self.builder.switch_to_block(join);
+                let value = self.builder.block_params(join)[0];
+                Ok(self.inc(value))
             }
 
             native_ir::Expression::Float(value) => {

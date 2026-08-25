@@ -448,7 +448,7 @@ pub extern "C" fn gleam_native_string_pop_char(string: u64) -> u64 {
 pub extern "C" fn gleam_native_string_char_slice(string: u64, from: u64, length: u64) -> u64 {
     let from = ((from as i64) >> 1).max(0) as usize;
     let length = ((length as i64) >> 1).max(0) as usize;
-    box_string(str_value(string).chars().skip(from).take(length).collect())
+    box_string(str_value(string).chars().skip(from).take(length).collect::<String>())
 }
 
 // ---------------------------------------------------------------------------

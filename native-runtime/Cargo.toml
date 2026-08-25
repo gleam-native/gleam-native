@@ -12,6 +12,9 @@ license = "Apache-2.0"
 # The single-threaded variant: dict structural sharing never crosses
 # threads, so plain Rc reference counts beat im's atomic ones.
 im-rc = "15"
+# Inline storage for short strings: most Gleam strings fit the 24 inline
+# bytes, skipping the separate buffer allocation entirely.
+compact_str = "0.9"
 libc = "0.2.189"
 num-bigint.workspace = true
 num-traits.workspace = true

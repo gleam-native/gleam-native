@@ -35,6 +35,7 @@
 
 use std::cell::Cell;
 
+use compact_str::CompactString;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use unicode_segmentation::UnicodeSegmentation;
@@ -140,12 +141,25 @@ pub fn tag_small_int(value: i64) -> u64 {
 }
 
 fn box_heap<T>(kind: u64, value: T) -> u64 {
-    let base = Box::into_raw(Box::new(HeapBox {
-        reference_count: 1,
-        header: kind,
-        value,
-    }));
-    base as u64 + 8
+    // Through the pooled allocator: the fixed-size shell recycles like any
+    // record, only the payload's own buffers (if any) touch the system
+    // allocator. All payload types are word-aligned.
+    let words = std::mem::size_of::<HeapBox<T>>() / 8 - 1;
+    let boxed = allocate_words(words);
+    unsafe {
+        *(boxed as *mut u64) = kind;
+        std::ptr::write((boxed + 8) as *mut T, value);
+    }
+    boxed
+}
+
+/// Frees a [`box_heap`] allocation: drops the payload in place and
+/// returns the shell to the pool.
+fn free_payload<T>(value: u64) {
+    unsafe {
+        std::ptr::drop_in_place(&raw mut (*container::<T>(value)).value);
+    }
+    free_words((value - 8) as *mut u64, std::mem::size_of::<HeapBox<T>>() / 8);
 }
 
 fn container<T>(value: u64) -> *mut HeapBox<T> {
@@ -168,8 +182,8 @@ pub fn box_float(value: f64) -> u64 {
     boxed
 }
 
-pub fn box_string(value: String) -> u64 {
-    box_heap(KIND_STRING, value)
+pub fn box_string(value: impl Into<CompactString>) -> u64 {
+    box_heap(KIND_STRING, value.into())
 }
 
 pub fn heap_header(value: u64) -> u64 {
@@ -184,8 +198,8 @@ pub fn float_value(value: u64) -> f64 {
     unsafe { (*container::<f64>(value)).value }
 }
 
-pub fn string_value(value: u64) -> &'static String {
-    unsafe { &(*container::<String>(value)).value }
+pub fn string_value(value: u64) -> &'static CompactString {
+    unsafe { &(*container::<CompactString>(value)).value }
 }
 
 /// A bit array's payload: a bit count and MSB-first packed bytes, the
@@ -525,7 +539,7 @@ pub extern "C" fn gleam_native_float_from_bits(bits: u64) -> u64 {
 pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length: u64) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
     let string = unsafe { std::str::from_utf8_unchecked(bytes) };
-    box_string(string.to_string())
+    box_string(string)
 }
 
 /// Concatenates two strings into a new string, the implementation of the
@@ -539,7 +553,7 @@ pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length
 pub unsafe extern "C" fn gleam_native_string_concat(left: u64, right: u64) -> u64 {
     let left = string_value(left);
     let right = string_value(right);
-    let mut result = String::with_capacity(left.len() + right.len());
+    let mut result = CompactString::with_capacity(left.len() + right.len());
     result.push_str(left);
     result.push_str(right);
     box_string(result)
@@ -592,7 +606,7 @@ pub unsafe extern "C" fn gleam_native_string_starts_with(
 /// a valid character boundary within it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u64) -> u64 {
-    box_string(string_value(subject)[offset as usize..].to_string())
+    box_string(&string_value(subject)[offset as usize..])
 }
 
 /// Builds a two-element tuple (a record with tag 0).
@@ -693,7 +707,7 @@ pub unsafe extern "C" fn gleam_native_string_lowercase(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_reverse(string: u64) -> u64 {
-    box_string(string_value(string).graphemes(true).rev().collect())
+    box_string(string_value(string).graphemes(true).rev().collect::<CompactString>())
 }
 
 /// # Safety
@@ -701,7 +715,7 @@ pub unsafe extern "C" fn gleam_native_string_reverse(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_contains(string: u64, needle: u64) -> u64 {
-    if string_value(string).contains(string_value(needle)) {
+    if string_value(string).contains(string_value(needle).as_str()) {
         TRUE
     } else {
         FALSE
@@ -713,7 +727,7 @@ pub unsafe extern "C" fn gleam_native_string_contains(string: u64, needle: u64) 
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64) -> u64 {
-    if string_value(string).ends_with(string_value(suffix)) {
+    if string_value(string).ends_with(string_value(suffix).as_str()) {
         TRUE
     } else {
         FALSE
@@ -725,11 +739,7 @@ pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64)
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim(string: u64) -> u64 {
-    box_string(
-        string_value(string)
-            .trim_matches(TRIMMED_WHITESPACE)
-            .to_string(),
-    )
+    box_string(string_value(string).trim_matches(TRIMMED_WHITESPACE))
 }
 
 /// The whitespace characters `string.trim` removes on every target: ASCII
@@ -744,11 +754,7 @@ const TRIMMED_WHITESPACE: &[char] = &[
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
-    box_string(
-        string_value(string)
-            .trim_start_matches(TRIMMED_WHITESPACE)
-            .to_string(),
-    )
+    box_string(string_value(string).trim_start_matches(TRIMMED_WHITESPACE))
 }
 
 /// # Safety
@@ -756,11 +762,7 @@ pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_end(string: u64) -> u64 {
-    box_string(
-        string_value(string)
-            .trim_end_matches(TRIMMED_WHITESPACE)
-            .to_string(),
-    )
+    box_string(string_value(string).trim_end_matches(TRIMMED_WHITESPACE))
 }
 
 /// The `length` grapheme clusters starting at grapheme index `start`
@@ -778,7 +780,7 @@ pub unsafe extern "C" fn gleam_native_string_slice(string: u64, start: u64, leng
             .graphemes(true)
             .skip(start)
             .take(length)
-            .collect(),
+            .collect::<CompactString>(),
     )
 }
 
@@ -791,7 +793,7 @@ pub unsafe extern "C" fn gleam_native_string_replace(
     pattern: u64,
     replacement: u64,
 ) -> u64 {
-    box_string(string_value(string).replace(string_value(pattern), string_value(replacement)))
+    box_string(string_value(string).replace(string_value(pattern).as_str(), string_value(replacement)))
 }
 
 /// Splits on a separator, returning a list of strings. An empty separator
@@ -805,12 +807,12 @@ pub unsafe extern "C" fn gleam_native_string_split(string: u64, on: u64) -> u64 
     let string = string_value(string);
     let on = string_value(on);
     if on.is_empty() {
-        return make_list(vec![box_string(string.clone())]);
+        return make_list(vec![box_string(string.as_str())]);
     }
     make_list(
         string
             .split(on.as_str())
-            .map(|part| box_string(part.to_string()))
+            .map(box_string)
             .collect(),
     )
 }
@@ -827,10 +829,9 @@ pub unsafe extern "C" fn gleam_native_string_pop_grapheme(string: u64) -> u64 {
     match string.grapheme_indices(true).next() {
         None => make_error(NIL),
         Some((_, head)) => {
-            let rest = string[head.len()..].to_string();
             make_ok(make_tuple2(
-                box_string(head.to_string()),
-                box_string(rest),
+                box_string(head),
+                box_string(&string[head.len()..]),
             ))
         }
     }
@@ -846,7 +847,7 @@ pub unsafe extern "C" fn gleam_native_string_graphemes(string: u64) -> u64 {
     make_list(
         string_value(string)
             .graphemes(true)
-            .map(|grapheme| box_string(grapheme.to_string()))
+            .map(box_string)
             .collect(),
     )
 }
@@ -1619,6 +1620,17 @@ thread_local! {
 /// does not recurse.
 #[cold]
 fn destroy(first: u64) {
+    // Only a record or closure with fields holds references the worklist
+    // must walk; everything else — strings and other leaf payloads, dicts
+    // (whose entries release through their `Drop`), and field-less records
+    // — frees directly. The empty vector never allocates: nothing is
+    // pushed onto it.
+    let header = heap_header(first);
+    let kind = header_kind(header);
+    if (kind != KIND_RECORD && kind != KIND_CLOSURE) || record_arity(header) == 0 {
+        free_object(first, &mut Vec::new());
+        return;
+    }
     let mut worklist = WORKLIST.take();
     free_object(first, &mut worklist);
     while let Some(value) = worklist.pop() {
@@ -1658,19 +1670,17 @@ fn free_object(value: u64, worklist: &mut Vec<u64>) {
             }
             free_words(count, 3 + captures as usize);
         }
-        KIND_BIGINT => drop(unsafe { Box::from_raw(container::<BigInt>(value)) }),
+        KIND_BIGINT => free_payload::<BigInt>(value),
         // A float box is count, header, and payload: the three-word class.
         KIND_FLOAT => free_words(count, 3),
-        KIND_STRING => drop(unsafe { Box::from_raw(container::<String>(value)) }),
-        KIND_BITARRAY => {
-            drop(unsafe { Box::from_raw(container::<BitArrayPayload>(value)) })
-        }
+        KIND_STRING => free_payload::<CompactString>(value),
+        KIND_BITARRAY => free_payload::<BitArrayPayload>(value),
         KIND_DICT => {
             // Dropping the persistent map releases exactly the tree
             // nodes no other dict shares; their keys and entries
             // release their references through [`DictKey`] and
             // [`DictEntry`]'s `Drop` implementations.
-            drop(unsafe { Box::from_raw(container::<DictPayload>(value)) });
+            free_payload::<DictPayload>(value);
         }
         _ => {}
     }
