@@ -33,6 +33,7 @@
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const NIL: u64 = 1;
 
@@ -520,6 +521,270 @@ pub unsafe extern "C" fn gleam_native_string_starts_with(
 /// a valid character boundary within it.
 pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u64) -> u64 {
     box_string(string_value(subject)[offset as usize..].to_string())
+}
+
+/// Builds a two-element tuple (a record with tag 0).
+fn make_tuple2(first: u64, second: u64) -> u64 {
+    let record = gleam_native_record_new(0, 2);
+    unsafe {
+        *((record as *mut u64).add(1)) = first;
+        *((record as *mut u64).add(2)) = second;
+    }
+    record
+}
+
+/// Builds an `Ok` value (variant 0 of `Result`).
+fn make_ok(value: u64) -> u64 {
+    let record = gleam_native_record_new(0, 1);
+    unsafe { *((record as *mut u64).add(1)) = value };
+    record
+}
+
+/// Builds an `Error` value (variant 1 of `Result`).
+fn make_error(value: u64) -> u64 {
+    let record = gleam_native_record_new(1, 1);
+    unsafe { *((record as *mut u64).add(1)) = value };
+    record
+}
+
+/// Builds a list (cons cells with tag 1) from already-owned values.
+fn make_list(values: Vec<u64>) -> u64 {
+    let mut list = NIL;
+    for value in values.into_iter().rev() {
+        let cell = gleam_native_record_new(1, 2);
+        unsafe {
+            *((cell as *mut u64).add(1)) = value;
+            *((cell as *mut u64).add(2)) = list;
+        }
+        list = cell;
+    }
+    list
+}
+
+/// The string's size in bytes.
+///
+/// # Safety
+///
+/// The argument must be a string created by this runtime; the Gleam type
+/// system upholds this, as for every string function below.
+pub unsafe extern "C" fn gleam_native_string_byte_size(string: u64) -> u64 {
+    tag_small_int(string_value(string).len() as i64)
+}
+
+/// The string's length in grapheme clusters.
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_length(string: u64) -> u64 {
+    tag_small_int(string_value(string).graphemes(true).count() as i64)
+}
+
+/// Three-way string comparison as a tagged -1/0/1. Bytewise UTF-8
+/// comparison is Unicode code point order, matching Erlang's binary
+/// comparison exactly.
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_compare(left: u64, right: u64) -> u64 {
+    tag_small_int(match string_value(left).cmp(string_value(right)) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_uppercase(string: u64) -> u64 {
+    box_string(string_value(string).to_uppercase())
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_lowercase(string: u64) -> u64 {
+    box_string(string_value(string).to_lowercase())
+}
+
+/// The string with its grapheme clusters in reverse order.
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_reverse(string: u64) -> u64 {
+    box_string(string_value(string).graphemes(true).rev().collect())
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_contains(string: u64, needle: u64) -> u64 {
+    if string_value(string).contains(string_value(needle)) {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64) -> u64 {
+    if string_value(string).ends_with(string_value(suffix)) {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_trim(string: u64) -> u64 {
+    box_string(string_value(string).trim().to_string())
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
+    box_string(string_value(string).trim_start().to_string())
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_trim_end(string: u64) -> u64 {
+    box_string(string_value(string).trim_end().to_string())
+}
+
+/// The `length` grapheme clusters starting at grapheme index `start`
+/// (both tagged, clamped to the string).
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_slice(string: u64, start: u64, length: u64) -> u64 {
+    let start = ((start as i64) >> 1).max(0) as usize;
+    let length = ((length as i64) >> 1).max(0) as usize;
+    box_string(
+        string_value(string)
+            .graphemes(true)
+            .skip(start)
+            .take(length)
+            .collect(),
+    )
+}
+
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_replace(
+    string: u64,
+    pattern: u64,
+    replacement: u64,
+) -> u64 {
+    box_string(string_value(string).replace(string_value(pattern), string_value(replacement)))
+}
+
+/// Splits on a separator, returning a list of strings. An empty separator
+/// yields the whole string as a single element, like the other targets.
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_split(string: u64, on: u64) -> u64 {
+    let string = string_value(string);
+    let on = string_value(on);
+    if on.is_empty() {
+        return make_list(vec![box_string(string.clone())]);
+    }
+    make_list(
+        string
+            .split(on.as_str())
+            .map(|part| box_string(part.to_string()))
+            .collect(),
+    )
+}
+
+/// The first grapheme cluster and the rest: `Ok(#(head, rest))`, or
+/// `Error(Nil)` for the empty string.
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_pop_grapheme(string: u64) -> u64 {
+    let string = string_value(string);
+    match string.grapheme_indices(true).next() {
+        None => make_error(NIL),
+        Some((_, head)) => {
+            let rest = string[head.len()..].to_string();
+            make_ok(make_tuple2(
+                box_string(head.to_string()),
+                box_string(rest),
+            ))
+        }
+    }
+}
+
+/// The string's grapheme clusters as a list of strings.
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_graphemes(string: u64) -> u64 {
+    make_list(
+        string_value(string)
+            .graphemes(true)
+            .map(|grapheme| box_string(grapheme.to_string()))
+            .collect(),
+    )
+}
+
+/// The string's Unicode code points as a list of tagged integers.
+///
+/// # Safety
+///
+/// See [`gleam_native_string_byte_size`].
+pub unsafe extern "C" fn gleam_native_string_to_codepoints(string: u64) -> u64 {
+    make_list(
+        string_value(string)
+            .chars()
+            .map(|character| tag_small_int(character as i64))
+            .collect(),
+    )
+}
+
+/// A string from a list of code point scalars, skipping invalid ones (the
+/// standard library validates scalars before building code point values).
+pub extern "C" fn gleam_native_string_from_codepoints(list: u64) -> u64 {
+    let mut result = String::new();
+    let mut current = list;
+    while current & 1 == 0 {
+        let scalar = ((record_field(current, 0) as i64) >> 1) as u32;
+        if let Some(character) = char::from_u32(scalar) {
+            result.push(character);
+        }
+        current = record_field(current, 1);
+    }
+    box_string(result)
+}
+
+/// An integer rendered in decimal.
+pub extern "C" fn gleam_native_int_to_string(value: u64) -> u64 {
+    box_string(untag(value).to_string())
+}
+
+/// A float rendered the way Gleam writes floats.
+///
+/// # Safety
+///
+/// The argument must be a float created by this runtime.
+pub unsafe extern "C" fn gleam_native_float_to_string(value: u64) -> u64 {
+    box_string(format!("{:?}", float_value(value)))
 }
 
 /// A new empty bit array, the start of a construction chain.
@@ -1127,6 +1392,86 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_string_slice_from as *const u8,
         ),
         (
+            "gleam_native_string_byte_size",
+            gleam_native_string_byte_size as *const u8,
+        ),
+        (
+            "gleam_native_string_length",
+            gleam_native_string_length as *const u8,
+        ),
+        (
+            "gleam_native_string_compare",
+            gleam_native_string_compare as *const u8,
+        ),
+        (
+            "gleam_native_string_uppercase",
+            gleam_native_string_uppercase as *const u8,
+        ),
+        (
+            "gleam_native_string_lowercase",
+            gleam_native_string_lowercase as *const u8,
+        ),
+        (
+            "gleam_native_string_reverse",
+            gleam_native_string_reverse as *const u8,
+        ),
+        (
+            "gleam_native_string_contains",
+            gleam_native_string_contains as *const u8,
+        ),
+        (
+            "gleam_native_string_ends_with",
+            gleam_native_string_ends_with as *const u8,
+        ),
+        (
+            "gleam_native_string_trim",
+            gleam_native_string_trim as *const u8,
+        ),
+        (
+            "gleam_native_string_trim_start",
+            gleam_native_string_trim_start as *const u8,
+        ),
+        (
+            "gleam_native_string_trim_end",
+            gleam_native_string_trim_end as *const u8,
+        ),
+        (
+            "gleam_native_string_slice",
+            gleam_native_string_slice as *const u8,
+        ),
+        (
+            "gleam_native_string_replace",
+            gleam_native_string_replace as *const u8,
+        ),
+        (
+            "gleam_native_string_split",
+            gleam_native_string_split as *const u8,
+        ),
+        (
+            "gleam_native_string_pop_grapheme",
+            gleam_native_string_pop_grapheme as *const u8,
+        ),
+        (
+            "gleam_native_string_graphemes",
+            gleam_native_string_graphemes as *const u8,
+        ),
+        (
+            "gleam_native_string_to_codepoints",
+            gleam_native_string_to_codepoints as *const u8,
+        ),
+        (
+            "gleam_native_string_from_codepoints",
+            gleam_native_string_from_codepoints as *const u8,
+        ),
+        (
+            "gleam_native_int_to_string",
+            gleam_native_int_to_string as *const u8,
+        ),
+        (
+            "gleam_native_float_to_string",
+            gleam_native_float_to_string as *const u8,
+        ),
+        (
             "gleam_native_bitarray_empty",
             gleam_native_bitarray_empty as *const u8,
         ),
@@ -1481,6 +1826,100 @@ mod tests {
         assert_eq!(gleam_native_eq(array, again), TRUE);
         assert_eq!(gleam_native_eq(array, rest), FALSE);
         assert_eq!(inspect(sized), "<<1, 1>>");
+    }
+
+    #[test]
+    fn string_operations() {
+        let s = |content: &str| make_string(content);
+        unsafe {
+            // Grapheme-aware length: the family emoji is one grapheme made
+            // of several code points.
+            assert_eq!(gleam_native_string_length(s("héllo")), tag_small_int(5));
+            assert_eq!(
+                gleam_native_string_length(s("\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F466}")),
+                tag_small_int(1)
+            );
+            assert_eq!(gleam_native_string_byte_size(s("héllo")), tag_small_int(6));
+            assert_eq!(string_value(gleam_native_string_reverse(s("noé"))), "éon");
+
+            // Bytewise comparison is code point order.
+            assert_eq!(
+                gleam_native_string_compare(s("apple"), s("banana")),
+                tag_small_int(-1)
+            );
+            assert_eq!(
+                gleam_native_string_compare(s("a"), s("a")),
+                tag_small_int(0)
+            );
+            assert_eq!(
+                gleam_native_string_compare(s("é"), s("z")),
+                tag_small_int(1)
+            );
+
+            assert_eq!(
+                string_value(gleam_native_string_uppercase(s("héllo"))),
+                "HÉLLO"
+            );
+            assert_eq!(
+                string_value(gleam_native_string_lowercase(s("HÉLLO"))),
+                "héllo"
+            );
+            assert_eq!(gleam_native_string_contains(s("hello"), s("ell")), TRUE);
+            assert_eq!(gleam_native_string_ends_with(s("hello"), s("llo")), TRUE);
+            assert_eq!(string_value(gleam_native_string_trim(s("  hi  "))), "hi");
+            assert_eq!(
+                string_value(gleam_native_string_trim_start(s("  hi  "))),
+                "hi  "
+            );
+            assert_eq!(
+                string_value(gleam_native_string_slice(
+                    s("héllo"),
+                    tag_small_int(1),
+                    tag_small_int(3)
+                )),
+                "éll"
+            );
+            assert_eq!(
+                string_value(gleam_native_string_replace(s("a-b-c"), s("-"), s("+"))),
+                "a+b+c"
+            );
+
+            // Splitting builds a proper list.
+            let parts = gleam_native_string_split(s("a,b,c"), s(","));
+            assert_eq!(string_value(record_field(parts, 0)), "a");
+            let rest = record_field(parts, 1);
+            assert_eq!(string_value(record_field(rest, 0)), "b");
+
+            // pop_grapheme returns Ok(#(head, rest)) and Error(Nil).
+            let popped = gleam_native_string_pop_grapheme(s("héllo"));
+            assert_eq!(record_tag(heap_header(popped)), 0);
+            let pair = record_field(popped, 0);
+            assert_eq!(string_value(record_field(pair, 0)), "h");
+            assert_eq!(string_value(record_field(pair, 1)), "éllo");
+            let empty = gleam_native_string_pop_grapheme(s(""));
+            assert_eq!(record_tag(heap_header(empty)), 1);
+
+            // Code points round-trip.
+            let codepoints = gleam_native_string_to_codepoints(s("hé"));
+            assert_eq!(record_field(codepoints, 0), tag_small_int(104));
+            assert_eq!(
+                string_value(gleam_native_string_from_codepoints(codepoints)),
+                "hé"
+            );
+
+            // Number rendering.
+            let big = gleam_native_int_add_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(1));
+            assert_eq!(
+                string_value(gleam_native_int_to_string(big)),
+                "4611686018427387904"
+            );
+            assert_eq!(
+                string_value(gleam_native_float_to_string(gleam_native_float_from_bits(
+                    2.5f64.to_bits()
+                ))),
+                "2.5"
+            );
+        }
     }
 
     #[test]

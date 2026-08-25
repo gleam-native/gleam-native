@@ -129,9 +129,15 @@ platform C convention.
 - ✅ Record updates (`Wibble(..old, name: "new")`): the type checker's
   desugaring lowers onto existing constructor and field access nodes,
   including non-variable spread expressions
-- 🚧 Strings: UTF-8 heap objects with literals, concatenation, and equality
-  done; ordering comparison and the grapheme operations the stdlib relies on
-  still need runtime support
+- ✅ Strings: UTF-8 heap objects with literals, concatenation, equality,
+  and prefix patterns; plus the runtime external suite a standard library
+  port binds to — grapheme-aware length/reverse/slice/pop_grapheme/
+  graphemes (via unicode-segmentation), three-way comparison (bytewise
+  UTF-8, which is code point order — exactly Erlang's binary comparison),
+  case mapping, contains/ends_with, trim family, replace, split, code point
+  conversions both ways, and int/float rendering. Runtime-built `Result`,
+  tuple, and list values follow the standard layouts and destructure in
+  ordinary Gleam patterns
 - ✅ Bit arrays: bit-granular storage with Erlang semantics — construction
   and patterns support arbitrary (unaligned) constant and dynamic sizes,
   big/little/native endianness, signedness, truncation, wide segments via

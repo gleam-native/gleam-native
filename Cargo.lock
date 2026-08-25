@@ -2437,6 +2437,7 @@ version = "1.0.0"
 dependencies = [
  "num-bigint 0.5.1",
  "num-traits",
+ "unicode-segmentation",
 ]
 
 [[package]]
