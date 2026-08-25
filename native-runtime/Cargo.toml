@@ -9,7 +9,9 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-im.workspace = true
+# The single-threaded variant: dict structural sharing never crosses
+# threads, so plain Rc reference counts beat im's atomic ones.
+im-rc = "15"
 libc = "0.2.189"
 num-bigint.workspace = true
 num-traits.workspace = true

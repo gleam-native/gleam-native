@@ -9,7 +9,6 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-im.workspace = true
 native-runtime = { path = "../native-runtime" }
 num-bigint.workspace = true
 num-traits.workspace = true

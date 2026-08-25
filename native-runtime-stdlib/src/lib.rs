@@ -756,7 +756,7 @@ pub extern "C" fn gleam_native_bitarray_to_int_and_size(array: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_new() -> u64 {
     box_dict(DictPayload {
-        map: im::OrdMap::new(),
+        map: native_runtime::DictMap::default(),
     })
 }
 

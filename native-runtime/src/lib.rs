@@ -1685,18 +1685,28 @@ fn free_object(value: u64, worklist: &mut Vec<u64>) {
 // `native-runtime-stdlib` crate provides the standard library's entry
 // points over them.
 
-/// The ordered map a dict (kind [`KIND_DICT`]) holds: a persistent B-tree
-/// whose clones share structure, so an immutable insert path-copies
-/// O(log n) nodes instead of copying the map. Keys and values own a
-/// reference each, managed by their wrappers' `Clone` and `Drop`: when a
-/// path copy clones a shared node its entries take new references, and
-/// when the last map holding a node drops it its entries release theirs.
+/// The hasher dict maps use: SipHash with fixed keys, so hashes — and
+/// with them the map's unspecified iteration order — are deterministic
+/// within a build.
+pub type DictHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+
+/// The map a dict holds: a persistent hash-array-mapped trie whose clones
+/// share structure, so an immutable insert path-copies O(log n) nodes
+/// instead of copying the map.
+pub type DictMap = im_rc::HashMap<DictKey, DictEntry, DictHasher>;
+
+/// The payload of a dict (kind [`KIND_DICT`]). Gleam dicts are unordered,
+/// so keys hash structurally (consistent with [`deep_eq`]) rather than
+/// sorting by [`cmp_values`]. Keys and values own a reference each,
+/// managed by their wrappers' `Clone` and `Drop`: when a path copy clones
+/// a shared node its entries take new references, and when the last map
+/// holding a node drops it its entries release theirs.
 pub struct DictPayload {
-    pub map: im::OrdMap<DictKey, DictEntry>,
+    pub map: DictMap,
 }
 
-/// A dict key: an owned reference to a Gleam value, ordered by
-/// [`cmp_values`].
+/// A dict key: an owned reference to a Gleam value, hashed and compared
+/// structurally.
 #[repr(transparent)]
 pub struct DictKey(pub u64);
 
@@ -1712,21 +1722,15 @@ impl Drop for DictKey {
     }
 }
 
-impl Ord for DictKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        cmp_values(self.0, other.0)
-    }
-}
-
-impl PartialOrd for DictKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+impl std::hash::Hash for DictKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        hash_value(self.0, state);
     }
 }
 
 impl PartialEq for DictKey {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
+        deep_eq(self.0, other.0)
     }
 }
 
@@ -1749,8 +1753,9 @@ impl Drop for DictEntry {
     }
 }
 
-/// A borrowed lookup key: ordered like [`DictKey`] but holding no
-/// reference, so probing a map does not touch reference counts.
+/// A borrowed lookup key: hashed and compared like [`DictKey`] but
+/// holding no reference, so probing a map does not touch reference
+/// counts.
 #[repr(transparent)]
 pub struct DictKeyRef(pub u64);
 
@@ -1761,25 +1766,67 @@ impl std::borrow::Borrow<DictKeyRef> for DictKey {
     }
 }
 
-impl Ord for DictKeyRef {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        cmp_values(self.0, other.0)
-    }
-}
-
-impl PartialOrd for DictKeyRef {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+impl std::hash::Hash for DictKeyRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        hash_value(self.0, state);
     }
 }
 
 impl PartialEq for DictKeyRef {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
+        deep_eq(self.0, other.0)
     }
 }
 
 impl Eq for DictKeyRef {}
+
+/// A structural hash consistent with [`deep_eq`]: equal values hash
+/// equally. Values of different kinds are never equal, so their hashes
+/// may collide freely. Negative zero hashes as zero (they compare equal);
+/// dict entries combine order-independently, since equal dicts may
+/// iterate differently.
+fn hash_value(value: u64, state: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    if value & 1 == 1 {
+        ((value as i64) >> 1).hash(state);
+        return;
+    }
+    let header = heap_header(value);
+    match header_kind(header) {
+        KIND_BIGINT => bigint_value(value).hash(state),
+        KIND_FLOAT => {
+            let float = float_value(value);
+            let float = if float == 0.0 { 0.0 } else { float };
+            float.to_bits().hash(state);
+        }
+        KIND_STRING => string_value(value).hash(state),
+        KIND_RECORD => {
+            (header & HEADER_SEMANTIC_MASK).hash(state);
+            for index in 0..record_arity(header) {
+                hash_value(record_field(value, index), state);
+            }
+        }
+        KIND_BITARRAY => {
+            let payload = bitarray_value(value);
+            payload.bits.hash(state);
+            payload.bytes.hash(state);
+        }
+        KIND_DICT => {
+            let map = &dict_payload(value).map;
+            map.len().hash(state);
+            let mut combined: u64 = 0;
+            for (key, entry) in map.iter() {
+                let mut entry_state = std::collections::hash_map::DefaultHasher::new();
+                hash_value(key.0, &mut entry_state);
+                hash_value(entry.0, &mut entry_state);
+                combined = combined.wrapping_add(std::hash::Hasher::finish(&entry_state));
+            }
+            combined.hash(state);
+        }
+        // Closures and unknown kinds compare by identity.
+        _ => value.hash(state),
+    }
+}
 
 /// A total order over Gleam values, consistent with structural equality:
 /// `Equal` exactly when [`deep_eq`] holds (floats excepted for NaN, which
@@ -1849,14 +1896,26 @@ pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
                 Ordering::Equal => {}
                 ordering => return ordering,
             }
+            // Iteration order is unspecified, so a total order needs each
+            // side's entries sorted by key first. Dicts nested inside dict
+            // keys are rare enough for the sort not to matter.
+            let sorted = |payload: &DictPayload| -> Vec<(u64, u64)> {
+                let mut entries: Vec<(u64, u64)> = payload
+                    .map
+                    .iter()
+                    .map(|(key, entry)| (key.0, entry.0))
+                    .collect();
+                entries.sort_by(|(left, _), (right, _)| cmp_values(*left, *right));
+                entries
+            };
             for ((left_key, left_value), (right_key, right_value)) in
-                left.map.iter().zip(right.map.iter())
+                sorted(left).into_iter().zip(sorted(right))
             {
-                match cmp_values(left_key.0, right_key.0) {
+                match cmp_values(left_key, right_key) {
                     Ordering::Equal => {}
                     ordering => return ordering,
                 }
-                match cmp_values(left_value.0, right_value.0) {
+                match cmp_values(left_value, right_value) {
                     Ordering::Equal => {}
                     ordering => return ordering,
                 }
@@ -1965,16 +2024,17 @@ pub(crate) fn deep_eq(left: u64, right: u64) -> bool {
             left.bits == right.bits && left.bytes == right.bytes
         }
         KIND_DICT => {
+            // Equal dicts may iterate in different orders (hash collisions
+            // keep insertion order), so compare by lookup.
             let left = dict_payload(left);
             let right = dict_payload(right);
             left.map.len() == right.map.len()
-                && left
-                    .map
-                    .iter()
-                    .zip(right.map.iter())
-                    .all(|((left_key, left_value), (right_key, right_value))| {
-                        deep_eq(left_key.0, right_key.0) && deep_eq(left_value.0, right_value.0)
-                    })
+                && left.map.iter().all(|(key, entry)| {
+                    right
+                        .map
+                        .get(key)
+                        .is_some_and(|other| deep_eq(entry.0, other.0))
+                })
         }
         // Closures are equal only when identical, handled above.
         _ => false,
@@ -2091,10 +2151,18 @@ pub fn inspect(value: u64) -> String {
             }
         }
         KIND_DICT => {
-            let entries: Vec<String> = dict_payload(value)
+            // Sorted by key, so `echo` output stays deterministic (and
+            // matches what the ordered map used to print) even though the
+            // map itself iterates in hash order.
+            let mut pairs: Vec<(u64, u64)> = dict_payload(value)
                 .map
                 .iter()
-                .map(|(key, entry)| format!("#({}, {})", inspect(key.0), inspect(entry.0)))
+                .map(|(key, entry)| (key.0, entry.0))
+                .collect();
+            pairs.sort_by(|(left, _), (right, _)| cmp_values(*left, *right));
+            let entries: Vec<String> = pairs
+                .into_iter()
+                .map(|(key, entry)| format!("#({}, {})", inspect(key), inspect(entry)))
                 .collect();
             format!("dict.from_list([{}])", entries.join(", "))
         }

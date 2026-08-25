@@ -2083,6 +2083,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "im-rc"
+version = "15.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af1955a75fa080c677d3972822ec4bad316169ab1cfc6c257a942c2265dbe5fe"
+dependencies = [
+ "bitmaps",
+ "rand_core 0.6.4",
+ "rand_xoshiro",
+ "sized-chunks",
+ "typenum",
+ "version_check",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2455,7 +2469,7 @@ dependencies = [
 name = "native-runtime"
 version = "1.0.0"
 dependencies = [
- "im",
+ "im-rc",
  "libc",
  "num-bigint 0.5.1",
  "num-traits",
@@ -2475,7 +2489,6 @@ dependencies = [
 name = "native-runtime-stdlib"
 version = "1.0.0"
 dependencies = [
- "im",
  "native-runtime",
  "num-bigint 0.5.1",
  "num-traits",
