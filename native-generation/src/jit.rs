@@ -42,6 +42,7 @@ pub fn run(
         translator.define_module(module)?;
     }
 
+    native_runtime::set_constructor_names(translator.constructor_names());
     let main = translator.function_id(main_module, "main").ok_or_else(|| {
         format!("module `{main_module}` has no `main` function compiled for the native target")
     })?;

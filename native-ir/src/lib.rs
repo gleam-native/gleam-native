@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 26;
+pub const FORMAT_VERSION: u32 = 27;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -154,9 +154,11 @@ pub enum Expression {
         tree: Decision,
     },
     /// Constructing a custom type value: a heap record with a variant tag
-    /// word followed by the field values.
+    /// word followed by the field values. The display says how `echo`
+    /// renders the value.
     Constructor {
         tag: u32,
+        display: ConstructorDisplay,
         arguments: Vec<Expression>,
     },
     /// Reading field `index` out of a custom type record or tuple.
@@ -322,6 +324,14 @@ pub enum BitsTest {
     /// Nothing to test (variable and discard segment patterns); the check
     /// exists to materialize its reads.
     AlwaysTrue,
+}
+
+/// How a constructed record renders in `echo` output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ConstructorDisplay {
+    Tuple,
+    List,
+    Record { name: String },
 }
 
 /// A node of a lowered pattern-match decision tree.

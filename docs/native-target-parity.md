@@ -162,15 +162,18 @@ platform C convention.
   all arithmetic and comparison operators)
 - ✅ `panic`, `todo` with module/function/line metadata baked into the call
   site, lazily-evaluated message expressions, exit code 1
-- 🚧 `echo`: prints `module:line` (plus the optional `as` message) and the
-  value to standard error, returning the value. Scalars and strings print
-  exactly (using the static type at the echo site); composites print
-  structurally as `@tag(field, ...)` because constructor names do not exist
-  at run time — Gleam-pretty output needs constructor-name metadata in
-  record headers or static descriptors. `echo` inside a pipeline is not yet
-  lowered
-- 🚧 Value formatting exists as the runtime's structural `inspect`; a
-  `gleam/string.inspect` equivalent with constructor names is future work
+- ✅ `echo`: prints `module:line` (plus the optional `as` message) and the
+  value to standard error, returning the value — in expression position and
+  inside pipelines (`|> echo |>` prints the mid-pipeline value). Output is
+  Gleam-pretty: record headers carry a display-only constructor id (masked
+  out of variant checks and equality) resolved through a name registry the
+  JIT hands the runtime, so custom types print as `Person("Ada", 36)`,
+  lists as `[1, 2]`, tuples as `#(...)`, and `Ok`/`Error` by name. Scalars
+  use the static type at the echo site. One representational limit remains:
+  `Bool`, `Nil`, and the empty list are bare tagged integers, so *nested*
+  inside structures they print as their integer encoding
+- ✅ Value formatting: the runtime's `inspect` now renders constructor
+  names, ready to back a `gleam/string.inspect` external
 - ✅ Reference counting: a count word before every heap object, with
   mechanical local ownership rules inserted during code generation
   (expressions yield owned references, variable reads share, container

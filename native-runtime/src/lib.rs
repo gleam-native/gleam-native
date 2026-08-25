@@ -53,9 +53,46 @@ pub const KIND_BITARRAY: u64 = 5;
 
 /// The header word of a record with the given variant tag and field count.
 /// Code generation computes expected headers with this same formula, so a
-/// variant check is a single word comparison.
+/// variant check is a single (masked) word comparison.
 pub const fn record_header(tag: u32, arity: u32) -> u64 {
     KIND_RECORD | ((tag as u64) << 16) | ((arity as u64) << 32)
+}
+
+/// Bits 48..64 of a record header hold a display-only constructor id used
+/// by `echo`; semantic comparisons (variant checks, equality) mask it out
+/// with this mask.
+pub const HEADER_SEMANTIC_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// Reserved display ids; user constructors are interned from
+/// [`FIRST_INTERNED_DISPLAY`] upwards by code generation.
+pub const DISPLAY_TUPLE: u16 = 0;
+pub const DISPLAY_LIST: u16 = 1;
+pub const DISPLAY_OK: u16 = 2;
+pub const DISPLAY_ERROR: u16 = 3;
+pub const FIRST_INTERNED_DISPLAY: u16 = 4;
+
+fn record_display(header: u64) -> u16 {
+    (header >> 48) as u16
+}
+
+/// The interned constructor names for display ids from
+/// [`FIRST_INTERNED_DISPLAY`] upwards, set by the host before `main` runs.
+static CONSTRUCTOR_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Stores the interned constructor names; called by the host.
+pub fn set_constructor_names(names: Vec<String>) {
+    let _ = CONSTRUCTOR_NAMES.set(names);
+}
+
+fn constructor_name(display: u16) -> Option<&'static str> {
+    match display {
+        DISPLAY_OK => Some("Ok"),
+        DISPLAY_ERROR => Some("Error"),
+        _ => CONSTRUCTOR_NAMES
+            .get()?
+            .get((display - FIRST_INTERNED_DISPLAY) as usize)
+            .map(|name| name.as_str()),
+    }
 }
 
 const fn closure_header(captures: u32) -> u64 {
@@ -525,7 +562,7 @@ pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u6
 
 /// Builds a two-element tuple (a record with tag 0).
 fn make_tuple2(first: u64, second: u64) -> u64 {
-    let record = gleam_native_record_new(0, 2);
+    let record = gleam_native_record_new(0, 2, DISPLAY_TUPLE as u64);
     unsafe {
         *((record as *mut u64).add(1)) = first;
         *((record as *mut u64).add(2)) = second;
@@ -535,14 +572,14 @@ fn make_tuple2(first: u64, second: u64) -> u64 {
 
 /// Builds an `Ok` value (variant 0 of `Result`).
 fn make_ok(value: u64) -> u64 {
-    let record = gleam_native_record_new(0, 1);
+    let record = gleam_native_record_new(0, 1, DISPLAY_OK as u64);
     unsafe { *((record as *mut u64).add(1)) = value };
     record
 }
 
 /// Builds an `Error` value (variant 1 of `Result`).
 fn make_error(value: u64) -> u64 {
-    let record = gleam_native_record_new(1, 1);
+    let record = gleam_native_record_new(1, 1, DISPLAY_ERROR as u64);
     unsafe { *((record as *mut u64).add(1)) = value };
     record
 }
@@ -551,7 +588,7 @@ fn make_error(value: u64) -> u64 {
 fn make_list(values: Vec<u64>) -> u64 {
     let mut list = NIL;
     for value in values.into_iter().rev() {
-        let cell = gleam_native_record_new(1, 2);
+        let cell = gleam_native_record_new(1, 2, DISPLAY_LIST as u64);
         unsafe {
             *((cell as *mut u64).add(1)) = value;
             *((cell as *mut u64).add(2)) = list;
@@ -1076,12 +1113,14 @@ pub extern "C" fn gleam_native_bitarray_slice(
     })
 }
 
-/// Allocates a custom type record: a header word encoding the variant tag
-/// and field count, followed by `arity` field words which generated code
-/// stores immediately after this call.
-pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64) -> u64 {
+/// Allocates a custom type record: a header word encoding the variant tag,
+/// field count, and display id, followed by `arity` field words which
+/// generated code stores immediately after this call.
+pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64, display: u64) -> u64 {
     let value = allocate_words(1 + arity as usize);
-    unsafe { *(value as *mut u64) = record_header(tag as u32, arity as u32) };
+    unsafe {
+        *(value as *mut u64) = record_header(tag as u32, arity as u32) | (display << 48)
+    };
     value
 }
 
@@ -1177,8 +1216,8 @@ fn deep_eq(left: u64, right: u64) -> bool {
     if left & 1 == 1 || right & 1 == 1 {
         return false;
     }
-    let left_header = heap_header(left);
-    if left_header != heap_header(right) {
+    let left_header = heap_header(left) & HEADER_SEMANTIC_MASK;
+    if left_header != heap_header(right) & HEADER_SEMANTIC_MASK {
         return false;
     }
     match header_kind(left_header) {
@@ -1229,10 +1268,31 @@ fn inspect(value: u64) -> String {
             format!("<<{}>>", parts.join(", "))
         }
         KIND_RECORD => {
-            let fields: Vec<String> = (0..record_arity(header))
-                .map(|index| inspect(record_field(value, index)))
-                .collect();
-            format!("@{}({})", record_tag(header), fields.join(", "))
+            let fields = |value: u64, header: u64| -> Vec<String> {
+                (0..record_arity(header))
+                    .map(|index| inspect(record_field(value, index)))
+                    .collect()
+            };
+            match record_display(header) {
+                DISPLAY_TUPLE => format!("#({})", fields(value, header).join(", ")),
+                DISPLAY_LIST => {
+                    // Walk the cons chain.
+                    let mut items = Vec::new();
+                    let mut current = value;
+                    while current & 1 == 0 {
+                        items.push(inspect(record_field(current, 0)));
+                        current = record_field(current, 1);
+                    }
+                    format!("[{}]", items.join(", "))
+                }
+                display => match constructor_name(display) {
+                    Some(name) if record_arity(header) == 0 => name.to_string(),
+                    Some(name) => format!("{name}({})", fields(value, header).join(", ")),
+                    None => {
+                        format!("@{}({})", record_tag(header), fields(value, header).join(", "))
+                    }
+                },
+            }
         }
         kind => format!("<unknown kind {kind}>"),
     }
@@ -1583,7 +1643,7 @@ mod tests {
     }
 
     fn make_record(tag: u64, fields: &[u64]) -> u64 {
-        let record = gleam_native_record_new(tag, fields.len() as u64);
+        let record = gleam_native_record_new(tag, fields.len() as u64, 9);
         for (index, field) in fields.iter().enumerate() {
             unsafe { *((record as *mut u64).add(1 + index)) = *field };
         }

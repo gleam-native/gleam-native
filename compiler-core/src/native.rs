@@ -238,11 +238,15 @@ impl Lowerer<'_> {
                     Ok(native_ir::Expression::Bool(name == "True"))
                 }
                 ValueConstructorVariant::Record {
+                    name,
                     arity: 0,
                     variant_index,
                     ..
                 } => Ok(native_ir::Expression::Constructor {
                     tag: *variant_index as u32,
+                    display: native_ir::ConstructorDisplay::Record {
+                        name: name.clone().into(),
+                    },
                     arguments: vec![],
                 }),
                 // A constructor used as a function value: a lambda that
@@ -263,6 +267,9 @@ impl Lowerer<'_> {
                         body: vec![native_ir::Statement::Expression(
                             native_ir::Expression::Constructor {
                                 tag: *variant_index as u32,
+                                display: native_ir::ConstructorDisplay::Record {
+                                    name: name.clone().into(),
+                                },
                                 arguments,
                             },
                         )],
@@ -299,12 +306,17 @@ impl Lowerer<'_> {
                                 arguments,
                             })
                         }
-                        ValueConstructorVariant::Record { variant_index, .. } => {
-                            Ok(native_ir::Expression::Constructor {
-                                tag: *variant_index as u32,
-                                arguments,
-                            })
-                        }
+                        ValueConstructorVariant::Record {
+                            name,
+                            variant_index,
+                            ..
+                        } => Ok(native_ir::Expression::Constructor {
+                            tag: *variant_index as u32,
+                            display: native_ir::ConstructorDisplay::Record {
+                                name: name.clone().into(),
+                            },
+                            arguments,
+                        }),
                         _ => Ok(native_ir::Expression::CallValue {
                             callee: Box::new(self.expression(fun)?),
                             arguments,
@@ -335,7 +347,8 @@ impl Lowerer<'_> {
             }
 
             // A pipeline is a series of named steps followed by a final
-            // expression.
+            // expression. An `echo` step prints the latest step's value
+            // without binding a new one.
             TypedExpr::Pipeline {
                 first_value,
                 assignments,
@@ -343,19 +356,54 @@ impl Lowerer<'_> {
                 ..
             } => {
                 let mut statements = Vec::with_capacity(assignments.len() + 2);
-                statements.push(native_ir::Statement::Let {
-                    name: first_value.name.clone().into(),
-                    value: self.expression(&first_value.value)?,
-                });
-                for (assignment, _kind) in assignments {
-                    statements.push(native_ir::Statement::Let {
-                        name: assignment.name.clone().into(),
-                        value: self.expression(&assignment.value)?,
-                    });
+                let mut latest: Option<(EcoString, std::sync::Arc<Type>)> = None;
+                let all_assignments =
+                    std::iter::once(first_value).chain(assignments.iter().map(|(a, _)| a));
+                for assignment in all_assignments {
+                    if let TypedExpr::Echo {
+                        expression: None,
+                        message,
+                        location,
+                        ..
+                    } = assignment.value.as_ref()
+                    {
+                        let (name, type_) = latest
+                            .clone()
+                            .expect("echo with no previous step in a pipe");
+                        statements.push(native_ir::Statement::Expression(self.echo(
+                            native_ir::Expression::Variable(name.into()),
+                            &type_,
+                            message.as_deref(),
+                            location,
+                        )?));
+                    } else {
+                        statements.push(native_ir::Statement::Let {
+                            name: assignment.name.clone().into(),
+                            value: self.expression(&assignment.value)?,
+                        });
+                        latest = Some((assignment.name.clone(), assignment.value.type_()));
+                    }
                 }
-                statements.push(native_ir::Statement::Expression(
-                    self.expression(finally)?,
-                ));
+                let finally = match finally.as_ref() {
+                    TypedExpr::Echo {
+                        expression: None,
+                        message,
+                        location,
+                        ..
+                    } => {
+                        let (name, type_) = latest
+                            .clone()
+                            .expect("echo with no previous step in a pipe");
+                        self.echo(
+                            native_ir::Expression::Variable(name.into()),
+                            &type_,
+                            message.as_deref(),
+                            location,
+                        )?
+                    }
+                    finally => self.expression(finally)?,
+                };
+                statements.push(native_ir::Statement::Expression(finally));
                 Ok(native_ir::Expression::Block(statements))
             }
 
@@ -365,7 +413,11 @@ impl Lowerer<'_> {
                     .iter()
                     .map(|element| self.expression(element))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(native_ir::Expression::Constructor { tag: 0, arguments })
+                Ok(native_ir::Expression::Constructor {
+                    tag: 0,
+                    display: native_ir::ConstructorDisplay::Tuple,
+                    arguments,
+                })
             }
 
             TypedExpr::TupleIndex { tuple, index, .. } => Ok(native_ir::Expression::FieldAccess {
@@ -383,6 +435,7 @@ impl Lowerer<'_> {
                 for element in elements.iter().rev() {
                     list = native_ir::Expression::Constructor {
                         tag: 1,
+                        display: native_ir::ConstructorDisplay::List,
                         arguments: vec![self.expression(element)?, list],
                     };
                 }
@@ -406,11 +459,13 @@ impl Lowerer<'_> {
                 // The type checker has already desugared the update into a
                 // full constructor argument list where unchanged fields read
                 // from the spread record, referenced by name.
-                let tag = match constructor.as_ref() {
+                let (tag, name) = match constructor.as_ref() {
                     TypedExpr::Var { constructor, .. } => match &constructor.variant {
-                        ValueConstructorVariant::Record { variant_index, .. } => {
-                            *variant_index as u32
-                        }
+                        ValueConstructorVariant::Record {
+                            name,
+                            variant_index,
+                            ..
+                        } => (*variant_index as u32, name.clone()),
                         _ => return Err(self.unsupported("this record update")),
                     },
                     _ => return Err(self.unsupported("this record update")),
@@ -419,7 +474,11 @@ impl Lowerer<'_> {
                     .iter()
                     .map(|argument| self.expression(&argument.value))
                     .collect::<Result<Vec<_>, _>>()?;
-                let construct = native_ir::Expression::Constructor { tag, arguments };
+                let construct = native_ir::Expression::Constructor {
+                    tag,
+                    display: native_ir::ConstructorDisplay::Record { name: name.into() },
+                    arguments,
+                };
                 match updated_record_assigned_name {
                     // The spread expression is not a plain variable: bind it
                     // to the compiler-chosen name the arguments refer to.
@@ -495,33 +554,13 @@ impl Lowerer<'_> {
                 location,
                 ..
             } => {
+                // A bare `echo` only occurs in pipelines, handled there.
                 let value = echo_expression
                     .as_ref()
-                    .ok_or_else(|| self.unsupported("echo inside a pipeline"))?;
+                    .expect("bare echo outside a pipeline");
                 let type_ = value.type_();
-                let kind = if type_.is_int() {
-                    native_ir::EchoKind::Int
-                } else if type_.is_float() {
-                    native_ir::EchoKind::Float
-                } else if type_.is_string() {
-                    native_ir::EchoKind::String
-                } else if type_.is_bool() {
-                    native_ir::EchoKind::Bool
-                } else if type_.is_nil() {
-                    native_ir::EchoKind::Nil
-                } else {
-                    native_ir::EchoKind::Structural
-                };
-                let message = match message {
-                    Some(message) => Some(Box::new(self.expression(message)?)),
-                    None => None,
-                };
-                Ok(native_ir::Expression::Echo {
-                    kind,
-                    value: Box::new(self.expression(value)?),
-                    message,
-                    line: self.line_numbers.line_number(location.start),
-                })
+                let value = self.expression(value)?;
+                self.echo(value, &type_, message.as_deref(), location)
             }
 
             TypedExpr::Panic {
@@ -695,6 +734,7 @@ impl Lowerer<'_> {
             }
             Constant::Record { type_, .. } if type_.is_nil() => Ok(native_ir::Expression::Nil),
             Constant::Record {
+                name,
                 arguments,
                 record_constructor,
                 ..
@@ -714,20 +754,31 @@ impl Lowerer<'_> {
                     .iter()
                     .map(|argument| self.constant(&argument.value))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(native_ir::Expression::Constructor { tag, arguments })
+                Ok(native_ir::Expression::Constructor {
+                    tag,
+                    display: native_ir::ConstructorDisplay::Record {
+                        name: name.clone().into(),
+                    },
+                    arguments,
+                })
             }
             Constant::Tuple { elements, .. } => {
                 let arguments = elements
                     .iter()
                     .map(|element| self.constant(element))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(native_ir::Expression::Constructor { tag: 0, arguments })
+                Ok(native_ir::Expression::Constructor {
+                    tag: 0,
+                    display: native_ir::ConstructorDisplay::Tuple,
+                    arguments,
+                })
             }
             Constant::List { elements, .. } => {
                 let mut list = native_ir::Expression::EmptyList;
                 for element in elements.iter().rev() {
                     list = native_ir::Expression::Constructor {
                         tag: 1,
+                        display: native_ir::ConstructorDisplay::List,
                         arguments: vec![self.constant(element)?, list],
                     };
                 }
@@ -1336,6 +1387,38 @@ impl Lowerer<'_> {
         Ok(bindings)
     }
 
+    fn echo(
+        &self,
+        value: native_ir::Expression,
+        type_: &Type,
+        message: Option<&TypedExpr>,
+        location: &src_span::SrcSpan,
+    ) -> Result<native_ir::Expression, Error> {
+        let kind = if type_.is_int() {
+            native_ir::EchoKind::Int
+        } else if type_.is_float() {
+            native_ir::EchoKind::Float
+        } else if type_.is_string() {
+            native_ir::EchoKind::String
+        } else if type_.is_bool() {
+            native_ir::EchoKind::Bool
+        } else if type_.is_nil() {
+            native_ir::EchoKind::Nil
+        } else {
+            native_ir::EchoKind::Structural
+        };
+        let message = match message {
+            Some(message) => Some(Box::new(self.expression(message)?)),
+            None => None,
+        };
+        Ok(native_ir::Expression::Echo {
+            kind,
+            value: Box::new(value),
+            message,
+            line: self.line_numbers.line_number(location.start),
+        })
+    }
+
     fn panic_expression(
         &self,
         kind: native_ir::PanicKind,
@@ -1738,6 +1821,9 @@ pub fn main() {
                 name: "pair".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 0,
+                    display: native_ir::ConstructorDisplay::Record {
+                        name: "Pair".into()
+                    },
                     arguments: vec![
                         native_ir::Expression::Int(1),
                         native_ir::Expression::Int(2)
@@ -1796,10 +1882,12 @@ pub fn main() {
                 name: "pair".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 0,
+                    display: native_ir::ConstructorDisplay::Tuple,
                     arguments: vec![
                         native_ir::Expression::Int(1),
                         native_ir::Expression::Constructor {
                             tag: 0,
+                            display: native_ir::ConstructorDisplay::Tuple,
                             arguments: vec![
                                 native_ir::Expression::Int(2),
                                 native_ir::Expression::Int(3),
@@ -1898,6 +1986,7 @@ pub fn main() {
                 name: "rest".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 1,
+                    display: native_ir::ConstructorDisplay::List,
                     arguments: vec![
                         native_ir::Expression::Int(4),
                         native_ir::Expression::EmptyList,
@@ -1910,6 +1999,7 @@ pub fn main() {
             body[1],
             native_ir::Statement::Expression(native_ir::Expression::Constructor {
                 tag: 1,
+                display: native_ir::ConstructorDisplay::List,
                 arguments: vec![
                     native_ir::Expression::Int(3),
                     native_ir::Expression::Variable("rest".into()),
@@ -2024,6 +2114,9 @@ pub fn main() {
             body[1],
             native_ir::Statement::Expression(native_ir::Expression::Constructor {
                 tag: 0,
+                display: native_ir::ConstructorDisplay::Record {
+                    name: "Person".into()
+                },
                 arguments: vec![
                     native_ir::Expression::FieldAccess {
                         record: Box::new(native_ir::Expression::Variable("alice".into())),
@@ -2181,10 +2274,12 @@ pub fn main() {
                 name: "z".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 1,
+                    display: native_ir::ConstructorDisplay::List,
                     arguments: vec![
                         native_ir::Expression::String("forty".into()),
                         native_ir::Expression::Constructor {
                             tag: 1,
+                            display: native_ir::ConstructorDisplay::List,
                             arguments: vec![
                                 native_ir::Expression::String("two".into()),
                                 native_ir::Expression::EmptyList,

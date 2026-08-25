@@ -188,7 +188,7 @@ impl RuntimeFunctions {
             bitarray_rest_is_bytes: declare(BITARRAY_REST_IS_BYTES, 2)?,
             bitarray_read_int: declare(BITARRAY_READ_INT, 5)?,
             bitarray_slice: declare(BITARRAY_SLICE, 4)?,
-            record_new: declare(RECORD_NEW, 2)?,
+            record_new: declare(RECORD_NEW, 3)?,
             closure_new: declare(CLOSURE_NEW, 1)?,
             deep_eq: declare(DEEP_EQ, 2)?,
             echo: declare(ECHO, 6)?,
@@ -225,6 +225,10 @@ pub struct Translator<'a, M: Module> {
     /// One wrapper per module function used as a value.
     wrappers: HashMap<(String, String), FuncId>,
     generated_counter: u32,
+    /// Interned constructor names for `echo` display, id-indexed from
+    /// `native_runtime::FIRST_INTERNED_DISPLAY`.
+    display_names: Vec<String>,
+    display_ids: HashMap<String, u16>,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -237,7 +241,15 @@ impl<'a, M: Module> Translator<'a, M> {
             pending: Vec::new(),
             wrappers: HashMap::new(),
             generated_counter: 0,
+            display_names: Vec::new(),
+            display_ids: HashMap::new(),
         })
+    }
+
+    /// The interned constructor names collected during translation, for
+    /// handing to the runtime.
+    pub fn constructor_names(&self) -> Vec<String> {
+        self.display_names.clone()
     }
 
     pub fn function_id(&self, module: &str, function: &str) -> Option<FuncId> {
@@ -379,6 +391,8 @@ impl<'a, M: Module> Translator<'a, M> {
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
+            display_names: &mut self.display_names,
+            display_ids: &mut self.display_ids,
             scope_owned: Vec::new(),
         };
         let result = function_translator.statements(body)?;
@@ -454,6 +468,8 @@ impl<'a, M: Module> Translator<'a, M> {
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
+            display_names: &mut self.display_names,
+            display_ids: &mut self.display_ids,
             scope_owned: Vec::new(),
         };
         let result = function_translator.statements(body)?;
@@ -520,6 +536,8 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     pending: &'a mut Vec<PendingFunction>,
     wrappers: &'a mut HashMap<(String, String), FuncId>,
     generated_counter: &'a mut u32,
+    display_names: &'a mut Vec<String>,
+    display_ids: &'a mut HashMap<String, u16>,
     /// Named variable slots holding owned references, decremented when
     /// their scope's statement sequence finishes — or just before its final
     /// statement, for bindings the final statement does not mention, so that
@@ -903,17 +921,43 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 Ok(result)
             }
 
-            native_ir::Expression::Constructor { tag, arguments } => {
+            native_ir::Expression::Constructor {
+                tag,
+                display,
+                arguments,
+            } => {
+                let display = match display {
+                    native_ir::ConstructorDisplay::Tuple => native_runtime::DISPLAY_TUPLE,
+                    native_ir::ConstructorDisplay::List => native_runtime::DISPLAY_LIST,
+                    native_ir::ConstructorDisplay::Record { name } => match name.as_str() {
+                        "Ok" => native_runtime::DISPLAY_OK,
+                        "Error" => native_runtime::DISPLAY_ERROR,
+                        name => match self.display_ids.get(name) {
+                            Some(id) => *id,
+                            None => {
+                                let id = native_runtime::FIRST_INTERNED_DISPLAY
+                                    + self.display_names.len() as u16;
+                                self.display_names.push(name.to_string());
+                                let _ = self.display_ids.insert(name.to_string(), id);
+                                id
+                            }
+                        },
+                    },
+                };
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
                     values.push(self.expression(argument)?);
                 }
                 let tag = self.builder.ins().iconst(types::I64, *tag as i64);
                 let arity = self.builder.ins().iconst(types::I64, values.len() as i64);
+                let display = self.builder.ins().iconst(types::I64, display as i64);
                 let record_new_ref = self
                     .module
                     .declare_func_in_func(self.runtime.record_new, self.builder.func);
-                let call = self.builder.ins().call(record_new_ref, &[tag, arity]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(record_new_ref, &[tag, arity, display]);
                 let record = self.builder.inst_results(call)[0];
                 for (index, value) in values.into_iter().enumerate() {
                     let _ = self.builder.ins().store(
@@ -1719,6 +1763,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                                 MemFlagsData::trusted(),
                                 subject,
                                 0,
+                            );
+                            // The display id in the header's top bits is not
+                            // semantic.
+                            let actual = self.builder.ins().band_imm_u(
+                                actual,
+                                native_runtime::HEADER_SEMANTIC_MASK as i64,
                             );
                             let expected = self.builder.ins().iconst(
                                 types::I64,
