@@ -20,8 +20,10 @@ Status legend:
 Architecture recap: typed modules are lowered in `compiler-core/src/native.rs`
 to the IR in the `native-ir` crate, serialized per module into
 `build/{mode}/native/{package}/_gleam_artefacts/*.nir`, then translated to
-Cranelift IR and JIT-executed by the `native-generation` crate against the
-`native-runtime` crate. Values are tagged 64-bit words (low bit 1 = 63-bit
+Cranelift IR by the `native-generation` crate against the `native-runtime`
+crate — either JIT-executed in process (`gleam run`) or compiled to an
+object file and linked with the `native-runtime-static` library into a
+standalone executable (`gleam export native`). Values are tagged 64-bit words (low bit 1 = 63-bit
 small integer, low bit 0 = 8-byte-aligned heap pointer). Every heap object
 starts with a header word (kind, and for records the variant tag and field
 count), enabling polymorphic deep equality and `echo`, and carries a
@@ -225,11 +227,17 @@ platform C convention.
 - ✅ `gleam run --target native` (in-process JIT)
 - 🚧 Unsupported features fail with a named error rather than miscompiling
   (no source location yet in `NativeUnsupportedFeature`)
-- ❌ Ahead-of-time compilation: `.nir` → object files via `cranelift-object`,
-  `native-runtime` as a staticlib, system linker; `gleam build` emits a real
-  executable
+- ✅ Ahead-of-time compilation: `gleam export native` builds the project in
+  production mode, compiles the `.nir` modules to a host object file via
+  `cranelift-object` (position-independent, optimized), and links it with
+  the system C compiler driver against the `native-runtime-static` library
+  — the runtime as a `staticlib` whose C `main` decodes an embedded program
+  data blob (configured stack size, interned constructor names) before
+  running the program thread. The executable lands in the project root,
+  named after the package. The static library is looked up next to the
+  `gleam` binary (`libnative_runtime_static.a`), overridable with
+  `GLEAM_NATIVE_RUNTIME_LIB`
 - ❌ `gleam test` (needs a gleeunit story or a native test runner)
-- ❌ `gleam export` equivalent (shipment = the AOT binary)
 - ❌ Debug info (DWARF via `gimli`) — spans must keep flowing through the IR
   so this stays possible
 - ❌ Cross-compilation (Cranelift supports foreign ISAs; needs target triple

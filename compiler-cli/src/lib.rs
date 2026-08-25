@@ -645,6 +645,10 @@ impl Command {
                 let paths = find_project_paths(directory)?;
                 export::escript(&paths)
             }
+            Self::Export(ExportTarget::Native) => {
+                let paths = find_project_paths(directory)?;
+                export::native(&paths)
+            }
             Self::Export(ExportTarget::HexTarball) => {
                 let paths = find_project_paths(directory)?;
                 export::hex_tarball(&paths)
@@ -686,6 +690,8 @@ pub enum ExportTarget {
     Escript,
     /// Precompiled Erlang, suitable for deployment
     ErlangShipment,
+    /// An ahead-of-time compiled native executable for this machine
+    Native,
     /// The package bundled into a tarball, suitable for publishing to Hex
     HexTarball,
     /// The JavaScript prelude module

@@ -48,6 +48,53 @@ impl TestProject {
             .output()
             .expect("run the gleam binary")
     }
+
+    /// Compiles the project ahead of time with `gleam export native` and
+    /// returns the path of the generated executable.
+    fn export_native(&self, name: &str) -> PathBuf {
+        ensure_runtime_static_library();
+        let output = Command::new(env!("CARGO_BIN_EXE_gleam"))
+            .args(["export", "native"])
+            .current_dir(&self.root)
+            .output()
+            .expect("run the gleam binary");
+        assert!(
+            output.status.success(),
+            "gleam export native failed.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let executable = self.root.join(name);
+        assert!(executable.is_file(), "no executable at {executable:?}");
+        executable
+    }
+}
+
+/// Builds the `native-runtime-static` library that `gleam export native`
+/// links executables against, so it sits next to the `gleam` binary under
+/// test whichever packages this test run happened to build.
+fn ensure_runtime_static_library() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        let _ = command.args(["build", "-p", "native-runtime-static"]);
+        if !cfg!(debug_assertions) {
+            let _ = command.arg("--release");
+        }
+        let output = command
+            .current_dir(workspace)
+            .output()
+            .expect("build native-runtime-static");
+        assert!(
+            output.status.success(),
+            "building native-runtime-static failed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
 }
 
 impl Drop for TestProject {
@@ -1096,6 +1143,125 @@ stderr: {stderr}"
     assert!(stdout.contains("10000000"), "stdout: {stdout}");
     assert!(stdout.contains("5000050000"), "stdout: {stdout}");
     assert!(stdout.contains("done"), "stdout: {stdout}");
+}
+
+#[test]
+fn export_native_executable() {
+    // Ahead-of-time compilation: the exported executable must behave like
+    // the JIT-run program, including runtime slow paths (big integers,
+    // string building), the constructor names `echo` reads from the
+    // embedded program data, command line arguments, and the exit code.
+    let project = TestProject::new(
+        "export_native",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+@external(native, "runtime", "gleam_native_start_arguments")
+fn start_arguments() -> List(String)
+
+@external(native, "runtime", "gleam_native_exit")
+fn exit(code: Int) -> Nil
+
+pub type Fruit {
+  Apple(count: Int)
+  Banana
+}
+
+fn print_each(arguments: List(String)) -> Int {
+  case arguments {
+    [] -> 0
+    [argument, ..rest] -> {
+      println(argument)
+      1 + print_each(rest)
+    }
+  }
+}
+
+pub fn main() -> Nil {
+  println("Hello from " <> "ahead of time!")
+  print_int(4611686018427387903 * 4)
+  let _ = echo Apple(3)
+  exit(print_each(start_arguments()))
+  println("unreachable")
+}
+"#,
+    );
+
+    let executable = project.export_native("export_native");
+    let output = Command::new(&executable)
+        .args(["alpha", "beta"])
+        .current_dir(&project.root)
+        .output()
+        .expect("run the exported executable");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected the argument count as the exit code.
+stdout: {stdout}
+stderr: {stderr}"
+    );
+    let expected = "Hello from ahead of time!
+18446744073709551612
+alpha
+beta
+";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.
+stdout: {stdout}"
+    );
+    assert!(!stdout.contains("unreachable"));
+    assert!(
+        stderr.contains("Apple(3)"),
+        "echo should print the interned constructor name.
+stderr: {stderr}"
+    );
+}
+
+#[test]
+fn export_native_configured_stack_size() {
+    // The configured stack size travels in the executable's embedded
+    // program data: a depth that fits in the default gigabyte must
+    // overflow, and be reported, with a small configured stack.
+    let project = TestProject::with_config_extras(
+        "export_native_stack",
+        r#"@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+fn deep(n: Int) -> Int {
+  case n {
+    0 -> 0
+    _ -> 1 + deep(n - 1)
+  }
+}
+
+pub fn main() -> Nil {
+  print_int(deep(200_000))
+}
+"#,
+        "\n[native]\nstack_size_megabytes = 4\n",
+    );
+    let executable = project.export_native("export_native_stack");
+    let output = Command::new(&executable)
+        .current_dir(&project.root)
+        .output()
+        .expect("run the exported executable");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a 4 MB stack should overflow.
+stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("runtime error: stack overflow"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

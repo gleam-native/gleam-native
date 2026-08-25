@@ -6,10 +6,11 @@
 //! This crate must not be depended upon by `compiler-core`, which has to keep
 //! compiling to WebAssembly for `compiler-wasm`. It consumes the serialized
 //! native IR that `compiler-core` writes at build time (see the `native-ir`
-//! crate) and either JIT-compiles and runs it ([`jit`]) or, in the future,
-//! emits object files for ahead-of-time compilation.
+//! crate) and either JIT-compiles and runs it ([`jit`]) or emits an object
+//! file for ahead-of-time compilation ([`object`]).
 
 pub mod jit;
+pub mod object;
 pub mod translate;
 
 #[cfg(test)]

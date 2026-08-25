@@ -7,6 +7,7 @@ use gleam_core::{
     Result,
     analyse::TargetSupport,
     build::{Codegen, Compile, ErlangOutput, Mode, Options, Target},
+    error::{Error, ShellCommandFailureReason},
     paths::ProjectPaths,
     type_::ModuleFunction,
 };
@@ -215,6 +216,135 @@ fn write_entrypoint_script(
     fs::write(entrypoint_output_path, &text)?;
     fs::make_executable(entrypoint_output_path)?;
     Ok(())
+}
+
+/// Compile the project ahead of time into a native executable for this
+/// machine, written to the project root and named after the package.
+///
+/// The Cranelift-generated object file is linked against the
+/// `native-runtime-static` library (which provides the runtime and the C
+/// `main`) with the system C compiler driver, which supplies the platform
+/// startup files and default libraries.
+pub(crate) fn native(paths: &ProjectPaths) -> Result<()> {
+    let target = Target::Native;
+    let mode = Mode::Prod;
+    let build = paths.build_directory_for_target(mode, target);
+
+    // Reset the directories to ensure we have a clean slate and no old code
+    fs::delete_directory(&build)?;
+
+    // Build project in production mode
+    let built = crate::build::main(
+        paths,
+        Options {
+            root_target_support: TargetSupport::Enforced,
+            warnings_as_errors: false,
+            codegen: Codegen::All,
+            compile: Compile::All,
+            mode,
+            target: Some(target),
+            no_print_progress: false,
+            erlang_output: ErlangOutput::Binary,
+        },
+        crate::build::download_dependencies(paths, crate::cli::Reporter::new())?,
+    )?;
+    let package_name = &built.root_package.config.name;
+
+    // The main function must exist for the executable to call. This will
+    // return an error if it could not be found.
+    let _: ModuleFunction = built.get_main_function(package_name, target)?;
+
+    let fail = |error: String| Error::NativeExecutableGeneration { error };
+
+    let modules = crate::run::load_native_modules(&build).map_err(fail)?;
+    let object = native_generation::object::compile(
+        &modules,
+        package_name,
+        built.root_package.config.native.stack_size_megabytes,
+    )
+    .map_err(fail)?;
+    let object_path = build.join(format!("{package_name}.o"));
+    fs::write_bytes(&object_path, &object)?;
+
+    let runtime_library = runtime_static_library().map_err(fail)?;
+    let executable_path = paths.root().join(package_name.as_str());
+    link_executable(&object_path, &runtime_library, &executable_path)?;
+
+    crate::cli::print_exported(package_name);
+    println!(
+        "
+Your native executable has been generated to {executable_path}.
+",
+    );
+
+    Ok(())
+}
+
+/// Links the object file and the runtime library into an executable with the
+/// system C compiler driver.
+fn link_executable(
+    object: &Utf8PathBuf,
+    runtime_library: &Utf8PathBuf,
+    executable: &Utf8PathBuf,
+) -> Result<()> {
+    let program = "cc";
+    let mut command = std::process::Command::new(program);
+    let _ = command
+        .arg(object)
+        .arg(runtime_library)
+        .arg("-o")
+        .arg(executable);
+    if cfg!(target_os = "linux") {
+        let _ = command.args(["-lpthread", "-ldl", "-lm"]);
+    }
+    let output = command.output().map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => Error::ShellProgramNotFound {
+            program: program.into(),
+            os: fs::get_os(),
+        },
+        kind => Error::ShellCommand {
+            program: program.into(),
+            reason: ShellCommandFailureReason::IoError(kind),
+        },
+    })?;
+    if !output.status.success() {
+        return Err(Error::ShellCommand {
+            program: program.into(),
+            reason: ShellCommandFailureReason::ShellCommandError(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Locates the `native-runtime-static` library executables are linked
+/// against: the path in the `GLEAM_NATIVE_RUNTIME_LIB` environment variable
+/// if set, otherwise `libnative_runtime_static.a` next to the running
+/// `gleam` binary.
+fn runtime_static_library() -> Result<Utf8PathBuf, String> {
+    if let Ok(path) = std::env::var("GLEAM_NATIVE_RUNTIME_LIB") {
+        let path = Utf8PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "GLEAM_NATIVE_RUNTIME_LIB is set to {path}, which does not exist"
+        ));
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("could not locate the gleam executable: {error}"))?;
+    match executable
+        .parent()
+        .map(|directory| directory.join("libnative_runtime_static.a"))
+    {
+        Some(path) if path.is_file() => Utf8PathBuf::from_path_buf(path)
+            .map_err(|path| format!("non UTF-8 path: {}", path.display())),
+        _ => Err("could not find libnative_runtime_static.a next to the gleam \
+executable. Build it with `cargo build -p native-runtime-static` or set \
+GLEAM_NATIVE_RUNTIME_LIB to its path."
+            .into()),
+    }
 }
 
 pub fn hex_tarball(paths: &ProjectPaths) -> Result<()> {

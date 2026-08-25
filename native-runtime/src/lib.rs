@@ -28,8 +28,10 @@
 //! decrements its children via a worklist, so destroying a long list does
 //! not recurse.
 //!
-//! These functions use the platform C calling convention and are registered
-//! with the JIT by name via [`symbols`], so they need no `#[no_mangle]`.
+//! These functions use the platform C calling convention. The JIT registers
+//! them by name via [`symbols`]; ahead-of-time compilation links against the
+//! `native-runtime-static` static library, so each carries `#[no_mangle]` to
+//! keep its symbol name.
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -419,23 +421,27 @@ fn retag(value: BigInt) -> u64 {
 
 /// The slow path for integer addition, called by generated code when either
 /// operand is a big integer or when small-integer addition overflowed.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_int_add_slow(left: u64, right: u64) -> u64 {
     retag(untag(left) + untag(right))
 }
 
 /// The slow path for integer subtraction; see [`gleam_native_int_add_slow`].
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_int_sub_slow(left: u64, right: u64) -> u64 {
     retag(untag(left) - untag(right))
 }
 
 /// The slow path for integer multiplication; see
 /// [`gleam_native_int_add_slow`].
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_int_mul_slow(left: u64, right: u64) -> u64 {
     retag(untag(left) * untag(right))
 }
 
 /// Three-way integer comparison for when either operand is a big integer:
 /// returns the tagged small integer -1, 0, or 1.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_int_compare(left: u64, right: u64) -> u64 {
     tag_small_int(match untag(left).cmp(&untag(right)) {
         std::cmp::Ordering::Less => -1,
@@ -446,6 +452,7 @@ pub extern "C" fn gleam_native_int_compare(left: u64, right: u64) -> u64 {
 
 /// Truncating integer division. Division by zero yields zero, following
 /// Gleam's semantics on every target.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_int_div(left: u64, right: u64) -> u64 {
     let divisor = untag(right);
     if divisor == BigInt::ZERO {
@@ -456,6 +463,7 @@ pub extern "C" fn gleam_native_int_div(left: u64, right: u64) -> u64 {
 
 /// Integer remainder, taking the sign of the dividend. A zero divisor
 /// yields zero, following Gleam's semantics on every target.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_int_rem(left: u64, right: u64) -> u64 {
     let divisor = untag(right);
     if divisor == BigInt::ZERO {
@@ -472,6 +480,7 @@ pub extern "C" fn gleam_native_int_rem(left: u64, right: u64) -> u64 {
 ///
 /// `bytes` must point to `length` readable bytes. Generated code always
 /// passes a pointer into its own constant data.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_bigint_from_bytes(bytes: *const u8, length: u64) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
     retag(BigInt::from_signed_bytes_le(bytes))
@@ -479,6 +488,7 @@ pub unsafe extern "C" fn gleam_native_bigint_from_bytes(bytes: *const u8, length
 
 /// Boxes a float value given its IEEE 754 bit pattern. Taking the bits as an
 /// integer keeps every generated call signature uniformly i64.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_float_from_bits(bits: u64) -> u64 {
     box_float(f64::from_bits(bits))
 }
@@ -491,6 +501,7 @@ pub extern "C" fn gleam_native_float_from_bits(bits: u64) -> u64 {
 /// `bytes` must point to `length` readable bytes of valid UTF-8. Generated
 /// code always passes a pointer into its own constant data, containing
 /// compiler-validated string contents.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length: u64) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
     let string = unsafe { std::str::from_utf8_unchecked(bytes) };
@@ -504,6 +515,7 @@ pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length
 ///
 /// Both arguments must be strings created by this runtime. The Gleam type
 /// system upholds this for calls from generated code.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_concat(left: u64, right: u64) -> u64 {
     let left = string_value(left);
     let right = string_value(right);
@@ -519,6 +531,7 @@ pub unsafe extern "C" fn gleam_native_string_concat(left: u64, right: u64) -> u6
 ///
 /// Both arguments must be strings created by this runtime. The Gleam type
 /// system upholds this for calls from generated code.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_eq(left: u64, right: u64) -> u64 {
     if string_value(left) == string_value(right) {
         TRUE
@@ -535,6 +548,7 @@ pub unsafe extern "C" fn gleam_native_string_eq(left: u64, right: u64) -> u64 {
 ///
 /// `subject` must be a string created by this runtime and `prefix` must
 /// point to `length` readable bytes.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_starts_with(
     subject: u64,
     prefix: *const u8,
@@ -556,6 +570,7 @@ pub unsafe extern "C" fn gleam_native_string_starts_with(
 ///
 /// `subject` must be a string created by this runtime and `offset` must be
 /// a valid character boundary within it.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u64) -> u64 {
     box_string(string_value(subject)[offset as usize..].to_string())
 }
@@ -604,6 +619,7 @@ fn make_list(values: Vec<u64>) -> u64 {
 ///
 /// The argument must be a string created by this runtime; the Gleam type
 /// system upholds this, as for every string function below.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_byte_size(string: u64) -> u64 {
     tag_small_int(string_value(string).len() as i64)
 }
@@ -613,6 +629,7 @@ pub unsafe extern "C" fn gleam_native_string_byte_size(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_length(string: u64) -> u64 {
     tag_small_int(string_value(string).graphemes(true).count() as i64)
 }
@@ -624,6 +641,7 @@ pub unsafe extern "C" fn gleam_native_string_length(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_compare(left: u64, right: u64) -> u64 {
     tag_small_int(match string_value(left).cmp(string_value(right)) {
         std::cmp::Ordering::Less => -1,
@@ -635,6 +653,7 @@ pub unsafe extern "C" fn gleam_native_string_compare(left: u64, right: u64) -> u
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_uppercase(string: u64) -> u64 {
     box_string(string_value(string).to_uppercase())
 }
@@ -642,6 +661,7 @@ pub unsafe extern "C" fn gleam_native_string_uppercase(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_lowercase(string: u64) -> u64 {
     box_string(string_value(string).to_lowercase())
 }
@@ -651,6 +671,7 @@ pub unsafe extern "C" fn gleam_native_string_lowercase(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_reverse(string: u64) -> u64 {
     box_string(string_value(string).graphemes(true).rev().collect())
 }
@@ -658,6 +679,7 @@ pub unsafe extern "C" fn gleam_native_string_reverse(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_contains(string: u64, needle: u64) -> u64 {
     if string_value(string).contains(string_value(needle)) {
         TRUE
@@ -669,6 +691,7 @@ pub unsafe extern "C" fn gleam_native_string_contains(string: u64, needle: u64) 
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64) -> u64 {
     if string_value(string).ends_with(string_value(suffix)) {
         TRUE
@@ -680,6 +703,7 @@ pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64)
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim(string: u64) -> u64 {
     box_string(string_value(string).trim().to_string())
 }
@@ -687,6 +711,7 @@ pub unsafe extern "C" fn gleam_native_string_trim(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
     box_string(string_value(string).trim_start().to_string())
 }
@@ -694,6 +719,7 @@ pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_end(string: u64) -> u64 {
     box_string(string_value(string).trim_end().to_string())
 }
@@ -704,6 +730,7 @@ pub unsafe extern "C" fn gleam_native_string_trim_end(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_slice(string: u64, start: u64, length: u64) -> u64 {
     let start = ((start as i64) >> 1).max(0) as usize;
     let length = ((length as i64) >> 1).max(0) as usize;
@@ -719,6 +746,7 @@ pub unsafe extern "C" fn gleam_native_string_slice(string: u64, start: u64, leng
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_replace(
     string: u64,
     pattern: u64,
@@ -733,6 +761,7 @@ pub unsafe extern "C" fn gleam_native_string_replace(
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_split(string: u64, on: u64) -> u64 {
     let string = string_value(string);
     let on = string_value(on);
@@ -753,6 +782,7 @@ pub unsafe extern "C" fn gleam_native_string_split(string: u64, on: u64) -> u64 
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_pop_grapheme(string: u64) -> u64 {
     let string = string_value(string);
     match string.grapheme_indices(true).next() {
@@ -772,6 +802,7 @@ pub unsafe extern "C" fn gleam_native_string_pop_grapheme(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_graphemes(string: u64) -> u64 {
     make_list(
         string_value(string)
@@ -786,6 +817,7 @@ pub unsafe extern "C" fn gleam_native_string_graphemes(string: u64) -> u64 {
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_to_codepoints(string: u64) -> u64 {
     make_list(
         string_value(string)
@@ -797,6 +829,7 @@ pub unsafe extern "C" fn gleam_native_string_to_codepoints(string: u64) -> u64 {
 
 /// A string from a list of code point scalars, skipping invalid ones (the
 /// standard library validates scalars before building code point values).
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_string_from_codepoints(list: u64) -> u64 {
     let mut result = String::new();
     let mut current = list;
@@ -811,6 +844,7 @@ pub extern "C" fn gleam_native_string_from_codepoints(list: u64) -> u64 {
 }
 
 /// An integer rendered in decimal.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_int_to_string(value: u64) -> u64 {
     box_string(untag(value).to_string())
 }
@@ -820,6 +854,7 @@ pub extern "C" fn gleam_native_int_to_string(value: u64) -> u64 {
 /// # Safety
 ///
 /// The argument must be a float created by this runtime.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_float_to_string(value: u64) -> u64 {
     box_string(format!("{:?}", float_value(value)))
 }
@@ -867,7 +902,104 @@ pub fn set_start_arguments(arguments: Vec<String>) {
     let _ = START_ARGUMENTS.set(arguments);
 }
 
+/// Runs the program's entry wrapper on the dedicated "gleam-main" thread
+/// with the given stack size (in megabytes) and the stack overflow handler
+/// installed. Tail calls run in constant space, and deep non-tail recursion
+/// gets generous room before the overflow handler reports it. A minimum of
+/// one megabyte keeps a misconfigured project able to reach `main` at all.
+pub fn run_program_thread(
+    stack_size_megabytes: u64,
+    entry: extern "C" fn() -> u64,
+) -> Result<(), String> {
+    let stack_size = usize::try_from(stack_size_megabytes.max(1))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(1024 * 1024);
+    std::thread::Builder::new()
+        .name("gleam-main".into())
+        .stack_size(stack_size)
+        .spawn(move || {
+            install_stack_overflow_handler();
+            let _ = entry();
+        })
+        .map_err(|error| format!("could not start the program thread: {error}"))?
+        .join()
+        .map_err(|_| "the program crashed".to_string())?;
+    Ok(())
+}
+
+/// The symbol of the program data blob that ahead-of-time compilation embeds
+/// in the executable, decoded by [`start`] before the program runs.
+pub const PROGRAM_DATA_SYMBOL: &str = "gleam_native_program_data";
+
+/// Encodes the program data blob for [`PROGRAM_DATA_SYMBOL`]. Layout, with
+/// all integers little-endian: the stack size in megabytes (u64), the
+/// constructor name count (u32), then each name as a u32 byte length
+/// followed by that many bytes of UTF-8.
+pub fn encode_program_data(stack_size_megabytes: u64, constructor_names: &[String]) -> Vec<u8> {
+    let mut data = stack_size_megabytes.to_le_bytes().to_vec();
+    let count = u32::try_from(constructor_names.len()).expect("constructor count fits in u32");
+    data.extend_from_slice(&count.to_le_bytes());
+    for name in constructor_names {
+        let length = u32::try_from(name.len()).expect("constructor name fits in u32");
+        data.extend_from_slice(&length.to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+    }
+    data
+}
+
+/// The entry point for ahead-of-time compiled programs, called from the C
+/// `main` that the `native-runtime-static` library provides. Stores the
+/// command line arguments (without the program name), decodes the embedded
+/// program data, and runs the entry wrapper on the program thread. Returns
+/// the process exit code.
+///
+/// # Safety
+///
+/// `argc`/`argv` must be the values C `main` received, and `program_data`
+/// must point at a blob produced by [`encode_program_data`].
+pub unsafe fn start(
+    argc: i32,
+    argv: *const *const std::ffi::c_char,
+    program_data: *const u8,
+    entry: extern "C" fn() -> u64,
+) -> i32 {
+    let mut arguments = Vec::new();
+    for index in 1..argc.max(0) {
+        let argument = unsafe { std::ffi::CStr::from_ptr(*argv.add(index as usize)) };
+        arguments.push(argument.to_string_lossy().into_owned());
+    }
+    set_start_arguments(arguments);
+
+    unsafe fn read_u32(cursor: &mut *const u8) -> u32 {
+        let value = unsafe { std::ptr::read_unaligned(*cursor as *const u32) };
+        *cursor = unsafe { cursor.add(4) };
+        u32::from_le(value)
+    }
+    let mut cursor = program_data;
+    let stack_size_megabytes =
+        u64::from_le(unsafe { std::ptr::read_unaligned(cursor as *const u64) });
+    cursor = unsafe { cursor.add(8) };
+    let count = unsafe { read_u32(&mut cursor) };
+    let mut names = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let length = unsafe { read_u32(&mut cursor) } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(cursor, length) };
+        cursor = unsafe { cursor.add(length) };
+        names.push(String::from_utf8_lossy(bytes).into_owned());
+    }
+    set_constructor_names(names);
+
+    match run_program_thread(stack_size_megabytes, entry) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
 /// The command line arguments as a list of strings.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_start_arguments() -> u64 {
     let arguments = START_ARGUMENTS.get().cloned().unwrap_or_default();
     make_list(
@@ -879,12 +1011,14 @@ pub extern "C" fn gleam_native_start_arguments() -> u64 {
 }
 
 /// Ends the program immediately with the given exit code.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_exit(code: u64) -> u64 {
     let code = untag(code).to_i32().unwrap_or(1);
     std::process::exit(code);
 }
 
 /// A new empty bit array, the start of a construction chain.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_empty() -> u64 {
     box_bitarray(BitArrayPayload {
         bits: 0,
@@ -895,6 +1029,7 @@ pub extern "C" fn gleam_native_bitarray_empty() -> u64 {
 /// Appends an integer segment of `bits` (tagged) bits, truncating the value
 /// to the segment size. Construction chains own their array uniquely, so
 /// the array is mutated in place and returned.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_append_int(
     array: u64,
     value: u64,
@@ -912,6 +1047,7 @@ pub extern "C" fn gleam_native_bitarray_append_int(
 /// # Safety
 ///
 /// `value` must be a float created by this runtime.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_bitarray_append_float(
     array: u64,
     value: u64,
@@ -931,6 +1067,7 @@ pub unsafe extern "C" fn gleam_native_bitarray_append_float(
 /// # Safety
 ///
 /// `string` must be a string created by this runtime.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_bitarray_append_string(
     array: u64,
     string: u64,
@@ -969,6 +1106,7 @@ pub unsafe extern "C" fn gleam_native_bitarray_append_string(
 
 /// Appends a single UTF codepoint (a tagged scalar value) with the given
 /// encoding and endianness.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_append_codepoint(
     array: u64,
     codepoint: u64,
@@ -989,6 +1127,7 @@ pub extern "C" fn gleam_native_bitarray_append_codepoint(
 
 /// Appends another bit array's contents, either whole (`has_bits` zero) or
 /// its first `bits` (tagged) bits.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_append_bits(
     array: u64,
     other: u64,
@@ -1014,6 +1153,7 @@ pub extern "C" fn gleam_native_bitarray_append_bits(
 
 /// Whether the array is exactly (`exact` non-zero) or at least `bits`
 /// (tagged) bits.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_size_test(array: u64, bits: u64, exact: u64) -> u64 {
     // A negative or gigantic wanted size simply never matches.
     if bits & 1 != 1 || (bits as i64) < 0 {
@@ -1031,6 +1171,7 @@ pub extern "C" fn gleam_native_bitarray_size_test(array: u64, bits: u64, exact: 
 /// # Safety
 ///
 /// `bytes` must point to at least `bit_length / 8` (rounded up) bytes.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_bitarray_bytes_test(
     array: u64,
     offset: u64,
@@ -1060,6 +1201,7 @@ pub unsafe extern "C" fn gleam_native_bitarray_bytes_test(
 
 /// Whether the rest of the array past (tagged) bit offset `offset` is a
 /// whole number of bytes.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_rest_is_bytes(array: u64, offset: u64) -> u64 {
     let offset = untag_bits(offset, "offset");
     if (bitarray_value(array).bits.saturating_sub(offset)) % 8 == 0 {
@@ -1071,6 +1213,7 @@ pub extern "C" fn gleam_native_bitarray_rest_is_bytes(array: u64, offset: u64) -
 
 /// Reads an integer of `bits` (tagged) bits at (tagged) bit offset
 /// `offset`.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_read_int(
     array: u64,
     offset: u64,
@@ -1091,6 +1234,7 @@ pub extern "C" fn gleam_native_bitarray_read_int(
 
 /// Reads a float of `bits` (tagged) bits (16, 32 or 64) at (tagged) bit
 /// offset `offset`.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_read_float(
     array: u64,
     offset: u64,
@@ -1105,6 +1249,7 @@ pub extern "C" fn gleam_native_bitarray_read_float(
 
 /// Whether the float at the given position is finite (not NaN or
 /// infinity); float segments only match finite values.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_is_finite_float(
     array: u64,
     offset: u64,
@@ -1127,6 +1272,7 @@ pub extern "C" fn gleam_native_bitarray_is_finite_float(
 
 /// A new bit array holding `bits` (tagged) bits from (tagged) bit offset
 /// `offset`, or everything from `offset` onwards when `has_bits` is zero.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_slice(
     array: u64,
     offset: u64,
@@ -1150,6 +1296,7 @@ pub extern "C" fn gleam_native_bitarray_slice(
 /// Allocates a custom type record: a header word encoding the variant tag,
 /// field count, and display id, followed by `arity` field words which
 /// generated code stores immediately after this call.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64, display: u64) -> u64 {
     let value = allocate_words(1 + arity as usize);
     unsafe {
@@ -1160,6 +1307,7 @@ pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64, display: u64) ->
 
 /// Allocates a closure: a header word, a slot for the code pointer, and
 /// `captures` capture words, all stored by generated code after this call.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_closure_new(captures: u64) -> u64 {
     let value = allocate_words(2 + captures as usize);
     unsafe { *(value as *mut u64) = closure_header(captures as u32) };
@@ -1181,6 +1329,7 @@ fn word_layout(words: usize) -> std::alloc::Layout {
 }
 
 /// Increments a value's reference count. A no-op for immediates.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
     if value & 1 == 0 {
         unsafe { *((value - 8) as *mut u64) += 1 };
@@ -1191,6 +1340,7 @@ pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
 /// Decrements a value's reference count, destroying the object when it
 /// reaches zero. Children are processed with a worklist so that destroying
 /// a long list does not overflow the stack. A no-op for immediates.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
     let mut worklist = vec![value];
     while let Some(value) = worklist.pop() {
@@ -1237,6 +1387,7 @@ pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
 
 /// Structural equality between two values of the same Gleam type, returning
 /// [`TRUE`] or [`FALSE`]. Closures compare by identity.
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_eq(left: u64, right: u64) -> u64 {
     if deep_eq(left, right) { TRUE } else { FALSE }
 }
@@ -1341,6 +1492,7 @@ fn inspect(value: u64) -> String {
 ///
 /// The module name pointer must be valid as described for
 /// [`gleam_native_panic`]; `message` is a string value or 0.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_echo(
     kind: u64,
     value: u64,
@@ -1384,6 +1536,7 @@ pub unsafe extern "C" fn gleam_native_echo(
 /// The pointer arguments must be valid as described above. Generated code
 /// always passes pointers into its own constant data and runtime-created
 /// strings.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_panic(
     kind: u64,
     message: u64,
@@ -1426,6 +1579,7 @@ pub unsafe extern "C" fn gleam_native_panic(
 
 /// Prints an integer followed by a newline. The standin for a real printing
 /// external until strings exist on the native target.
+#[unsafe(no_mangle)]
 pub extern "C" fn print_int(value: u64) -> u64 {
     println!("{}", untag(value));
     NIL
@@ -1433,6 +1587,7 @@ pub extern "C" fn print_int(value: u64) -> u64 {
 
 /// Prints a boolean as Gleam writes it, `True` or `False`, followed by a
 /// newline.
+#[unsafe(no_mangle)]
 pub extern "C" fn print_bool(value: u64) -> u64 {
     println!("{}", if value == TRUE { "True" } else { "False" });
     NIL
@@ -1445,6 +1600,7 @@ pub extern "C" fn print_bool(value: u64) -> u64 {
 ///
 /// `value` must be a float created by this runtime. The Gleam type system
 /// upholds this for calls from generated code.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn print_float(value: u64) -> u64 {
     println!("{:?}", float_value(value));
     NIL
@@ -1457,6 +1613,7 @@ pub unsafe extern "C" fn print_float(value: u64) -> u64 {
 ///
 /// `value` must be a string created by this runtime. The Gleam type system
 /// upholds this for calls from generated code.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn println(value: u64) -> u64 {
     println!("{}", string_value(value));
     NIL

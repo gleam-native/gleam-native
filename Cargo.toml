@@ -22,6 +22,7 @@ members = [
   "native-generation",
   "native-ir",
   "native-runtime",
+  "native-runtime-static",
   "src-span",
 ]
 

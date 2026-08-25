@@ -58,24 +58,6 @@ pub fn run(
         .map_err(|error| error.to_string())?;
 
     let pointer = jit_module.get_finalized_function(entry) as usize;
-    // Run on a dedicated thread with a large stack; tail calls run in
-    // constant space, and deep non-tail recursion gets generous room before
-    // the overflow handler reports it. A minimum of one megabyte keeps a
-    // misconfigured project able to reach `main` at all.
-    let stack_size = usize::try_from(stack_size_megabytes.max(1))
-        .unwrap_or(usize::MAX)
-        .saturating_mul(1024 * 1024);
-    std::thread::Builder::new()
-        .name("gleam-main".into())
-        .stack_size(stack_size)
-        .spawn(move || {
-            native_runtime::install_stack_overflow_handler();
-            let entry_function =
-                unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(pointer) };
-            let _ = entry_function();
-        })
-        .map_err(|error| format!("could not start the program thread: {error}"))?
-        .join()
-        .map_err(|_| "the program crashed".to_string())?;
-    Ok(())
+    let entry_function = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(pointer) };
+    native_runtime::run_program_thread(stack_size_megabytes, entry_function)
 }

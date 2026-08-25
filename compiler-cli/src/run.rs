@@ -281,12 +281,25 @@ fn run_native_command(
     }
 
     let build_directory = paths.build_directory_for_target(Mode::Dev, Target::Native);
+    let modules = load_native_modules(&build_directory).unwrap_or_else(|error| fail(error));
+
+    match native_generation::jit::run(&modules, module, arguments, stack_size_megabytes) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => fail(error),
+    }
+}
+
+/// Loads every native IR module from the package artefact directories of the
+/// given target build directory.
+pub(crate) fn load_native_modules(
+    build_directory: &Utf8PathBuf,
+) -> Result<Vec<native_ir::Module>, String> {
     let mut modules = vec![];
-    let packages = std::fs::read_dir(&build_directory)
-        .unwrap_or_else(|error| fail(format!("could not read {build_directory}: {error}")));
+    let packages = std::fs::read_dir(build_directory)
+        .map_err(|error| format!("could not read {build_directory}: {error}"))?;
     for package in packages {
-        let package = package
-            .unwrap_or_else(|error| fail(format!("could not read {build_directory}: {error}")));
+        let package =
+            package.map_err(|error| format!("could not read {build_directory}: {error}"))?;
         let artefact_directory = package
             .path()
             .join(gleam_core::paths::ARTEFACT_DIRECTORY_NAME);
@@ -295,23 +308,19 @@ fn run_native_command(
         };
         for artefact in artefacts {
             let path = artefact
-                .unwrap_or_else(|error| fail(format!("could not read build artifacts: {error}")))
+                .map_err(|error| format!("could not read build artifacts: {error}"))?
                 .path();
             if path.extension() != Some(std::ffi::OsStr::new("nir")) {
                 continue;
             }
             let bytes = std::fs::read(&path)
-                .unwrap_or_else(|error| fail(format!("could not read {}: {error}", path.display())));
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
             let module = native_ir::decode(&bytes)
-                .unwrap_or_else(|error| fail(format!("in {}: {error}", path.display())));
+                .map_err(|error| format!("in {}: {error}", path.display()))?;
             modules.push(module);
         }
     }
-
-    match native_generation::jit::run(&modules, module, arguments, stack_size_megabytes) {
-        Ok(()) => std::process::exit(0),
-        Err(error) => fail(error),
-    }
+    Ok(modules)
 }
 
 fn write_javascript_entrypoint(

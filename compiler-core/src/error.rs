@@ -197,6 +197,9 @@ pub enum Error {
     #[error("{error}")]
     GitInitialization { error: String },
 
+    #[error("failed to generate native executable")]
+    NativeExecutableGeneration { error: String },
+
     #[error("io operation failed")]
     StandardIo {
         action: StandardIoAction,
@@ -1956,6 +1959,21 @@ with `gleam hex authenticate`."
                 );
                 vec![Diagnostic {
                     title: "Failed to initialize git repository".into(),
+                    text,
+                    hint: None,
+                    level: Level::Error,
+                    location: None,
+                }]
+            }
+
+            Error::NativeExecutableGeneration { error } => {
+                let text = format!(
+                    "An error occurred while generating the native executable:
+
+    {error}"
+                );
+                vec![Diagnostic {
+                    title: "Failed to generate native executable".into(),
                     text,
                     hint: None,
                     level: Level::Error,
