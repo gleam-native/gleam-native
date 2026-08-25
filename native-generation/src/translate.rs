@@ -62,6 +62,10 @@ pub const DEEP_EQ: &str = "gleam_native_eq";
 /// The symbol of the runtime's `echo` implementation.
 pub const ECHO: &str = "gleam_native_echo";
 
+/// The symbols of the runtime's reference counting operations.
+pub const INC: &str = "gleam_native_inc";
+pub const DEC: &str = "gleam_native_dec";
+
 /// The symbol of the runtime's panic/todo report-and-abort function.
 pub const PANIC: &str = "gleam_native_panic";
 
@@ -110,6 +114,8 @@ struct RuntimeFunctions {
     closure_new: FuncId,
     deep_eq: FuncId,
     echo: FuncId,
+    inc: FuncId,
+    dec: FuncId,
     panic: FuncId,
 }
 
@@ -137,6 +143,8 @@ impl RuntimeFunctions {
             closure_new: declare(CLOSURE_NEW, 1)?,
             deep_eq: declare(DEEP_EQ, 2)?,
             echo: declare(ECHO, 6)?,
+            inc: declare(INC, 1)?,
+            dec: declare(DEC, 1)?,
             panic: declare(PANIC, 7)?,
         })
     }
@@ -322,6 +330,7 @@ impl<'a, M: Module> Translator<'a, M> {
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
+            scope_owned: Vec::new(),
         };
         let result = function_translator.statements(body)?;
         builder.ins().return_(&[result]);
@@ -396,6 +405,7 @@ impl<'a, M: Module> Translator<'a, M> {
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
+            scope_owned: Vec::new(),
         };
         let result = function_translator.statements(body)?;
         builder.ins().return_(&[result]);
@@ -461,6 +471,11 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     pending: &'a mut Vec<PendingFunction>,
     wrappers: &'a mut HashMap<(String, String), FuncId>,
     generated_counter: &'a mut u32,
+    /// Named variable slots holding owned references, decremented when
+    /// their scope's statement sequence finishes — or just before its final
+    /// statement, for bindings the final statement does not mention, so that
+    /// tail-recursive loops release their garbage every iteration.
+    scope_owned: Vec<(String, Variable)>,
 }
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
@@ -488,6 +503,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 .get(name)
                 .ok_or_else(|| format!("unbound capture `{name}`"))?;
             let value = self.builder.use_var(*variable);
+            let _ = self.inc(value);
             let _ = self.builder.ins().store(
                 MemFlagsData::trusted(),
                 value,
@@ -571,16 +587,66 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     }
 
     /// Translates a statement sequence, returning the value of the last one.
+    /// Emits a reference count increment. Yields the value for chaining.
+    fn inc(&mut self, value: Value) -> Value {
+        let inc_ref = self
+            .module
+            .declare_func_in_func(self.runtime.inc, self.builder.func);
+        let _ = self.builder.ins().call(inc_ref, &[value]);
+        value
+    }
+
+    /// Emits a reference count decrement.
+    fn dec(&mut self, value: Value) {
+        let dec_ref = self
+            .module
+            .declare_func_in_func(self.runtime.dec, self.builder.func);
+        let _ = self.builder.ins().call(dec_ref, &[value]);
+    }
+
+    /// Translates a statement sequence with ownership bookkeeping: values of
+    /// discarded statements are decremented immediately, `let`-bound slots
+    /// are decremented when the sequence finishes, and a final `let`'s value
+    /// is incremented since both the binding and the sequence result own it.
     fn statements(&mut self, statements: &[native_ir::Statement]) -> Result<Value, String> {
-        let mut last = None;
-        for statement in statements {
-            last = Some(match statement {
-                native_ir::Statement::Expression(expression) => self.expression(expression)?,
+        let scope_start = self.scope_owned.len();
+        let mut result = None;
+        for (index, statement) in statements.iter().enumerate() {
+            let is_final = index + 1 == statements.len();
+            if is_final {
+                // Release bindings the final statement does not mention now,
+                // so a tail call does not keep them alive down the recursion.
+                let free = native_ir::free_variables(
+                    std::slice::from_ref(statement),
+                    &std::collections::HashSet::new(),
+                );
+                let tail = self.scope_owned.split_off(scope_start);
+                for (name, slot) in tail {
+                    if free.contains(&name) {
+                        self.scope_owned.push((name, slot));
+                    } else {
+                        let value = self.builder.use_var(slot);
+                        self.dec(value);
+                    }
+                }
+            }
+            result = Some(match statement {
+                native_ir::Statement::Expression(expression) => {
+                    let value = self.expression(expression)?;
+                    if !is_final {
+                        self.dec(value);
+                    }
+                    value
+                }
                 native_ir::Statement::Let { name, value } => {
                     let value = self.expression(value)?;
                     let variable = self.builder.declare_var(types::I64);
                     self.builder.def_var(variable, value);
                     let _ = self.environment.insert(name.clone(), variable);
+                    self.scope_owned.push((name.clone(), variable));
+                    if is_final {
+                        let _ = self.inc(value);
+                    }
                     value
                 }
                 native_ir::Statement::Destructure {
@@ -606,14 +672,25 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     )?;
                     self.builder.seal_block(join);
                     self.builder.switch_to_block(join);
-                    self.builder.block_params(join)[0]
+                    let result = self.builder.block_params(join)[0];
+                    if !is_final {
+                        self.dec(result);
+                    }
+                    result
                 }
             });
         }
-        match last {
-            Some(value) => Ok(value),
-            None => Ok(self.builder.ins().iconst(types::I64, NIL)),
+        let result = match result {
+            Some(value) => value,
+            None => self.builder.ins().iconst(types::I64, NIL),
+        };
+        // Release everything this scope's bindings still own.
+        while self.scope_owned.len() > scope_start {
+            let (_, slot) = self.scope_owned.pop().expect("scope slot");
+            let value = self.builder.use_var(slot);
+            self.dec(value);
         }
+        Ok(result)
     }
 
     fn expression(&mut self, expression: &native_ir::Expression) -> Result<Value, String> {
@@ -662,7 +739,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .environment
                     .get(name)
                     .ok_or_else(|| format!("unbound variable `{name}`"))?;
-                Ok(self.builder.use_var(*variable))
+                let value = self.builder.use_var(*variable);
+                Ok(self.inc(value))
             }
 
             native_ir::Expression::Block(statements) => self.statements(statements),
@@ -683,7 +761,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
                 let function_ref = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(function_ref, &values);
-                Ok(self.builder.inst_results(call)[0])
+                let result = self.builder.inst_results(call)[0];
+                // The callee borrowed the arguments.
+                for value in values {
+                    self.dec(value);
+                }
+                Ok(result)
             }
 
             native_ir::Expression::StringConcat(left, right) => {
@@ -693,7 +776,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .module
                     .declare_func_in_func(self.runtime.string_concat, self.builder.func);
                 let call = self.builder.ins().call(concat_ref, &[left, right]);
-                Ok(self.builder.inst_results(call)[0])
+                let result = self.builder.inst_results(call)[0];
+                self.dec(left);
+                self.dec(right);
+                Ok(result)
             }
 
             native_ir::Expression::Case {
@@ -713,7 +799,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.builder.seal_block(join);
 
                 self.builder.switch_to_block(join);
-                Ok(self.builder.block_params(join)[0])
+                let result = self.builder.block_params(join)[0];
+                for subject in variables.values() {
+                    self.dec(*subject);
+                }
+                Ok(result)
             }
 
             native_ir::Expression::Constructor { tag, arguments } => {
@@ -741,12 +831,15 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
             native_ir::Expression::FieldAccess { record, index } => {
                 let record = self.expression(record)?;
-                Ok(self.builder.ins().load(
+                let field = self.builder.ins().load(
                     types::I64,
                     MemFlagsData::trusted(),
                     record,
                     8 + 8 * *index as i32,
-                ))
+                );
+                let _ = self.inc(field);
+                self.dec(record);
+                Ok(field)
             }
 
             native_ir::Expression::Lambda { parameters, body } => {
@@ -831,7 +924,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .builder
                     .import_signature(gleam_signature(values.len()));
                 let call = self.builder.ins().call_indirect(signature, code, &values);
-                Ok(self.builder.inst_results(call)[0])
+                let result = self.builder.inst_results(call)[0];
+                // The callee borrowed the closure and the arguments.
+                for value in values {
+                    self.dec(value);
+                }
+                Ok(result)
             }
 
             native_ir::Expression::Echo {
@@ -852,9 +950,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     },
                 );
                 let value = self.expression(value)?;
-                let message = match message {
-                    Some(message) => self.expression(message)?,
-                    None => self.builder.ins().iconst(types::I64, 0),
+                let (message, message_owned) = match message {
+                    Some(message) => (self.expression(message)?, true),
+                    None => (self.builder.ins().iconst(types::I64, 0), false),
                 };
                 let module_name = self.module_name.to_string();
                 let (module_pointer, module_length) =
@@ -867,7 +965,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     echo_ref,
                     &[kind, value, message, module_pointer, module_length, line],
                 );
-                Ok(self.builder.inst_results(call)[0])
+                let result = self.builder.inst_results(call)[0];
+                if message_owned {
+                    self.dec(message);
+                }
+                Ok(result)
             }
 
             native_ir::Expression::Panic {
@@ -892,7 +994,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             } => {
                 let left = self.expression(left)?;
                 let right = self.expression(right)?;
-                self.int_binary(*operator, left, right)
+                let result = self.int_binary(*operator, left, right)?;
+                self.dec(left);
+                self.dec(right);
+                Ok(result)
             }
 
             native_ir::Expression::IntCompare {
@@ -910,7 +1015,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 };
                 let left = self.expression(left)?;
                 let right = self.expression(right)?;
-                self.int_compare(condition, left, right)
+                let result = self.int_compare(condition, left, right)?;
+                self.dec(left);
+                self.dec(right);
+                Ok(result)
             }
 
             native_ir::Expression::Equality {
@@ -921,7 +1029,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             } => {
                 let left = self.expression(left)?;
                 let right = self.expression(right)?;
-                match kind {
+                let result = match kind {
                     // Bool and Nil are always tagged immediates: word
                     // equality is value equality.
                     native_ir::EqualityKind::Immediate => {
@@ -981,7 +1089,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             Ok(result)
                         }
                     }
-                }
+                }?;
+                self.dec(left);
+                self.dec(right);
+                Ok(result)
             }
 
             native_ir::Expression::BoolNot(expression) => {
@@ -1033,10 +1144,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 left,
                 right,
             } => {
-                let left = self.expression(left)?;
-                let right = self.expression(right)?;
-                let left = self.load_float(left);
-                let right = self.load_float(right);
+                let left_boxed = self.expression(left)?;
+                let right_boxed = self.expression(right)?;
+                let left = self.load_float(left_boxed);
+                let right = self.load_float(right_boxed);
                 let result = match operator {
                     native_ir::FloatOperator::Add => self.builder.ins().fadd(left, right),
                     native_ir::FloatOperator::Subtract => self.builder.ins().fsub(left, right),
@@ -1052,7 +1163,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         self.builder.ins().select(divisor_is_zero, zero, quotient)
                     }
                 };
-                self.box_float(result)
+                let result = self.box_float(result)?;
+                self.dec(left_boxed);
+                self.dec(right_boxed);
+                Ok(result)
             }
 
             native_ir::Expression::FloatCompare {
@@ -1068,12 +1182,15 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         FloatCC::GreaterThanOrEqual
                     }
                 };
-                let left = self.expression(left)?;
-                let right = self.expression(right)?;
-                let left = self.load_float(left);
-                let right = self.load_float(right);
+                let left_boxed = self.expression(left)?;
+                let right_boxed = self.expression(right)?;
+                let left = self.load_float(left_boxed);
+                let right = self.load_float(right_boxed);
                 let flag = self.builder.ins().fcmp(condition, left, right);
-                Ok(self.tag_boolean_flag(flag))
+                let result = self.tag_boolean_flag(flag);
+                self.dec(left_boxed);
+                self.dec(right_boxed);
+                Ok(result)
             }
         }
     }
@@ -1097,20 +1214,38 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     DecisionMode::Case => Some(self.environment.clone()),
                     DecisionMode::Assignment { .. } => None,
                 };
+                let mut binding_slots = Vec::with_capacity(bindings.len());
                 for (name, bound) in bindings {
                     let value = match bound {
-                        native_ir::Bound::Variable(id) => *variables
-                            .get(id)
-                            .ok_or_else(|| format!("unbound decision variable {id}"))?,
+                        native_ir::Bound::Variable(id) => {
+                            let value = *variables
+                                .get(id)
+                                .ok_or_else(|| format!("unbound decision variable {id}"))?;
+                            // The binding shares the container's reference.
+                            self.inc(value)
+                        }
                         native_ir::Bound::Value(expression) => self.expression(expression)?,
                     };
                     let variable = self.builder.declare_var(types::I64);
                     self.builder.def_var(variable, value);
                     let _ = self.environment.insert(name.clone(), variable);
+                    binding_slots.push((name.clone(), variable));
                 }
                 let result = match mode {
-                    DecisionMode::Case => self.statements(body)?,
-                    DecisionMode::Assignment { result, .. } => result,
+                    DecisionMode::Case => {
+                        let result = self.statements(body)?;
+                        // Clause bindings end with the clause.
+                        for (_, slot) in binding_slots {
+                            let value = self.builder.use_var(slot);
+                            self.dec(value);
+                        }
+                        result
+                    }
+                    DecisionMode::Assignment { result, .. } => {
+                        // Assignment bindings live on in the enclosing scope.
+                        self.scope_owned.extend(binding_slots);
+                        result
+                    }
                 };
                 self.builder.ins().jump(join, &[result.into()]);
                 if let Some(environment) = saved_environment {
@@ -1153,16 +1288,21 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 // The pattern's bindings are in scope for the guard and the
                 // clause body, but not for the rest of the tree.
                 let saved_environment = self.environment.clone();
+                let mut binding_slots = Vec::with_capacity(bindings.len());
                 for (name, bound) in bindings {
                     let value = match bound {
-                        native_ir::Bound::Variable(id) => *variables
-                            .get(id)
-                            .ok_or_else(|| format!("unbound decision variable {id}"))?,
+                        native_ir::Bound::Variable(id) => {
+                            let value = *variables
+                                .get(id)
+                                .ok_or_else(|| format!("unbound decision variable {id}"))?;
+                            self.inc(value)
+                        }
                         native_ir::Bound::Value(expression) => self.expression(expression)?,
                     };
                     let variable = self.builder.declare_var(types::I64);
                     self.builder.def_var(variable, value);
                     let _ = self.environment.insert(name.clone(), variable);
+                    binding_slots.push(variable);
                 }
 
                 let guard_value = self.expression(guard)?;
@@ -1177,10 +1317,18 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
                 self.builder.switch_to_block(true_block);
                 let result = self.statements(if_true)?;
+                for slot in &binding_slots {
+                    let value = self.builder.use_var(*slot);
+                    self.dec(value);
+                }
                 self.builder.ins().jump(join, &[result.into()]);
                 self.environment = saved_environment;
 
                 self.builder.switch_to_block(false_block);
+                for slot in &binding_slots {
+                    let value = self.builder.use_var(*slot);
+                    self.dec(value);
+                }
                 self.decision(variables, if_false, join, mode)
             }
 
@@ -1292,6 +1440,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let literal =
                     self.construct_from_constant_bytes(bytes, self.runtime.bigint_from_bytes)?;
                 let equal = self.int_compare(IntCC::Equal, subject, literal)?;
+                self.dec(literal);
                 Ok(self.builder.ins().band_imm_u(equal, 2))
             }
             native_ir::Check::Float(value) => {
@@ -1312,6 +1461,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .declare_func_in_func(self.runtime.string_eq, self.builder.func);
                 let call = self.builder.ins().call(eq_ref, &[subject, literal]);
                 let equal = self.builder.inst_results(call)[0];
+                self.dec(literal);
                 Ok(self.builder.ins().band_imm_u(equal, 2))
             }
         }

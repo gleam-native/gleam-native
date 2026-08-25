@@ -24,7 +24,8 @@ Cranelift IR and JIT-executed by the `native-generation` crate against the
 `native-runtime` crate. Values are tagged 64-bit words (low bit 1 = 63-bit
 small integer, low bit 0 = 8-byte-aligned heap pointer). Every heap object
 starts with a header word (kind, and for records the variant tag and field
-count), enabling polymorphic deep equality and `echo`. Gleam functions use
+count), enabling polymorphic deep equality and `echo`, and carries a
+reference count in the word before the pointer. Gleam functions use
 Cranelift's `tail` calling convention; runtime and external calls use the
 platform C convention.
 
@@ -153,9 +154,16 @@ platform C convention.
   lowered
 - 🚧 Value formatting exists as the runtime's structural `inspect`; a
   `gleam/string.inspect` equivalent with constructor names is future work
-- ❌ Reference counting — currently every heap allocation leaks. Gleam data
-  is immutable and acyclic so plain RC is sound; insertion as an IR-to-IR
-  pass with liveness-based drops, Perceus-style reuse later
+- ✅ Reference counting: a count word before every heap object, with
+  mechanical local ownership rules inserted during code generation
+  (expressions yield owned references, variable reads share, container
+  stores consume, scopes release bindings on exit, callers release borrowed
+  arguments). Bindings a sequence's final statement does not mention are
+  released early, so tail-recursive loops free their garbage every
+  iteration (verified: an allocation-churn program runs at baseline memory).
+  Destruction is worklist-based, so long lists do not overflow the stack.
+  Counts are runtime calls today; Perceus-style reuse and inline fast paths
+  are future optimization work
 - ❌ Stack traces or at least source positions on panics
 - ❌ `main` receiving arguments / `argv` access, exit code propagation
   (`gleam run` currently always exits 0 on success)

@@ -21,8 +21,12 @@
 //! - float: `[header, f64]` — generated code loads the payload directly
 //! - closure: `[header, code pointer, captures...]`
 //!
-//! Heap allocations are currently leaked: reference counting is not yet
-//! implemented.
+//! Every heap object also has a reference count in the word immediately
+//! before the pointer generated code holds (so all payload offsets are
+//! unchanged by it). Generated code calls [`gleam_native_inc`] and
+//! [`gleam_native_dec`]; a count reaching zero frees the object and
+//! decrements its children via a worklist, so destroying a long list does
+//! not recurse.
 //!
 //! These functions use the platform C calling convention and are registered
 //! with the JIT by name via [`symbols`], so they need no `#[no_mangle]`.
@@ -68,47 +72,43 @@ fn record_arity(header: u64) -> u32 {
     ((header >> 32) & 0xFFFF) as u32
 }
 
+/// A boxed Rust payload: reference count, header, value. The value word
+/// generated code holds points at `header`, so the count lives at offset
+/// -8 and all payload offsets are unaffected.
 #[repr(C)]
-struct HeapBigInt {
+struct HeapBox<T> {
+    reference_count: u64,
     header: u64,
-    value: BigInt,
-}
-
-#[repr(C)]
-struct HeapFloat {
-    header: u64,
-    value: f64,
-}
-
-#[repr(C)]
-struct HeapString {
-    header: u64,
-    value: String,
+    value: T,
 }
 
 pub fn tag_small_int(value: i64) -> u64 {
     ((value << 1) | 1) as u64
 }
 
-fn box_bigint(value: BigInt) -> u64 {
-    Box::into_raw(Box::new(HeapBigInt {
-        header: KIND_BIGINT,
+fn box_heap<T>(kind: u64, value: T) -> u64 {
+    let base = Box::into_raw(Box::new(HeapBox {
+        reference_count: 1,
+        header: kind,
         value,
-    })) as u64
+    }));
+    base as u64 + 8
+}
+
+fn container<T>(value: u64) -> *mut HeapBox<T> {
+    (value - 8) as *mut HeapBox<T>
+}
+
+fn box_bigint(value: BigInt) -> u64 {
+    box_heap(KIND_BIGINT, value)
 }
 
 fn box_float(value: f64) -> u64 {
-    Box::into_raw(Box::new(HeapFloat {
-        header: KIND_FLOAT,
-        value,
-    })) as u64
+    box_heap(KIND_FLOAT, value)
 }
 
 fn box_string(value: String) -> u64 {
-    Box::into_raw(Box::new(HeapString {
-        header: KIND_STRING,
-        value,
-    })) as u64
+    box_heap(KIND_STRING, value)
 }
 
 fn heap_header(value: u64) -> u64 {
@@ -116,15 +116,15 @@ fn heap_header(value: u64) -> u64 {
 }
 
 fn bigint_value(value: u64) -> &'static BigInt {
-    unsafe { &(*(value as *const HeapBigInt)).value }
+    unsafe { &(*container::<BigInt>(value)).value }
 }
 
 fn float_value(value: u64) -> f64 {
-    unsafe { (*(value as *const HeapFloat)).value }
+    unsafe { (*container::<f64>(value)).value }
 }
 
 fn string_value(value: u64) -> &'static String {
-    unsafe { &(*(value as *const HeapString)).value }
+    unsafe { &(*container::<String>(value)).value }
 }
 
 fn record_field(value: u64, index: u32) -> u64 {
@@ -260,24 +260,83 @@ pub unsafe extern "C" fn gleam_native_string_eq(left: u64, right: u64) -> u64 {
 /// and field count, followed by `arity` field words which generated code
 /// stores immediately after this call.
 pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64) -> u64 {
-    let pointer = allocate_words(1 + arity as usize);
-    unsafe { *pointer = record_header(tag as u32, arity as u32) };
-    pointer as u64
+    let value = allocate_words(1 + arity as usize);
+    unsafe { *(value as *mut u64) = record_header(tag as u32, arity as u32) };
+    value
 }
 
 /// Allocates a closure: a header word, a slot for the code pointer, and
 /// `captures` capture words, all stored by generated code after this call.
 pub extern "C" fn gleam_native_closure_new(captures: u64) -> u64 {
-    let pointer = allocate_words(2 + captures as usize);
-    unsafe { *pointer = closure_header(captures as u32) };
-    pointer as u64
+    let value = allocate_words(2 + captures as usize);
+    unsafe { *(value as *mut u64) = closure_header(captures as u32) };
+    value
 }
 
-fn allocate_words(words: usize) -> *mut u64 {
-    let layout = std::alloc::Layout::array::<u64>(words).expect("heap object layout");
-    let pointer = unsafe { std::alloc::alloc(layout) } as *mut u64;
-    assert!(!pointer.is_null(), "heap allocation failed");
-    pointer
+/// Allocates `words` object words preceded by a reference count of one,
+/// returning the value pointer (which points at the first object word).
+fn allocate_words(words: usize) -> u64 {
+    let layout = word_layout(words);
+    let base = unsafe { std::alloc::alloc(layout) } as *mut u64;
+    assert!(!base.is_null(), "heap allocation failed");
+    unsafe { *base = 1 };
+    base as u64 + 8
+}
+
+fn word_layout(words: usize) -> std::alloc::Layout {
+    std::alloc::Layout::array::<u64>(1 + words).expect("heap object layout")
+}
+
+/// Increments a value's reference count. A no-op for immediates.
+pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
+    if value & 1 == 0 {
+        unsafe { *((value - 8) as *mut u64) += 1 };
+    }
+    value
+}
+
+/// Decrements a value's reference count, destroying the object when it
+/// reaches zero. Children are processed with a worklist so that destroying
+/// a long list does not overflow the stack. A no-op for immediates.
+pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
+    let mut worklist = vec![value];
+    while let Some(value) = worklist.pop() {
+        if value & 1 == 1 {
+            continue;
+        }
+        let count = (value - 8) as *mut u64;
+        unsafe { *count -= 1 };
+        if unsafe { *count } > 0 {
+            continue;
+        }
+        let header = heap_header(value);
+        match header_kind(header) {
+            KIND_RECORD => {
+                let arity = record_arity(header);
+                for index in 0..arity {
+                    worklist.push(record_field(value, index));
+                }
+                unsafe {
+                    std::alloc::dealloc(count as *mut u8, word_layout(1 + arity as usize))
+                };
+            }
+            KIND_CLOSURE => {
+                let captures = record_arity(header);
+                for index in 0..captures {
+                    // Captures sit one word past the code pointer.
+                    worklist.push(record_field(value, 1 + index));
+                }
+                unsafe {
+                    std::alloc::dealloc(count as *mut u8, word_layout(2 + captures as usize))
+                };
+            }
+            KIND_BIGINT => drop(unsafe { Box::from_raw(container::<BigInt>(value)) }),
+            KIND_FLOAT => drop(unsafe { Box::from_raw(container::<f64>(value)) }),
+            KIND_STRING => drop(unsafe { Box::from_raw(container::<String>(value)) }),
+            _ => {}
+        }
+    }
+    NIL
 }
 
 /// Structural equality between two values of the same Gleam type, returning
@@ -515,6 +574,8 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_closure_new as *const u8,
         ),
         ("gleam_native_eq", gleam_native_eq as *const u8),
+        ("gleam_native_inc", gleam_native_inc as *const u8),
+        ("gleam_native_dec", gleam_native_dec as *const u8),
         ("gleam_native_echo", gleam_native_echo as *const u8),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
@@ -538,6 +599,25 @@ mod tests {
             unsafe { *((record as *mut u64).add(1 + index)) = *field };
         }
         record
+    }
+
+    #[test]
+    fn reference_counting_lifecycle() {
+        // A record holding its own reference to a string.
+        let string = make_string("shared");
+        let record = make_record(0, &[gleam_native_inc(string)]);
+        // Drop our reference; the record still holds one.
+        let _ = gleam_native_dec(string);
+        assert_eq!(string_value(record_field(record, 0)), "shared");
+        // Destroying the record frees the string too.
+        let _ = gleam_native_dec(record);
+
+        // A long list must not overflow the stack when destroyed.
+        let mut list = NIL;
+        for n in 0..200_000 {
+            list = make_record(1, &[tag_small_int(n), list]);
+        }
+        let _ = gleam_native_dec(list);
     }
 
     #[test]
