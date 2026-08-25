@@ -131,8 +131,10 @@ platform C convention.
 - ❌ Bit arrays: construction and patterns with size/unit/signedness/
   endianness options, UTF codepoint segments; the per-target feature gates in
   `compiler-core/src/bit_array.rs` need `Native` rules
-- ❌ Constants (`const x = …`): compile-time construction into the data
-  section, or lazily-initialized globals
+- ✅ Constants (`const x = …`): inlined at use sites like the Erlang
+  target, covering scalars, tuples, lists, records, references to other
+  constants and to functions, `<>`, and module-qualified constants in
+  guards
 
 ## Runtime semantics and services
 

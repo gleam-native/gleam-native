@@ -39,15 +39,9 @@ fn lower_int(value: &BigInt) -> native_ir::Expression {
 pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
     let mut functions = Vec::new();
 
-    // Imports, type aliases, and custom type definitions generate no code:
-    // constructors are lowered to record allocations at their call sites.
-    if !module.definitions.constants.is_empty() {
-        return Err(Error::NativeUnsupportedFeature {
-            module: module.name.clone(),
-            feature: "module constants".into(),
-        });
-    }
-
+    // Imports, type aliases, custom type definitions, and constants
+    // generate no code: constructors are lowered to record allocations at
+    // their call sites, and constants are inlined where they are used.
     for function in &module.definitions.functions {
         let name = function
             .name
@@ -246,6 +240,9 @@ impl Lowerer<'_> {
                     function: name.clone().into(),
                     arity: *arity as u32,
                 }),
+                ValueConstructorVariant::ModuleConstant { literal, .. } => {
+                    self.constant(literal)
+                }
                 _ => Err(self.unsupported("this kind of value")),
             },
 
@@ -578,7 +575,7 @@ impl Lowerer<'_> {
                 })
             }
             ClauseGuard::FieldAccess { .. } => Err(self.unsupported("field access in guards")),
-            ClauseGuard::ModuleSelect { .. } => Err(self.unsupported("constants in guards")),
+            ClauseGuard::ModuleSelect { literal, .. } => self.constant(literal),
             ClauseGuard::Invalid { .. } => Err(self.unsupported("this guard expression")),
         }
     }
@@ -600,6 +597,78 @@ impl Lowerer<'_> {
                 Ok(native_ir::Expression::Bool(name == "True"))
             }
             Constant::Record { type_, .. } if type_.is_nil() => Ok(native_ir::Expression::Nil),
+            Constant::Record {
+                arguments,
+                record_constructor,
+                ..
+            } => {
+                let tag = record_constructor
+                    .as_deref()
+                    .and_then(|constructor| match &constructor.variant {
+                        ValueConstructorVariant::Record { variant_index, .. } => {
+                            Some(*variant_index as u32)
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| self.unsupported("this kind of constant"))?;
+                let arguments = arguments
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|argument| self.constant(&argument.value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(native_ir::Expression::Constructor { tag, arguments })
+            }
+            Constant::Tuple { elements, .. } => {
+                let arguments = elements
+                    .iter()
+                    .map(|element| self.constant(element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(native_ir::Expression::Constructor { tag: 0, arguments })
+            }
+            Constant::List { elements, .. } => {
+                let mut list = native_ir::Expression::EmptyList;
+                for element in elements.iter().rev() {
+                    list = native_ir::Expression::Constructor {
+                        tag: 1,
+                        arguments: vec![self.constant(element)?, list],
+                    };
+                }
+                Ok(list)
+            }
+            // A constant referring to another constant or to a function.
+            Constant::Var { constructor, .. } => {
+                let constructor = constructor
+                    .as_deref()
+                    .ok_or_else(|| self.unsupported("this kind of constant"))?;
+                match &constructor.variant {
+                    ValueConstructorVariant::ModuleConstant { literal, .. } => {
+                        self.constant(literal)
+                    }
+                    ValueConstructorVariant::ModuleFn {
+                        module,
+                        name,
+                        arity,
+                        ..
+                    } => Ok(native_ir::Expression::FunctionReference {
+                        module: module.clone().into(),
+                        function: name.clone().into(),
+                        arity: *arity as u32,
+                    }),
+                    _ => Err(self.unsupported("this kind of constant")),
+                }
+            }
+            Constant::BinaryOperator {
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                let left_type = left.type_();
+                let left = self.constant(left)?;
+                let right = self.constant(right)?;
+                self.binary_operator(*operator, &left_type, left, right)
+            }
             _ => Err(self.unsupported("this kind of constant")),
         }
     }
@@ -1597,6 +1666,66 @@ pub fn main() {
                     arguments: vec![native_ir::Expression::Int(1)],
                 }],
             })
+        );
+    }
+
+    #[test]
+    fn module_constants_are_inlined() {
+        let module = lower(
+            r#"const answer = 42
+
+const long_greeting = greeting <> "!"
+
+const greeting = "hello"
+
+const words = ["forty", "two"]
+
+pub fn main() {
+  let x = answer
+  let y = long_greeting
+  let z = words
+  x
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        assert_eq!(
+            body[0],
+            native_ir::Statement::Let {
+                name: "x".into(),
+                value: native_ir::Expression::Int(42),
+            }
+        );
+        // A constant referencing another constant inlines it recursively.
+        assert_eq!(
+            body[1],
+            native_ir::Statement::Let {
+                name: "y".into(),
+                value: native_ir::Expression::StringConcat(
+                    Box::new(native_ir::Expression::String("hello".into())),
+                    Box::new(native_ir::Expression::String("!".into())),
+                ),
+            }
+        );
+        assert_eq!(
+            body[2],
+            native_ir::Statement::Let {
+                name: "z".into(),
+                value: native_ir::Expression::Constructor {
+                    tag: 1,
+                    arguments: vec![
+                        native_ir::Expression::String("forty".into()),
+                        native_ir::Expression::Constructor {
+                            tag: 1,
+                            arguments: vec![
+                                native_ir::Expression::String("two".into()),
+                                native_ir::Expression::EmptyList,
+                            ],
+                        },
+                    ],
+                },
+            }
         );
     }
 
