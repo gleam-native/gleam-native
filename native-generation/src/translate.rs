@@ -1158,6 +1158,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     native_ir::ConstructorDisplay::Record { name } => match name.as_str() {
                         "Ok" => native_runtime::DISPLAY_OK,
                         "Error" => native_runtime::DISPLAY_ERROR,
+                        "Some" => native_runtime::DISPLAY_SOME,
+                        "None" => native_runtime::DISPLAY_NONE,
                         name => match self.display_ids.get(name) {
                             Some(id) => *id,
                             None => {

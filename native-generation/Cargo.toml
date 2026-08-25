@@ -11,6 +11,7 @@ license = "Apache-2.0"
 [dependencies]
 native-ir = { path = "../native-ir" }
 native-runtime = { path = "../native-runtime" }
+native-runtime-stdlib = { path = "../native-runtime-stdlib" }
 cranelift-codegen = { version = "0.135.0", features = ["all-native-arch"] }
 cranelift-frontend = "0.135.0"
 cranelift-jit = "0.135.0"

@@ -27,7 +27,10 @@ fn make_jit_module() -> Result<JITModule, String> {
         .map_err(|error| error.to_string())?;
 
     let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-    for (name, pointer) in native_runtime::symbols() {
+    let symbols = native_runtime::symbols()
+        .into_iter()
+        .chain(native_runtime_stdlib::symbols());
+    for (name, pointer) in symbols {
         let _ = jit_builder.symbol(name, pointer);
     }
     Ok(JITModule::new(jit_builder))

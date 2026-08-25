@@ -12,6 +12,11 @@
 //! would clash. It is compiled only as a standalone `staticlib` artifact
 //! that the `gleam` binary locates at export time.
 
+// Linked for its `#[no_mangle]` symbols alone: the standard library's
+// `@external(native, ...)` implementations, which generated code references
+// by name.
+use native_runtime_stdlib as _;
+
 unsafe extern "C" {
     /// The C-convention wrapper around the program's `main` function; the
     /// symbol name is `native_generation::translate::ENTRY_SYMBOL`. Declared

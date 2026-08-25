@@ -23,6 +23,7 @@ members = [
   "native-ir",
   "native-runtime",
   "native-runtime-static",
+  "native-runtime-stdlib",
   "src-span",
 ]
 

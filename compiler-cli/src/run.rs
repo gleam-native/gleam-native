@@ -315,25 +315,31 @@ fn run_native_command(
 /// `test` directory — the convention gleeunit uses on the other targets.
 /// Modules are visited in name order; functions in source order.
 fn native_test_functions(built: &Built) -> Vec<(String, String)> {
+    // Discovery reads the module interfaces rather than the compiled ASTs:
+    // modules already up to date in the build cache are not re-parsed, so
+    // they appear only as interfaces.
+    let root = &built.root_package.config.name;
     let mut modules: Vec<_> = built
-        .root_package
-        .modules
-        .iter()
-        .filter(|module| module.origin == Origin::Test)
+        .module_interfaces
+        .values()
+        .filter(|module| &module.package == root && module.origin == Origin::Test)
         .collect();
     modules.sort_by(|a, b| a.name.cmp(&b.name));
     let mut tests = vec![];
     for module in modules {
-        for function in &module.ast.definitions.functions {
-            let Some((_, name)) = &function.name else {
-                continue;
-            };
-            if function.publicity.is_public()
-                && function.arguments.is_empty()
-                && name.ends_with("_test")
-            {
-                tests.push((module.name.to_string(), name.to_string()));
-            }
+        let mut names: Vec<_> = module
+            .values
+            .iter()
+            .filter(|(name, value)| {
+                name.ends_with("_test")
+                    && value.publicity.is_public()
+                    && value.type_.fn_arity() == Some(0)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        for name in names {
+            tests.push((module.name.to_string(), name.to_string()));
         }
     }
     tests

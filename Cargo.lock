@@ -2420,6 +2420,7 @@ dependencies = [
  "cranelift-object",
  "native-ir",
  "native-runtime",
+ "native-runtime-stdlib",
  "target-lexicon",
 ]
 
@@ -2446,6 +2447,16 @@ name = "native-runtime-static"
 version = "1.0.0"
 dependencies = [
  "native-runtime",
+ "native-runtime-stdlib",
+]
+
+[[package]]
+name = "native-runtime-stdlib"
+version = "1.0.0"
+dependencies = [
+ "native-runtime",
+ "num-bigint 0.5.1",
+ "num-traits",
 ]
 
 [[package]]

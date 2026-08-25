@@ -52,6 +52,9 @@ pub const KIND_FLOAT: u64 = 2;
 pub const KIND_STRING: u64 = 3;
 pub const KIND_CLOSURE: u64 = 4;
 pub const KIND_BITARRAY: u64 = 5;
+/// A standard library dict, created by the runtime's dict functions rather
+/// than by generated code.
+pub const KIND_DICT: u64 = 6;
 
 /// The header word of a record with the given variant tag and field count.
 /// Code generation computes expected headers with this same formula, so a
@@ -71,9 +74,11 @@ pub const DISPLAY_TUPLE: u16 = 0;
 pub const DISPLAY_LIST: u16 = 1;
 pub const DISPLAY_OK: u16 = 2;
 pub const DISPLAY_ERROR: u16 = 3;
-pub const FIRST_INTERNED_DISPLAY: u16 = 4;
+pub const DISPLAY_SOME: u16 = 4;
+pub const DISPLAY_NONE: u16 = 5;
+pub const FIRST_INTERNED_DISPLAY: u16 = 6;
 
-fn record_display(header: u64) -> u16 {
+pub fn record_display(header: u64) -> u16 {
     (header >> 48) as u16
 }
 
@@ -86,10 +91,12 @@ pub fn set_constructor_names(names: Vec<String>) {
     let _ = CONSTRUCTOR_NAMES.set(names);
 }
 
-fn constructor_name(display: u16) -> Option<&'static str> {
+pub(crate) fn constructor_name(display: u16) -> Option<&'static str> {
     match display {
         DISPLAY_OK => Some("Ok"),
         DISPLAY_ERROR => Some("Error"),
+        DISPLAY_SOME => Some("Some"),
+        DISPLAY_NONE => Some("None"),
         _ => CONSTRUCTOR_NAMES
             .get()?
             .get((display - FIRST_INTERNED_DISPLAY) as usize)
@@ -104,15 +111,15 @@ const fn closure_header(captures: u32, arity: u32) -> u64 {
     KIND_CLOSURE | ((arity as u64) << 16) | ((captures as u64) << 32)
 }
 
-fn header_kind(header: u64) -> u64 {
+pub fn header_kind(header: u64) -> u64 {
     header & 0xFFFF
 }
 
-fn record_tag(header: u64) -> u32 {
+pub(crate) fn record_tag(header: u64) -> u32 {
     ((header >> 16) & 0xFFFF) as u32
 }
 
-fn record_arity(header: u64) -> u32 {
+pub fn record_arity(header: u64) -> u32 {
     ((header >> 32) & 0xFFFF) as u32
 }
 
@@ -143,56 +150,56 @@ fn container<T>(value: u64) -> *mut HeapBox<T> {
     (value - 8) as *mut HeapBox<T>
 }
 
-fn box_bigint(value: BigInt) -> u64 {
+pub(crate) fn box_bigint(value: BigInt) -> u64 {
     box_heap(KIND_BIGINT, value)
 }
 
-fn box_float(value: f64) -> u64 {
+pub fn box_float(value: f64) -> u64 {
     box_heap(KIND_FLOAT, value)
 }
 
-fn box_string(value: String) -> u64 {
+pub fn box_string(value: String) -> u64 {
     box_heap(KIND_STRING, value)
 }
 
-fn heap_header(value: u64) -> u64 {
+pub fn heap_header(value: u64) -> u64 {
     unsafe { *(value as *const u64) }
 }
 
-fn bigint_value(value: u64) -> &'static BigInt {
+pub(crate) fn bigint_value(value: u64) -> &'static BigInt {
     unsafe { &(*container::<BigInt>(value)).value }
 }
 
-fn float_value(value: u64) -> f64 {
+pub fn float_value(value: u64) -> f64 {
     unsafe { (*container::<f64>(value)).value }
 }
 
-fn string_value(value: u64) -> &'static String {
+pub fn string_value(value: u64) -> &'static String {
     unsafe { &(*container::<String>(value)).value }
 }
 
 /// A bit array's payload: a bit count and MSB-first packed bytes, the
 /// last byte zero-padded in its unused low bits.
-struct BitArrayPayload {
-    bits: u64,
-    bytes: Vec<u8>,
+pub struct BitArrayPayload {
+    pub bits: u64,
+    pub bytes: Vec<u8>,
 }
 
-fn box_bitarray(payload: BitArrayPayload) -> u64 {
+pub fn box_bitarray(payload: BitArrayPayload) -> u64 {
     box_heap(KIND_BITARRAY, payload)
 }
 
-fn bitarray_value(value: u64) -> &'static BitArrayPayload {
+pub fn bitarray_value(value: u64) -> &'static BitArrayPayload {
     unsafe { &(*container::<BitArrayPayload>(value)).value }
 }
 
-fn bitarray_value_mut(value: u64) -> &'static mut BitArrayPayload {
+pub(crate) fn bitarray_value_mut(value: u64) -> &'static mut BitArrayPayload {
     unsafe { &mut (*container::<BitArrayPayload>(value)).value }
 }
 
 /// Aborts on an invalid bit array operation. These are runtime limitations
 /// or bounds violations, reported like a panic.
-fn bitarray_panic(message: &str) -> ! {
+pub(crate) fn bitarray_panic(message: &str) -> ! {
     eprintln!("runtime error: bit array");
     eprintln!();
     eprintln!("{message}");
@@ -234,7 +241,7 @@ fn push_bit(payload: &mut BitArrayPayload, bit: bool) {
 }
 
 /// Appends `length` bits read from `source` starting at `offset`.
-fn append_bits(payload: &mut BitArrayPayload, source: &[u8], offset: u64, length: u64) {
+pub fn append_bits(payload: &mut BitArrayPayload, source: &[u8], offset: u64, length: u64) {
     if payload.bits.is_multiple_of(8) && offset.is_multiple_of(8) && length.is_multiple_of(8) {
         // Fully aligned fast path.
         let start = (offset / 8) as usize;
@@ -249,7 +256,7 @@ fn append_bits(payload: &mut BitArrayPayload, source: &[u8], offset: u64, length
 }
 
 /// The `length` bits at `offset`, MSB-first packed and zero-padded.
-fn extract_bits(payload: &BitArrayPayload, offset: u64, length: u64) -> Vec<u8> {
+pub(crate) fn extract_bits(payload: &BitArrayPayload, offset: u64, length: u64) -> Vec<u8> {
     if offset + length > payload.bits {
         bitarray_panic("This bit array read is out of range.");
     }
@@ -403,11 +410,11 @@ fn float_from_bytes(bytes: &[u8], little: bool) -> f64 {
     }
 }
 
-fn record_field(value: u64, index: u32) -> u64 {
+pub fn record_field(value: u64, index: u32) -> u64 {
     unsafe { *((value as *const u64).add(1 + index as usize)) }
 }
 
-fn untag(value: u64) -> BigInt {
+pub fn untag(value: u64) -> BigInt {
     if value & 1 == 1 {
         BigInt::from((value as i64) >> 1)
     } else {
@@ -415,7 +422,7 @@ fn untag(value: u64) -> BigInt {
     }
 }
 
-fn retag(value: BigInt) -> u64 {
+pub fn retag(value: BigInt) -> u64 {
     match value.to_i64() {
         Some(small) if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&small) => tag_small_int(small),
         _ => box_bigint(value),
@@ -579,7 +586,7 @@ pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u6
 }
 
 /// Builds a two-element tuple (a record with tag 0).
-fn make_tuple2(first: u64, second: u64) -> u64 {
+pub fn make_tuple2(first: u64, second: u64) -> u64 {
     let record = gleam_native_record_new(0, 2, DISPLAY_TUPLE as u64);
     unsafe {
         *((record as *mut u64).add(1)) = first;
@@ -589,21 +596,21 @@ fn make_tuple2(first: u64, second: u64) -> u64 {
 }
 
 /// Builds an `Ok` value (variant 0 of `Result`).
-fn make_ok(value: u64) -> u64 {
+pub fn make_ok(value: u64) -> u64 {
     let record = gleam_native_record_new(0, 1, DISPLAY_OK as u64);
     unsafe { *((record as *mut u64).add(1)) = value };
     record
 }
 
 /// Builds an `Error` value (variant 1 of `Result`).
-fn make_error(value: u64) -> u64 {
+pub fn make_error(value: u64) -> u64 {
     let record = gleam_native_record_new(1, 1, DISPLAY_ERROR as u64);
     unsafe { *((record as *mut u64).add(1)) = value };
     record
 }
 
 /// Builds a list (cons cells with tag 1) from already-owned values.
-fn make_list(values: Vec<u64>) -> u64 {
+pub fn make_list(values: Vec<u64>) -> u64 {
     let mut list = NIL;
     for value in values.into_iter().rev() {
         let cell = gleam_native_record_new(1, 2, DISPLAY_LIST as u64);
@@ -708,15 +715,30 @@ pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64)
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim(string: u64) -> u64 {
-    box_string(string_value(string).trim().to_string())
+    box_string(
+        string_value(string)
+            .trim_matches(TRIMMED_WHITESPACE)
+            .to_string(),
+    )
 }
+
+/// The whitespace characters `string.trim` removes on every target: ASCII
+/// whitespace plus next line and the line and paragraph separators, but
+/// not the various Unicode spaces.
+const TRIMMED_WHITESPACE: &[char] = &[
+    ' ', '\t', '\n', '\u{B}', '\u{C}', '\r', '\u{85}', '\u{2028}', '\u{2029}',
+];
 
 /// # Safety
 ///
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
-    box_string(string_value(string).trim_start().to_string())
+    box_string(
+        string_value(string)
+            .trim_start_matches(TRIMMED_WHITESPACE)
+            .to_string(),
+    )
 }
 
 /// # Safety
@@ -724,7 +746,11 @@ pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_end(string: u64) -> u64 {
-    box_string(string_value(string).trim_end().to_string())
+    box_string(
+        string_value(string)
+            .trim_end_matches(TRIMMED_WHITESPACE)
+            .to_string(),
+    )
 }
 
 /// The `length` grapheme clusters starting at grapheme index `start`
@@ -852,6 +878,25 @@ pub extern "C" fn gleam_native_int_to_string(value: u64) -> u64 {
     box_string(untag(value).to_string())
 }
 
+
+/// Renders a float the way Gleam writes floats: always with a decimal
+/// point, keeping exponent notation, and naming the non-finite values.
+pub(crate) fn format_float(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let rendered = format!("{value:?}");
+    match rendered.find('e') {
+        Some(position) if !rendered[..position].contains('.') => {
+            format!("{}.0{}", &rendered[..position], &rendered[position..])
+        }
+        _ => rendered,
+    }
+}
+
 /// A float rendered the way Gleam writes floats.
 ///
 /// # Safety
@@ -859,7 +904,7 @@ pub extern "C" fn gleam_native_int_to_string(value: u64) -> u64 {
 /// The argument must be a float created by this runtime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_float_to_string(value: u64) -> u64 {
-    box_string(format!("{:?}", float_value(value)))
+    box_string(format_float(float_value(value)))
 }
 
 /// Installs a handler that reports stack overflows (and other fatal memory
@@ -1104,6 +1149,10 @@ pub extern "C" fn gleam_native_bitarray_append_int(
     bits: u64,
     endian: u64,
 ) -> u64 {
+    // A negative size appends nothing, matching Erlang: `<<0:-8>>` is `<<>>`.
+    if bits & 1 == 1 && (bits as i64) < 0 {
+        return array;
+    }
     let bits = untag_bits(bits, "segment size");
     let value = untag(value);
     append_int_bits(bitarray_value_mut(array), &value, bits, is_little(endian));
@@ -1122,6 +1171,10 @@ pub unsafe extern "C" fn gleam_native_bitarray_append_float(
     bits: u64,
     endian: u64,
 ) -> u64 {
+    // A negative size appends nothing; see the integer segment case.
+    if bits & 1 == 1 && (bits as i64) < 0 {
+        return array;
+    }
     let bits = untag_bits(bits, "segment size");
     let bytes = float_to_bytes(float_value(value), bits, is_little(endian));
     let payload = bitarray_value_mut(array);
@@ -1389,7 +1442,7 @@ pub extern "C" fn gleam_native_closure_new(captures: u64, arity: u64) -> u64 {
 
 /// Allocates `words` object words preceded by a reference count of one,
 /// returning the value pointer (which points at the first object word).
-fn allocate_words(words: usize) -> u64 {
+pub(crate) fn allocate_words(words: usize) -> u64 {
     let layout = word_layout(words);
     let base = unsafe { std::alloc::alloc(layout) } as *mut u64;
     assert!(!base.is_null(), "heap allocation failed");
@@ -1452,10 +1505,194 @@ pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
             KIND_BITARRAY => {
                 drop(unsafe { Box::from_raw(container::<BitArrayPayload>(value)) })
             }
+            KIND_DICT => {
+                let payload = unsafe { Box::from_raw(container::<DictPayload>(value)) };
+                for (key, entry) in payload.value.map.iter() {
+                    worklist.push(key.0);
+                    worklist.push(*entry);
+                }
+                drop(payload);
+            }
             _ => {}
         }
     }
     NIL
+}
+
+
+// ---------------------------------------------------------------------------
+// Dicts and string trees
+//
+// These value shapes are part of the core value model — structural
+// equality, destruction, and `echo` must understand them — while the
+// `native-runtime-stdlib` crate provides the standard library's entry
+// points over them.
+
+/// The ordered map a dict (kind [`KIND_DICT`]) holds. Keys and values own
+/// a reference each.
+pub struct DictPayload {
+    pub map: std::collections::BTreeMap<DictKey, u64>,
+}
+
+/// A dict key, ordered by [`cmp_values`].
+pub struct DictKey(pub u64);
+
+impl Ord for DictKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_values(self.0, other.0)
+    }
+}
+
+impl PartialOrd for DictKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DictKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for DictKey {}
+
+/// A total order over Gleam values, consistent with structural equality:
+/// `Equal` exactly when [`deep_eq`] holds (floats excepted for NaN, which
+/// Gleam code cannot produce as a dict key in practice). Values of
+/// different types order by an arbitrary type rank; Gleam's type system
+/// keeps mixed-type keys to `Dynamic` dicts only.
+pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let rank = |value: u64| -> u8 {
+        if value & 1 == 1 {
+            return 0;
+        }
+        match header_kind(heap_header(value)) {
+            KIND_BIGINT => 0,
+            KIND_FLOAT => 1,
+            KIND_STRING => 2,
+            KIND_BITARRAY => 3,
+            KIND_RECORD => 4,
+            KIND_DICT => 5,
+            _ => 6,
+        }
+    };
+    let left_rank = rank(left);
+    match left_rank.cmp(&rank(right)) {
+        Ordering::Equal => {}
+        ordering => return ordering,
+    }
+    match left_rank {
+        // Integers compare numerically whether small or big.
+        0 => {
+            if left & 1 == 1 && right & 1 == 1 {
+                ((left as i64) >> 1).cmp(&((right as i64) >> 1))
+            } else {
+                untag(left).cmp(&untag(right))
+            }
+        }
+        1 => {
+            let left = float_value(left);
+            let right = float_value(right);
+            left.partial_cmp(&right).unwrap_or_else(|| left.total_cmp(&right))
+        }
+        2 => string_value(left).cmp(string_value(right)),
+        3 => {
+            let left = bitarray_value(left);
+            let right = bitarray_value(right);
+            (left.bits, &left.bytes).cmp(&(right.bits, &right.bytes))
+        }
+        4 => {
+            let left_header = heap_header(left) & HEADER_SEMANTIC_MASK;
+            let right_header = heap_header(right) & HEADER_SEMANTIC_MASK;
+            match left_header.cmp(&right_header) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+            for index in 0..record_arity(left_header) {
+                match cmp_values(record_field(left, index), record_field(right, index)) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+            }
+            Ordering::Equal
+        }
+        5 => {
+            let left = dict_payload(left);
+            let right = dict_payload(right);
+            match left.map.len().cmp(&right.map.len()) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+            for ((left_key, left_value), (right_key, right_value)) in
+                left.map.iter().zip(right.map.iter())
+            {
+                match cmp_values(left_key.0, right_key.0) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+                match cmp_values(*left_value, *right_value) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+            }
+            Ordering::Equal
+        }
+        // Closures and unknown kinds: identity order.
+        _ => left.cmp(&right),
+    }
+}
+
+pub fn dict_payload(value: u64) -> &'static DictPayload {
+    unsafe { &(*container::<DictPayload>(value)).value }
+}
+
+/// The dict's map, mutably; only sound for transient dicts, which the
+/// standard library uses linearly.
+pub fn dict_payload_mut(value: u64) -> &'static mut DictPayload {
+    unsafe { &mut (*container::<DictPayload>(value)).value }
+}
+
+pub fn box_dict(payload: DictPayload) -> u64 {
+    box_heap(KIND_DICT, payload)
+}
+
+/// Appends a string tree's text to the buffer with a worklist, so deep
+/// trees cannot overflow the stack. A native string tree is either a
+/// string or a (possibly nested) list of string trees, mirroring Erlang's
+/// iodata.
+fn flatten_tree(tree: u64, buffer: &mut String) {
+    let mut worklist = vec![tree];
+    while let Some(value) = worklist.pop() {
+        if value & 1 == 1 {
+            // The empty list: nothing to add.
+            continue;
+        }
+        let header = heap_header(value);
+        match header_kind(header) {
+            KIND_STRING => buffer.push_str(string_value(value)),
+            KIND_RECORD => {
+                // A cons cell: process the head before the tail.
+                worklist.push(record_field(value, 1));
+                worklist.push(record_field(value, 0));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Flattens a string tree into its text.
+pub fn tree_to_string(tree: u64) -> String {
+    let mut buffer = String::new();
+    flatten_tree(tree, &mut buffer);
+    buffer
+}
+
+/// Whether two string trees flatten to the same text; used by structural
+/// equality when the two sides have different shapes.
+pub(crate) fn trees_hold_equal_text(left: u64, right: u64) -> bool {
+    tree_to_string(left) == tree_to_string(right)
 }
 
 /// Structural equality between two values of the same Gleam type, returning
@@ -1465,7 +1702,7 @@ pub extern "C" fn gleam_native_eq(left: u64, right: u64) -> u64 {
     if deep_eq(left, right) { TRUE } else { FALSE }
 }
 
-fn deep_eq(left: u64, right: u64) -> bool {
+pub(crate) fn deep_eq(left: u64, right: u64) -> bool {
     if left == right {
         return true;
     }
@@ -1475,7 +1712,18 @@ fn deep_eq(left: u64, right: u64) -> bool {
         return false;
     }
     let left_header = heap_header(left) & HEADER_SEMANTIC_MASK;
-    if left_header != heap_header(right) & HEADER_SEMANTIC_MASK {
+    let right_header = heap_header(right) & HEADER_SEMANTIC_MASK;
+    if left_header != right_header {
+        // A string against a list can only be two string trees of different
+        // shapes (no other value of one type has both representations), so
+        // they compare by their flattened text.
+        let kinds = (header_kind(left_header), header_kind(right_header));
+        let list_display = |value: u64| record_display(heap_header(value)) == DISPLAY_LIST;
+        if kinds == (KIND_STRING, KIND_RECORD) && list_display(right)
+            || kinds == (KIND_RECORD, KIND_STRING) && list_display(left)
+        {
+            return trees_hold_equal_text(left, right);
+        }
         return false;
     }
     match header_kind(left_header) {
@@ -1491,6 +1739,18 @@ fn deep_eq(left: u64, right: u64) -> bool {
             let left = bitarray_value(left);
             let right = bitarray_value(right);
             left.bits == right.bits && left.bytes == right.bytes
+        }
+        KIND_DICT => {
+            let left = dict_payload(left);
+            let right = dict_payload(right);
+            left.map.len() == right.map.len()
+                && left
+                    .map
+                    .iter()
+                    .zip(right.map.iter())
+                    .all(|((left_key, left_value), (right_key, right_value))| {
+                        deep_eq(left_key.0, right_key.0) && deep_eq(*left_value, *right_value)
+                    })
         }
         // Closures are equal only when identical, handled above.
         _ => false,
@@ -1525,14 +1785,14 @@ fn inspect_string(string: &str) -> String {
     out
 }
 
-fn inspect(value: u64) -> String {
+pub fn inspect(value: u64) -> String {
     if value & 1 == 1 {
         return format!("{}", (value as i64) >> 1);
     }
     let header = heap_header(value);
     match header_kind(header) {
         KIND_BIGINT => format!("{}", bigint_value(value)),
-        KIND_FLOAT => format!("{:?}", float_value(value)),
+        KIND_FLOAT => format_float(float_value(value)),
         KIND_STRING => inspect_string(string_value(value)),
         KIND_CLOSURE => {
             // Parameters render as `a`, `b`, ... from the arity stored in
@@ -1606,6 +1866,14 @@ fn inspect(value: u64) -> String {
                 },
             }
         }
+        KIND_DICT => {
+            let entries: Vec<String> = dict_payload(value)
+                .map
+                .iter()
+                .map(|(key, entry)| format!("#({}, {})", inspect(key.0), inspect(*entry)))
+                .collect();
+            format!("dict.from_list([{}])", entries.join(", "))
+        }
         kind => format!("<unknown kind {kind}>"),
     }
 }
@@ -1633,7 +1901,7 @@ pub unsafe extern "C" fn gleam_native_echo(
     };
     let rendered = match kind {
         1 => format!("{}", untag(value)),
-        2 => format!("{:?}", float_value(value)),
+        2 => format_float(float_value(value)),
         3 => inspect_string(string_value(value)),
         4 => (if value == TRUE { "True" } else { "False" }).to_string(),
         5 => "Nil".to_string(),
@@ -1755,7 +2023,7 @@ pub extern "C" fn print_bool(value: u64) -> u64 {
 /// upholds this for calls from generated code.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn print_float(value: u64) -> u64 {
-    println!("{:?}", float_value(value));
+    println!("{}", format_float(float_value(value)));
     NIL
 }
 
