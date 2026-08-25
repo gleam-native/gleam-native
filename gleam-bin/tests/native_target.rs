@@ -201,6 +201,102 @@ pub fn main() -> Nil {
 }
 
 #[test]
+fn bit_arrays() {
+    let project = TestProject::new(
+        "bit_arrays",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+@external(native, "runtime", "print_float")
+pub fn print_float(value: Float) -> Nil
+
+@external(native, "runtime", "print_bool")
+pub fn print_bool(value: Bool) -> Nil
+
+fn parse_frame(packet: BitArray) -> String {
+  // Length-prefixed frame: 1-byte length, then that many bytes.
+  case packet {
+    <<length, payload:bytes-size(length), rest:bits>> ->
+      case payload, rest {
+        <<"hi">>, <<>> -> "greeting"
+        _, _ ->
+          case length {
+            3 -> "frame of three"
+            _ -> "other frame"
+          }
+      }
+    _ -> "malformed"
+  }
+}
+
+pub fn main() -> Nil {
+  // Dynamic length-prefixed parsing, including rejection.
+  println(parse_frame(<<2, "hi":utf8>>))
+  println(parse_frame(<<3, 7, 8, 9>>))
+  println(parse_frame(<<5, 1>>))
+
+  // Unaligned segments and the Erlang reference value for <<1000:12>>.
+  let assert <<first, tail:4>> = <<1000:12>>
+  print_int(first)
+  print_int(tail)
+  case <<1:1, 0:1, 1:1, 0:5, 10:4, 3:4>> {
+    <<a:1, _:1, c:1, _:5, high:4, low:4>> -> {
+      print_int(a * 100 + c * 10 + high - low)
+    }
+    _ -> println("no")
+  }
+
+  // Endianness and signedness.
+  let assert <<value:16-little>> = <<1, 2>>
+  print_int(value)
+  case <<255>> {
+    <<n:signed>> -> print_int(n)
+    _ -> println("no")
+  }
+
+  // Floats at 16, 32, and 64 bits round-trip through patterns.
+  case <<1.5:16, 2.5:32-little, 3.25>> {
+    <<a:16-float, b:32-float-little, c:float>> -> {
+      print_float(a)
+      print_float(b)
+      print_float(c)
+    }
+    _ -> println("no")
+  }
+
+  // Wide reads produce big integers; sizes may use arithmetic.
+  let width = 2
+  let assert <<head:size(width * 8), _:bits>> = <<513:16, 42>>
+  print_int(head)
+  let assert <<wide:size(128)>> = <<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0>>
+  print_bool(wide == 256)
+
+  // Encodings, native endianness, splices, and equality.
+  print_bool(<<"AB":utf16-little>> == <<65, 0, 66, 0>>)
+  print_bool(<<258:16-native>> == <<258:16-little>>)
+  print_bool(<<<<0xAB>>:bits-size(4)>> == <<0xA:4>>)
+}
+"#,
+    );
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gleam run failed.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = "greeting\nframe of three\nmalformed\n62\n8\n117\n513\n-1\n1.5\n2.5\n3.25\n513\nTrue\nTrue\nTrue\nTrue\n";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.\nstdout: {stdout}"
+    );
+}
+
+#[test]
 fn fizzbuzz() {
     let project = TestProject::new(
         "fizzbuzz",

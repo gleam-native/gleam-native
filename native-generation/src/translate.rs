@@ -57,8 +57,12 @@ pub const STRING_SLICE_FROM: &str = "gleam_native_string_slice_from";
 /// The symbols of the runtime's bit array operations.
 pub const BITARRAY_EMPTY: &str = "gleam_native_bitarray_empty";
 pub const BITARRAY_APPEND_INT: &str = "gleam_native_bitarray_append_int";
+pub const BITARRAY_APPEND_FLOAT: &str = "gleam_native_bitarray_append_float";
 pub const BITARRAY_APPEND_STRING: &str = "gleam_native_bitarray_append_string";
+pub const BITARRAY_APPEND_CODEPOINT: &str = "gleam_native_bitarray_append_codepoint";
 pub const BITARRAY_APPEND_BITS: &str = "gleam_native_bitarray_append_bits";
+pub const BITARRAY_READ_FLOAT: &str = "gleam_native_bitarray_read_float";
+pub const BITARRAY_IS_FINITE_FLOAT: &str = "gleam_native_bitarray_is_finite_float";
 pub const BITARRAY_SIZE_TEST: &str = "gleam_native_bitarray_size_test";
 pub const BITARRAY_BYTES_TEST: &str = "gleam_native_bitarray_bytes_test";
 pub const BITARRAY_REST_IS_BYTES: &str = "gleam_native_bitarray_rest_is_bytes";
@@ -129,8 +133,12 @@ struct RuntimeFunctions {
     string_slice_from: FuncId,
     bitarray_empty: FuncId,
     bitarray_append_int: FuncId,
+    bitarray_append_float: FuncId,
     bitarray_append_string: FuncId,
+    bitarray_append_codepoint: FuncId,
     bitarray_append_bits: FuncId,
+    bitarray_read_float: FuncId,
+    bitarray_is_finite_float: FuncId,
     bitarray_size_test: FuncId,
     bitarray_bytes_test: FuncId,
     bitarray_rest_is_bytes: FuncId,
@@ -169,8 +177,12 @@ impl RuntimeFunctions {
             string_slice_from: declare(STRING_SLICE_FROM, 2)?,
             bitarray_empty: declare(BITARRAY_EMPTY, 0)?,
             bitarray_append_int: declare(BITARRAY_APPEND_INT, 4)?,
-            bitarray_append_string: declare(BITARRAY_APPEND_STRING, 2)?,
-            bitarray_append_bits: declare(BITARRAY_APPEND_BITS, 2)?,
+            bitarray_append_float: declare(BITARRAY_APPEND_FLOAT, 4)?,
+            bitarray_append_string: declare(BITARRAY_APPEND_STRING, 4)?,
+            bitarray_append_codepoint: declare(BITARRAY_APPEND_CODEPOINT, 4)?,
+            bitarray_append_bits: declare(BITARRAY_APPEND_BITS, 4)?,
+            bitarray_read_float: declare(BITARRAY_READ_FLOAT, 4)?,
+            bitarray_is_finite_float: declare(BITARRAY_IS_FINITE_FLOAT, 4)?,
             bitarray_size_test: declare(BITARRAY_SIZE_TEST, 3)?,
             bitarray_bytes_test: declare(BITARRAY_BYTES_TEST, 4)?,
             bitarray_rest_is_bytes: declare(BITARRAY_REST_IS_BYTES, 2)?,
@@ -624,6 +636,30 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     }
 
     /// Translates a statement sequence, returning the value of the last one.
+    /// The runtime flag for an endianness: 0 big, 1 little, 2 native.
+    fn endian_flag(&mut self, endian: native_ir::Endian) -> Value {
+        self.builder.ins().iconst(
+            types::I64,
+            match endian {
+                native_ir::Endian::Big => 0,
+                native_ir::Endian::Little => 1,
+                native_ir::Endian::Native => 2,
+            },
+        )
+    }
+
+    /// The runtime flag for a string encoding: 0 utf8, 1 utf16, 2 utf32.
+    fn encoding_flag(&mut self, encoding: native_ir::StringEncoding) -> Value {
+        self.builder.ins().iconst(
+            types::I64,
+            match encoding {
+                native_ir::StringEncoding::Utf8 => 0,
+                native_ir::StringEncoding::Utf16 => 1,
+                native_ir::StringEncoding::Utf32 => 2,
+            },
+        )
+    }
+
     /// Emits an integer read out of a bit array with expression-valued
     /// offset and size (both tagged).
     fn emit_bits_read(
@@ -633,10 +669,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     ) -> Result<Value, String> {
         let offset = self.expression(&read.offset)?;
         let bits = self.expression(&read.bits)?;
-        let little = self
-            .builder
-            .ins()
-            .iconst(types::I64, read.little_endian as i64);
+        let endian = self.endian_flag(read.endian);
         let signed = self.builder.ins().iconst(types::I64, read.signed as i64);
         let read_ref = self
             .module
@@ -644,7 +677,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let call = self
             .builder
             .ins()
-            .call(read_ref, &[subject, offset, bits, little, signed]);
+            .call(read_ref, &[subject, offset, bits, endian, signed]);
         let result = self.builder.inst_results(call)[0];
         self.dec(offset);
         self.dec(bits);
@@ -1005,15 +1038,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 for segment in segments {
                     let value = self.expression(&segment.value)?;
                     array = match &segment.kind {
-                        native_ir::BitSegmentKind::Int {
-                            bits,
-                            little_endian,
-                        } => {
+                        native_ir::BitSegmentKind::Int { bits, endian } => {
                             let bits = self.expression(bits)?;
-                            let little = self
-                                .builder
-                                .ins()
-                                .iconst(types::I64, *little_endian as i64);
+                            let endian = self.endian_flag(*endian);
                             let append_ref = self.module.declare_func_in_func(
                                 self.runtime.bitarray_append_int,
                                 self.builder.func,
@@ -1021,23 +1048,73 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             let call = self
                                 .builder
                                 .ins()
-                                .call(append_ref, &[array, value, bits, little]);
-                            self.builder.inst_results(call)[0]
+                                .call(append_ref, &[array, value, bits, endian]);
+                            let result = self.builder.inst_results(call)[0];
+                            self.dec(bits);
+                            result
                         }
-                        native_ir::BitSegmentKind::Utf8String => {
+                        native_ir::BitSegmentKind::Float { bits, endian } => {
+                            let bits = self.expression(bits)?;
+                            let endian = self.endian_flag(*endian);
+                            let append_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_append_float,
+                                self.builder.func,
+                            );
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(append_ref, &[array, value, bits, endian]);
+                            let result = self.builder.inst_results(call)[0];
+                            self.dec(bits);
+                            result
+                        }
+                        native_ir::BitSegmentKind::String { encoding, endian } => {
+                            let encoding = self.encoding_flag(*encoding);
+                            let endian = self.endian_flag(*endian);
                             let append_ref = self.module.declare_func_in_func(
                                 self.runtime.bitarray_append_string,
                                 self.builder.func,
                             );
-                            let call = self.builder.ins().call(append_ref, &[array, value]);
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(append_ref, &[array, value, encoding, endian]);
                             self.builder.inst_results(call)[0]
                         }
-                        native_ir::BitSegmentKind::BitArraySplice => {
+                        native_ir::BitSegmentKind::Codepoint { encoding, endian } => {
+                            let encoding = self.encoding_flag(*encoding);
+                            let endian = self.endian_flag(*endian);
+                            let append_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_append_codepoint,
+                                self.builder.func,
+                            );
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(append_ref, &[array, value, encoding, endian]);
+                            self.builder.inst_results(call)[0]
+                        }
+                        native_ir::BitSegmentKind::BitArraySplice { bits } => {
+                            let (bits, has_bits) = match bits {
+                                Some(bits) => {
+                                    let bits = self.expression(bits)?;
+                                    let one = self.builder.ins().iconst(types::I64, 1);
+                                    (bits, one)
+                                }
+                                None => {
+                                    let placeholder = self.builder.ins().iconst(types::I64, 1);
+                                    let zero = self.builder.ins().iconst(types::I64, 0);
+                                    (placeholder, zero)
+                                }
+                            };
                             let append_ref = self.module.declare_func_in_func(
                                 self.runtime.bitarray_append_bits,
                                 self.builder.func,
                             );
-                            let call = self.builder.ins().call(append_ref, &[array, value]);
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(append_ref, &[array, value, bits, has_bits]);
                             self.builder.inst_results(call)[0]
                         }
                     };
@@ -1356,7 +1433,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             subject,
                             offset,
                             bits,
-                            little_endian,
+                            endian,
                             signed,
                         } => {
                             let subject = *variables
@@ -1366,10 +1443,35 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                                 name: String::new(),
                                 offset: offset.clone(),
                                 bits: bits.clone(),
-                                little_endian: *little_endian,
+                                endian: *endian,
                                 signed: *signed,
                             };
                             self.emit_bits_read(subject, &read)?
+                        }
+                        native_ir::Bound::BitsReadFloat {
+                            subject,
+                            offset,
+                            bits,
+                            endian,
+                        } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.expression(offset)?;
+                            let bits = self.expression(bits)?;
+                            let endian = self.endian_flag(*endian);
+                            let read_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_read_float,
+                                self.builder.func,
+                            );
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(read_ref, &[subject, offset, bits, endian]);
+                            let result = self.builder.inst_results(call)[0];
+                            self.dec(offset);
+                            self.dec(bits);
+                            result
                         }
                         native_ir::Bound::BitsSlice {
                             subject,
@@ -1493,7 +1595,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             subject,
                             offset,
                             bits,
-                            little_endian,
+                            endian,
                             signed,
                         } => {
                             let subject = *variables
@@ -1503,10 +1605,35 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                                 name: String::new(),
                                 offset: offset.clone(),
                                 bits: bits.clone(),
-                                little_endian: *little_endian,
+                                endian: *endian,
                                 signed: *signed,
                             };
                             self.emit_bits_read(subject, &read)?
+                        }
+                        native_ir::Bound::BitsReadFloat {
+                            subject,
+                            offset,
+                            bits,
+                            endian,
+                        } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.expression(offset)?;
+                            let bits = self.expression(bits)?;
+                            let endian = self.endian_flag(*endian);
+                            let read_ref = self.module.declare_func_in_func(
+                                self.runtime.bitarray_read_float,
+                                self.builder.func,
+                            );
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(read_ref, &[subject, offset, bits, endian]);
+                            let result = self.builder.inst_results(call)[0];
+                            self.dec(offset);
+                            self.dec(bits);
+                            result
                         }
                         native_ir::Bound::BitsSlice {
                             subject,
@@ -1743,9 +1870,15 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         self.dec(bits);
                         Ok(self.builder.ins().band_imm_u(matched, 2))
                     }
-                    native_ir::BitsTest::Bytes { offset, bytes } => {
+                    native_ir::BitsTest::Bytes {
+                        offset,
+                        bytes,
+                        bit_length,
+                    } => {
                         let offset = self.expression(offset)?;
-                        let (pointer, length) = self.constant_bytes(bytes)?;
+                        let (pointer, _byte_length) = self.constant_bytes(bytes)?;
+                        let bit_length =
+                            self.builder.ins().iconst(types::I64, *bit_length as i64);
                         let test_ref = self.module.declare_func_in_func(
                             self.runtime.bitarray_bytes_test,
                             self.builder.func,
@@ -1753,9 +1886,30 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         let call = self
                             .builder
                             .ins()
-                            .call(test_ref, &[subject, offset, pointer, length]);
+                            .call(test_ref, &[subject, offset, pointer, bit_length]);
                         let matched = self.builder.inst_results(call)[0];
                         self.dec(offset);
+                        Ok(self.builder.ins().band_imm_u(matched, 2))
+                    }
+                    native_ir::BitsTest::IsFiniteFloat {
+                        offset,
+                        bits,
+                        endian,
+                    } => {
+                        let offset = self.expression(offset)?;
+                        let bits = self.expression(bits)?;
+                        let endian = self.endian_flag(*endian);
+                        let test_ref = self.module.declare_func_in_func(
+                            self.runtime.bitarray_is_finite_float,
+                            self.builder.func,
+                        );
+                        let call = self
+                            .builder
+                            .ins()
+                            .call(test_ref, &[subject, offset, bits, endian]);
+                        let matched = self.builder.inst_results(call)[0];
+                        self.dec(offset);
+                        self.dec(bits);
                         Ok(self.builder.ins().band_imm_u(matched, 2))
                     }
                     native_ir::BitsTest::RestIsBytes { offset } => {

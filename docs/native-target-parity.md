@@ -84,8 +84,7 @@ platform C convention.
   (`[x, ..rest]`, nested patterns), and string prefixes
   (`"pre" <> rest`, including `as` bindings, in `case` and `let assert`)
   work, including untested final variants of exhaustive matches, whose
-  fields arrive via the fallback. Bit array patterns work within the
-  byte-aligned subset, including dynamic sizes
+  fields arrive via the fallback. Bit array patterns are fully supported
 - 🚧 Guards (`if` clauses): operators, negation, variables, tuple indexing,
   and scalar literal constants work (sharing the expression operator
   lowering). Not yet: field access and module constants in guards
@@ -132,17 +131,19 @@ platform C convention.
 - 🚧 Strings: UTF-8 heap objects with literals, concatenation, and equality
   done; ordering comparison and the grapheme operations the stdlib relies on
   still need runtime support
-- 🚧 Bit arrays: byte-aligned segments work, with both constant and dynamic
-  sizes — construction (int segments with size/unit expressions, endianness,
-  truncation, wide segments via big integers, utf8 strings, splices) and
-  patterns (literal matches via the compiler's pre-encoded bytes, sized and
-  endian/signed reads including `size(n)` referring to earlier segments,
-  outer variables, and size arithmetic; `bytes-size(n)` payloads;
-  `rest:bits` captures; reads wider than 64 bits produce big integers),
-  plus structural equality and `echo`. Segment sizes are validated at run
-  time. Not yet: non-byte-aligned sizes (a runtime error), floats,
-  UTF-16/32, codepoints; the per-target gates in
-  `compiler-core/src/bit_array.rs` still treat native like Erlang
+- ✅ Bit arrays: bit-granular storage with Erlang semantics — construction
+  and patterns support arbitrary (unaligned) constant and dynamic sizes,
+  big/little/native endianness, signedness, truncation, wide segments via
+  big integers, floats at 16 (half precision), 32, and 64 bits (only
+  finite floats match, via the finiteness test), UTF-8/16/32 strings
+  (literal pattern matches use the compiler's pre-encoded bytes),
+  codepoint construction segments, whole and sized bit array splices,
+  `bytes-size(n)` payloads, `rest:bits` captures, sizes referring to
+  earlier segments and outer variables with arithmetic, structural
+  equality, and `echo` (partial trailing bits print as `n:size(b)`).
+  Sizes are validated at run time. Codepoint and string *variable* reads in
+  patterns are rejected at code generation — exactly as on the JavaScript
+  target
 - ✅ Constants (`const x = …`): inlined at use sites like the Erlang
   target, covering scalars, tuples, lists, records, references to other
   constants and to functions, `<>`, and module-qualified constants in

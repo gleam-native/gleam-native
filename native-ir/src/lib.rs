@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 25;
+pub const FORMAT_VERSION: u32 = 26;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -238,19 +238,48 @@ pub struct BitSegment {
     pub kind: BitSegmentKind,
 }
 
+/// Byte order of a multi-byte segment. `Native` resolves to the host's
+/// byte order at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Endian {
+    Big,
+    Little,
+    Native,
+}
+
+/// A string segment's encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum StringEncoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BitSegmentKind {
     /// An integer segment, truncated to the segment size. The size is an
-    /// expression evaluating to the bit count (validated at run time to be
-    /// a non-negative multiple of 8).
+    /// expression evaluating to the bit count.
     Int {
         bits: Box<Expression>,
-        little_endian: bool,
+        endian: Endian,
     },
-    /// A string's UTF-8 bytes.
-    Utf8String,
-    /// Another bit array spliced in whole.
-    BitArraySplice,
+    /// A float segment of 16, 32 or 64 bits (validated at run time).
+    Float {
+        bits: Box<Expression>,
+        endian: Endian,
+    },
+    /// A string's bytes in the given encoding.
+    String {
+        encoding: StringEncoding,
+        endian: Endian,
+    },
+    /// A single UTF codepoint (a scalar value) in the given encoding.
+    Codepoint {
+        encoding: StringEncoding,
+        endian: Endian,
+    },
+    /// Another bit array spliced in, whole or its first `bits` bits.
+    BitArraySplice { bits: Option<Box<Expression>> },
 }
 
 /// A named segment read a bit array check materializes before evaluating:
@@ -262,7 +291,7 @@ pub struct SegmentRead {
     pub name: String,
     pub offset: Box<Expression>,
     pub bits: Box<Expression>,
-    pub little_endian: bool,
+    pub endian: Endian,
     pub signed: bool,
 }
 
@@ -274,10 +303,19 @@ pub enum BitsTest {
     Size { bits: Box<Expression>, exact: bool },
     /// A computed size is not negative.
     NonNegative { value: Box<Expression> },
-    /// The bytes at the offset equal these constant bytes.
+    /// The `bit_length` bits at the offset equal these constant bits
+    /// (MSB-first packed).
     Bytes {
         offset: Box<Expression>,
         bytes: Vec<u8>,
+        bit_length: u64,
+    },
+    /// The float at the given position is finite; float segments only
+    /// match finite values.
+    IsFiniteFloat {
+        offset: Box<Expression>,
+        bits: Box<Expression>,
+        endian: Endian,
     },
     /// The remainder past the offset is a whole number of bytes.
     RestIsBytes { offset: Box<Expression> },
@@ -334,8 +372,15 @@ pub enum Bound {
         subject: u32,
         offset: Box<Expression>,
         bits: Box<Expression>,
-        little_endian: bool,
+        endian: Endian,
         signed: bool,
+    },
+    /// A float read out of a bit array segment (16, 32 or 64 bits).
+    BitsReadFloat {
+        subject: u32,
+        offset: Box<Expression>,
+        bits: Box<Expression>,
+        endian: Endian,
     },
     /// A fresh bit array sliced out of another; `bits` of `None` means
     /// everything from the offset onwards.
@@ -553,8 +598,16 @@ fn expression_free(
         Expression::BitArray(segments) => {
             for segment in segments {
                 expression_free(&segment.value, bound, free);
-                if let BitSegmentKind::Int { bits, .. } = &segment.kind {
-                    expression_free(bits, bound, free);
+                match &segment.kind {
+                    BitSegmentKind::Int { bits, .. } | BitSegmentKind::Float { bits, .. } => {
+                        expression_free(bits, bound, free)
+                    }
+                    BitSegmentKind::BitArraySplice { bits: Some(bits) } => {
+                        expression_free(bits, bound, free)
+                    }
+                    BitSegmentKind::BitArraySplice { bits: None }
+                    | BitSegmentKind::String { .. }
+                    | BitSegmentKind::Codepoint { .. } => {}
                 }
             }
         }
@@ -698,6 +751,10 @@ fn check_free(check: &Check, bound: &mut HashSet<String>, free: &mut BTreeSet<St
         BitsTest::Bytes { offset, .. } | BitsTest::RestIsBytes { offset } => {
             expression_free(offset, bound, free)
         }
+        BitsTest::IsFiniteFloat { offset, bits, .. } => {
+            expression_free(offset, bound, free);
+            expression_free(bits, bound, free);
+        }
         BitsTest::AlwaysTrue => {}
     }
 }
@@ -706,7 +763,7 @@ fn bound_free(value: &Bound, bound: &mut HashSet<String>, free: &mut BTreeSet<St
     match value {
         Bound::Value(expression) => expression_free(expression, bound, free),
         Bound::Variable(_) | Bound::StringSlice { .. } => {}
-        Bound::BitsReadInt { offset, bits, .. } => {
+        Bound::BitsReadInt { offset, bits, .. } | Bound::BitsReadFloat { offset, bits, .. } => {
             expression_free(offset, bound, free);
             expression_free(bits, bound, free);
         }

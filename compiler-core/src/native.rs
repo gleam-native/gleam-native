@@ -770,26 +770,74 @@ impl Lowerer<'_> {
         use crate::ast::BitArrayOption;
         let mut size: Option<native_ir::Expression> = None;
         let mut unit: u32 = 1;
-        let mut little_endian = false;
-        let mut is_utf8 = false;
+        let mut endian = native_ir::Endian::Big;
+        let mut encoding = None;
+        let mut is_codepoint = false;
+        let mut is_float = false;
         let mut is_splice = false;
         for option in &segment.options {
             match option {
                 BitArrayOption::Int { .. } | BitArrayOption::Big { .. } => {}
                 BitArrayOption::Signed { .. } | BitArrayOption::Unsigned { .. } => {}
-                BitArrayOption::Little { .. } => little_endian = true,
-                BitArrayOption::Utf8 { .. } => is_utf8 = true,
+                BitArrayOption::Little { .. } => endian = native_ir::Endian::Little,
+                BitArrayOption::Native { .. } => endian = native_ir::Endian::Native,
+                BitArrayOption::Float { .. } => is_float = true,
+                BitArrayOption::Utf8 { .. } => encoding = Some(native_ir::StringEncoding::Utf8),
+                BitArrayOption::Utf16 { .. } => {
+                    encoding = Some(native_ir::StringEncoding::Utf16)
+                }
+                BitArrayOption::Utf32 { .. } => {
+                    encoding = Some(native_ir::StringEncoding::Utf32)
+                }
+                BitArrayOption::Utf8Codepoint { .. } => {
+                    encoding = Some(native_ir::StringEncoding::Utf8);
+                    is_codepoint = true;
+                }
+                BitArrayOption::Utf16Codepoint { .. } => {
+                    encoding = Some(native_ir::StringEncoding::Utf16);
+                    is_codepoint = true;
+                }
+                BitArrayOption::Utf32Codepoint { .. } => {
+                    encoding = Some(native_ir::StringEncoding::Utf32);
+                    is_codepoint = true;
+                }
                 BitArrayOption::Bytes { .. } | BitArrayOption::Bits { .. } => is_splice = true,
                 BitArrayOption::Size { value, .. } => size = Some(self.expression(value)?),
                 BitArrayOption::Unit { value, .. } => unit = *value as u32,
-                _ => return Err(self.unsupported("this bit array segment")),
             }
         }
-        if is_utf8 || segment.type_.is_string() {
-            return Ok(native_ir::BitSegmentKind::Utf8String);
+        if is_codepoint {
+            return Ok(native_ir::BitSegmentKind::Codepoint {
+                encoding: encoding.unwrap_or(native_ir::StringEncoding::Utf8),
+                endian,
+            });
+        }
+        if let Some(encoding) = encoding {
+            return Ok(native_ir::BitSegmentKind::String { encoding, endian });
+        }
+        if segment.type_.is_string() {
+            return Ok(native_ir::BitSegmentKind::String {
+                encoding: native_ir::StringEncoding::Utf8,
+                endian,
+            });
         }
         if is_splice || segment.type_.is_bit_array() {
-            return Ok(native_ir::BitSegmentKind::BitArraySplice);
+            return Ok(native_ir::BitSegmentKind::BitArraySplice {
+                bits: match size {
+                    Some(size) => Some(Box::new(Self::multiply(size, unit as u64))),
+                    None => None,
+                },
+            });
+        }
+        if is_float || segment.type_.is_float() {
+            let bits = Self::multiply(
+                size.unwrap_or(native_ir::Expression::Int(64)),
+                unit as u64,
+            );
+            return Ok(native_ir::BitSegmentKind::Float {
+                bits: Box::new(bits),
+                endian,
+            });
         }
         if !segment.type_.is_int() {
             return Err(self.unsupported("this bit array segment"));
@@ -800,7 +848,7 @@ impl Lowerer<'_> {
         );
         Ok(native_ir::BitSegmentKind::Int {
             bits: Box::new(bits),
-            little_endian,
+            endian,
         })
     }
 
@@ -929,6 +977,13 @@ impl Lowerer<'_> {
         })
     }
 
+    fn endian(endianness: crate::ast::Endianness) -> native_ir::Endian {
+        match endianness {
+            crate::ast::Endianness::Big => native_ir::Endian::Big,
+            crate::ast::Endianness::Little => native_ir::Endian::Little,
+        }
+    }
+
     /// The named segment reads a test refers to, materialized before it runs.
     fn segment_reads(
         &self,
@@ -946,7 +1001,7 @@ impl Lowerer<'_> {
                 name: Self::segment_variable_name(name),
                 offset: Box::new(self.offset_expression(&action.from)?),
                 bits: Box::new(bits),
-                little_endian: action.endianness == crate::ast::Endianness::Little,
+                endian: Self::endian(action.endianness),
                 signed: action.signed,
             });
         }
@@ -984,22 +1039,29 @@ impl Lowerer<'_> {
                     value = inner;
                 }
                 match value {
-                    BitArrayMatchedValue::LiteralInt { bits: Ok(bits), .. }
-                        if bits.len() % 8 == 0 =>
-                    {
+                    BitArrayMatchedValue::LiteralInt { bits: Ok(bits), .. } => {
+                        // Pack MSB-first, zero-padding the last byte.
+                        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+                        for (index, bit) in bits.iter().enumerate() {
+                            if *bit {
+                                bytes[index / 8] |= 1 << (7 - index % 8);
+                            }
+                        }
                         native_ir::BitsTest::Bytes {
                             offset,
-                            bytes: bits.clone().into_vec(),
+                            bytes,
+                            bit_length: bits.len() as u64,
                         }
                     }
-                    BitArrayMatchedValue::LiteralString {
-                        encoding: exhaustiveness::StringEncoding::Utf8,
-                        bytes,
-                        ..
-                    } => native_ir::BitsTest::Bytes {
-                        offset,
-                        bytes: bytes.clone(),
-                    },
+                    // The compiler pre-encodes literal strings with their
+                    // encoding and endianness.
+                    BitArrayMatchedValue::LiteralString { bytes, .. } => {
+                        native_ir::BitsTest::Bytes {
+                            offset,
+                            bytes: bytes.clone(),
+                            bit_length: bytes.len() as u64 * 8,
+                        }
+                    }
                     // Variables and discards always match; the check exists
                     // to materialize its reads.
                     BitArrayMatchedValue::Variable(_) | BitArrayMatchedValue::Discard(_) => {
@@ -1008,8 +1070,15 @@ impl Lowerer<'_> {
                     _ => return Err(self.unsupported("this bit array pattern")),
                 }
             }
-            BitArrayTest::SegmentIsFiniteFloat { .. } => {
-                return Err(self.unsupported("float bit array patterns"));
+            BitArrayTest::SegmentIsFiniteFloat { read_action } => {
+                let bits = self
+                    .read_size_expression(&read_action.size)?
+                    .ok_or_else(|| self.unsupported("this bit array pattern"))?;
+                native_ir::BitsTest::IsFiniteFloat {
+                    offset: Box::new(self.offset_expression(&read_action.from)?),
+                    bits: Box::new(bits),
+                    endian: Self::endian(read_action.endianness),
+                }
             }
         };
         Ok(native_ir::Check::BitArray { reads, test })
@@ -1226,9 +1295,14 @@ impl Lowerer<'_> {
                             subject,
                             offset,
                             bits: Box::new(bits),
-                            little_endian: read_action.endianness
-                                == crate::ast::Endianness::Little,
+                            endian: Self::endian(read_action.endianness),
                             signed: read_action.signed,
+                        },
+                        (ReadType::Float, Some(bits)) => native_ir::Bound::BitsReadFloat {
+                            subject,
+                            offset,
+                            bits: Box::new(bits),
+                            endian: Self::endian(read_action.endianness),
                         },
                         (ReadType::BitArray, bits) => native_ir::Bound::BitsSlice {
                             subject,
@@ -2110,6 +2184,89 @@ pub fn main() {
                 },
             }
         );
+    }
+
+    #[test]
+    fn bit_arrays() {
+        let module = lower(
+            r#"pub fn main(input: BitArray) {
+  let constructed = <<1, 513:16-little, "hi":utf16, 2.5:32-float, input:bits-size(4)>>
+  case input {
+    <<length, payload:bytes-size(length), _:bits>> -> payload
+    _ -> constructed
+  }
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        // Construction: five segments with the right kinds.
+        let native_ir::Statement::Let { value, .. } = &body[0] else {
+            panic!("expected a let");
+        };
+        let native_ir::Expression::BitArray(segments) = value else {
+            panic!("expected a bit array, got {value:?}");
+        };
+        let kinds: Vec<_> = segments.iter().map(|segment| &segment.kind).collect();
+        assert!(matches!(
+            kinds[0],
+            native_ir::BitSegmentKind::Int {
+                endian: native_ir::Endian::Big,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kinds[1],
+            native_ir::BitSegmentKind::Int {
+                endian: native_ir::Endian::Little,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kinds[2],
+            native_ir::BitSegmentKind::String {
+                encoding: native_ir::StringEncoding::Utf16,
+                ..
+            }
+        ));
+        assert!(matches!(kinds[3], native_ir::BitSegmentKind::Float { .. }));
+        assert!(matches!(
+            kinds[4],
+            native_ir::BitSegmentKind::BitArraySplice { bits: Some(_) }
+        ));
+
+        // The pattern produces bit array checks, and the dynamic
+        // `bytes-size(length)` payload read refers to the materialized
+        // `length` segment.
+        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[1]
+        else {
+            panic!("expected a case");
+        };
+        fn find_dynamic_read(decision: &native_ir::Decision) -> bool {
+            match decision {
+                native_ir::Decision::Run { bindings, .. } => {
+                    bindings.iter().any(|(_, bound)| match bound {
+                        native_ir::Bound::BitsSlice { bits: Some(bits), .. } => {
+                            format!("{bits:?}").contains("bit$length")
+                        }
+                        _ => false,
+                    })
+                }
+                native_ir::Decision::Switch {
+                    choices, fallback, ..
+                } => {
+                    choices
+                        .iter()
+                        .any(|(_, decision)| find_dynamic_read(decision))
+                        || find_dynamic_read(fallback)
+                }
+                native_ir::Decision::Guard {
+                    if_false, ..
+                } => find_dynamic_read(if_false),
+                native_ir::Decision::Fail => false,
+            }
+        }
+        assert!(find_dynamic_read(tree), "tree: {tree:#?}");
     }
 
     #[test]
