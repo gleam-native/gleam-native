@@ -33,6 +33,8 @@
 //! `native-runtime-static` static library, so each carries `#[no_mangle]` to
 //! keep its symbol name.
 
+use std::cell::Cell;
+
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use unicode_segmentation::UnicodeSegmentation;
@@ -155,7 +157,15 @@ pub(crate) fn box_bigint(value: BigInt) -> u64 {
 }
 
 pub fn box_float(value: f64) -> u64 {
-    box_heap(KIND_FLOAT, value)
+    // Floats go through the pooled word allocator rather than [`box_heap`]:
+    // the layouts agree ([`HeapBox<f64>`] is three words), and float churn
+    // in arithmetic loops is exactly what the pool recycles best.
+    let boxed = allocate_words(2);
+    unsafe {
+        *(boxed as *mut u64) = KIND_FLOAT;
+        *((boxed as *mut u64).add(1)) = value.to_bits();
+    }
+    boxed
 }
 
 pub fn box_string(value: String) -> u64 {
@@ -1442,7 +1452,25 @@ pub extern "C" fn gleam_native_closure_new(captures: u64, arity: u64) -> u64 {
 
 /// Allocates `words` object words preceded by a reference count of one,
 /// returning the value pointer (which points at the first object word).
+/// Recycles a freed allocation of the same size from the pool when one is
+/// available, falling back to the system allocator.
 pub(crate) fn allocate_words(words: usize) -> u64 {
+    let total = 1 + words;
+    if total < POOL_CLASSES {
+        let recycled = POOL.with(|pool| {
+            let head = pool.heads[total].get();
+            if head != 0 {
+                // The count word of a pooled block holds the next block.
+                pool.heads[total].set(unsafe { *(head as *const u64) });
+                pool.counts[total].set(pool.counts[total].get() - 1);
+            }
+            head
+        });
+        if recycled != 0 {
+            unsafe { *(recycled as *mut u64) = 1 };
+            return recycled + 8;
+        }
+    }
     let layout = word_layout(words);
     let base = unsafe { std::alloc::alloc(layout) } as *mut u64;
     assert!(!base.is_null(), "heap allocation failed");
@@ -1452,6 +1480,64 @@ pub(crate) fn allocate_words(words: usize) -> u64 {
 
 fn word_layout(words: usize) -> std::alloc::Layout {
     std::alloc::Layout::array::<u64>(1 + words).expect("heap object layout")
+}
+
+/// Reference counting frees objects deterministically, and hot loops free
+/// and re-request the same shapes over and over (cons cells above all), so
+/// freed fixed-size allocations sit on per-size free lists for
+/// [`allocate_words`] to hand straight back instead of going through the
+/// system allocator each time. A freed block stores the next free block's
+/// address in its count word, so the pool needs no memory of its own.
+struct Pool {
+    /// The first free block of each size class (0 when empty), indexed by
+    /// the block's total size in words, count word included.
+    heads: [Cell<u64>; POOL_CLASSES],
+    /// How many blocks each class holds, enforcing
+    /// [`POOL_CLASS_CAPACITY`].
+    counts: [Cell<u32>; POOL_CLASSES],
+}
+
+/// One class per total word count: count and header words plus up to 32
+/// fields. Larger objects use the system allocator directly.
+const POOL_CLASSES: usize = 35;
+
+/// The most blocks a size class retains. Frees beyond this go back to the
+/// system allocator, bounding how much freed memory the pool can hold onto
+/// after a large working set shrinks.
+const POOL_CLASS_CAPACITY: u32 = 4096;
+
+thread_local! {
+    static POOL: Pool = const {
+        Pool {
+            heads: [const { Cell::new(0) }; POOL_CLASSES],
+            counts: [const { Cell::new(0) }; POOL_CLASSES],
+        }
+    };
+}
+
+/// Frees an allocation of `total` words (count word included): into the
+/// pool when its size class has room, back to the system allocator
+/// otherwise.
+fn free_words(base: *mut u64, total: usize) {
+    let pooled = total < POOL_CLASSES
+        && POOL.with(|pool| {
+            let count = pool.counts[total].get();
+            if count >= POOL_CLASS_CAPACITY {
+                return false;
+            }
+            unsafe { *base = pool.heads[total].get() };
+            pool.heads[total].set(base as u64);
+            pool.counts[total].set(count + 1);
+            true
+        });
+    if !pooled {
+        unsafe {
+            std::alloc::dealloc(
+                base as *mut u8,
+                std::alloc::Layout::array::<u64>(total).expect("heap object layout"),
+            )
+        };
+    }
 }
 
 /// Increments a value's reference count. A no-op for immediates.
@@ -1464,58 +1550,92 @@ pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
 }
 
 /// Decrements a value's reference count, destroying the object when it
-/// reaches zero. Children are processed with a worklist so that destroying
-/// a long list does not overflow the stack. A no-op for immediates.
+/// reaches zero. A no-op for immediates. The common cases — an immediate,
+/// or a count that stays positive — touch nothing but the count word.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
-    let mut worklist = vec![value];
+    if value & 1 == 1 {
+        return NIL;
+    }
+    let count = (value - 8) as *mut u64;
+    unsafe {
+        *count -= 1;
+        if *count > 0 {
+            return NIL;
+        }
+    }
+    destroy(value);
+    NIL
+}
+
+thread_local! {
+    /// The reused worklist buffer for [`destroy`], so a destroy performs no
+    /// allocation of its own. Destruction can re-enter itself (a dict's
+    /// drop releases its keys and entries); a nested destroy finds the cell
+    /// empty and works with a fresh vector.
+    static WORKLIST: Cell<Vec<u64>> = const { Cell::new(Vec::new()) };
+}
+
+/// Destroys an object whose reference count has just reached zero,
+/// decrementing its children via a worklist so that destroying a long list
+/// does not recurse.
+#[cold]
+fn destroy(first: u64) {
+    let mut worklist = WORKLIST.take();
+    free_object(first, &mut worklist);
     while let Some(value) = worklist.pop() {
         if value & 1 == 1 {
             continue;
         }
         let count = (value - 8) as *mut u64;
-        unsafe { *count -= 1 };
-        if unsafe { *count } > 0 {
-            continue;
+        unsafe {
+            *count -= 1;
+            if *count > 0 {
+                continue;
+            }
         }
-        let header = heap_header(value);
-        match header_kind(header) {
-            KIND_RECORD => {
-                let arity = record_arity(header);
-                for index in 0..arity {
-                    worklist.push(record_field(value, index));
-                }
-                unsafe {
-                    std::alloc::dealloc(count as *mut u8, word_layout(1 + arity as usize))
-                };
-            }
-            KIND_CLOSURE => {
-                let captures = record_arity(header);
-                for index in 0..captures {
-                    // Captures sit one word past the code pointer.
-                    worklist.push(record_field(value, 1 + index));
-                }
-                unsafe {
-                    std::alloc::dealloc(count as *mut u8, word_layout(2 + captures as usize))
-                };
-            }
-            KIND_BIGINT => drop(unsafe { Box::from_raw(container::<BigInt>(value)) }),
-            KIND_FLOAT => drop(unsafe { Box::from_raw(container::<f64>(value)) }),
-            KIND_STRING => drop(unsafe { Box::from_raw(container::<String>(value)) }),
-            KIND_BITARRAY => {
-                drop(unsafe { Box::from_raw(container::<BitArrayPayload>(value)) })
-            }
-            KIND_DICT => {
-                // Dropping the persistent map releases exactly the tree
-                // nodes no other dict shares; their keys and entries
-                // release their references through [`DictKey`] and
-                // [`DictEntry`]'s `Drop` implementations.
-                drop(unsafe { Box::from_raw(container::<DictPayload>(value)) });
-            }
-            _ => {}
-        }
+        free_object(value, &mut worklist);
     }
-    NIL
+    WORKLIST.set(worklist);
+}
+
+/// Frees one object whose count has reached zero, pushing the children it
+/// owned onto the worklist.
+fn free_object(value: u64, worklist: &mut Vec<u64>) {
+    let count = (value - 8) as *mut u64;
+    let header = heap_header(value);
+    match header_kind(header) {
+        KIND_RECORD => {
+            let arity = record_arity(header);
+            for index in 0..arity {
+                worklist.push(record_field(value, index));
+            }
+            free_words(count, 2 + arity as usize);
+        }
+        KIND_CLOSURE => {
+            let captures = record_arity(header);
+            for index in 0..captures {
+                // Captures sit one word past the code pointer.
+                worklist.push(record_field(value, 1 + index));
+            }
+            free_words(count, 3 + captures as usize);
+        }
+        KIND_BIGINT => drop(unsafe { Box::from_raw(container::<BigInt>(value)) }),
+        // A float box is count, header, and payload: the three-word class.
+        KIND_FLOAT => free_words(count, 3),
+        KIND_STRING => drop(unsafe { Box::from_raw(container::<String>(value)) }),
+        KIND_BITARRAY => {
+            drop(unsafe { Box::from_raw(container::<BitArrayPayload>(value)) })
+        }
+        KIND_DICT => {
+            // Dropping the persistent map releases exactly the tree
+            // nodes no other dict shares; their keys and entries
+            // release their references through [`DictKey`] and
+            // [`DictEntry`]'s `Drop` implementations.
+            drop(unsafe { Box::from_raw(container::<DictPayload>(value)) });
+        }
+        _ => {}
+    }
 }
 
 

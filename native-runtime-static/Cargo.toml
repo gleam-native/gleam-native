@@ -21,3 +21,4 @@ bench = false
 [dependencies]
 native-runtime = { path = "../native-runtime" }
 native-runtime-stdlib = { path = "../native-runtime-stdlib" }
+mimalloc.workspace = true

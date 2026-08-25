@@ -17,6 +17,13 @@
 // by name.
 use native_runtime_stdlib as _;
 
+/// Gleam programs allocate a heap object per value, so compiled executables
+/// get a fast allocator behind the runtime's pool rather than the system
+/// one. This mirrors the `gleam` binary, keeping `gleam run` and exported
+/// executables at the same performance.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 unsafe extern "C" {
     /// The C-convention wrapper around the program's `main` function; the
     /// symbol name is `native_generation::translate::ENTRY_SYMBOL`. Declared
