@@ -797,16 +797,24 @@ pub extern "C" fn gleam_native_dict_insert(key: u64, value: u64, dict: u64) -> u
     box_dict(DictPayload { map })
 }
 
-/// The entries as a list of `#(key, value)` tuples in the dict's
-/// (structural) order.
+/// The entries as a list of `#(key, value)` tuples, sorted by key. The
+/// map iterates in hash order, which Gleam leaves unspecified — but
+/// sorting keeps `to_list` (and `fold`, `keys`, and `values`, which go
+/// through it) deterministic, matching Erlang's small-map term order and
+/// what the previous ordered-map representation produced.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_to_list(dict: u64) -> u64 {
+    let mut pairs: Vec<(u64, u64)> = dict_payload(dict)
+        .map
+        .iter()
+        .map(|(key, value)| (key.0, value.0))
+        .collect();
+    pairs.sort_by(|(left, _), (right, _)| native_runtime::cmp_values(*left, *right));
     make_list(
-        dict_payload(dict)
-            .map
-            .iter()
+        pairs
+            .into_iter()
             .map(|(key, value)| {
-                make_tuple2(gleam_native_inc(key.0), gleam_native_inc(value.0))
+                make_tuple2(gleam_native_inc(key), gleam_native_inc(value))
             })
             .collect(),
     )
