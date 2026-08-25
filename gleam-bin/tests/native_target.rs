@@ -49,15 +49,29 @@ impl TestProject {
             .expect("run the gleam binary")
     }
 
+    /// Runs `gleam export native` with extra arguments and environment
+    /// variables, returning the process output.
+    fn export_native_command(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gleam"));
+        let _ = command
+            .args(["export", "native"])
+            .args(arguments)
+            .current_dir(&self.root);
+        for (name, value) in environment {
+            let _ = command.env(name, value);
+        }
+        command.output().expect("run the gleam binary")
+    }
+
     /// Compiles the project ahead of time with `gleam export native` and
     /// returns the path of the generated executable.
     fn export_native(&self, name: &str) -> PathBuf {
         ensure_runtime_static_library();
-        let output = Command::new(env!("CARGO_BIN_EXE_gleam"))
-            .args(["export", "native"])
-            .current_dir(&self.root)
-            .output()
-            .expect("run the gleam binary");
+        let output = self.export_native_command(&[], &[]);
         assert!(
             output.status.success(),
             "gleam export native failed.\nstdout: {}\nstderr: {}",
@@ -1220,6 +1234,109 @@ stdout: {stdout}"
         stderr.contains("Apple(3)"),
         "echo should print the interned constructor name.
 stderr: {stderr}"
+    );
+}
+
+#[test]
+fn export_native_cross_compiles_for_the_other_macos_architecture() {
+    // Cross-compilation within macOS: an arm64 host produces an x86_64
+    // executable and vice versa, linked with the host's C compiler. Skipped
+    // off macOS, and when the runtime library cannot be cross-built (the
+    // rustup target is not installed).
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipped: cross-architecture link test requires macOS");
+        return;
+    }
+    let (platform, triple, cpu_type) = if cfg!(target_arch = "aarch64") {
+        ("macos-x64", "x86_64-apple-darwin", 0x0100_0007u32)
+    } else {
+        ("macos-arm64", "aarch64-apple-darwin", 0x0100_000C)
+    };
+
+    // Cross-build the runtime library into the workspace target directory,
+    // where the export's development-layout lookup finds it.
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    let _ = command.args(["build", "-p", "native-runtime-static", "--target", triple]);
+    if !cfg!(debug_assertions) {
+        let _ = command.arg("--release");
+    }
+    let output = command
+        .current_dir(workspace)
+        .output()
+        .expect("run cargo build");
+    if !output.status.success() {
+        eprintln!(
+            "skipped: could not cross-build the runtime library for {triple} \
+(is the rustup target installed?)"
+        );
+        return;
+    }
+
+    let project = TestProject::new(
+        "export_cross",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+pub fn main() -> Nil {
+  println("crossed " <> "over")
+}
+"#,
+    );
+    let output = project.export_native_command(&["--platform", platform], &[]);
+    assert!(
+        output.status.success(),
+        "gleam export native --platform {platform} failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let executable = project.root.join("export_cross");
+    let bytes = std::fs::read(&executable).expect("read the executable");
+    assert_eq!(&bytes[..4], &0xFEED_FACFu32.to_le_bytes(), "not Mach-O 64");
+    assert_eq!(
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        cpu_type,
+        "wrong architecture"
+    );
+
+    // Run it when the host can (arm64 Macs run x86_64 through Rosetta when
+    // it is installed; Intel Macs cannot run arm64).
+    if let Ok(output) = Command::new(&executable).current_dir(&project.root).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("crossed over"),
+            "unexpected output.\nstdout: {stdout}"
+        );
+    } else {
+        eprintln!("skipped execution: host cannot run {platform} binaries");
+    }
+}
+
+#[test]
+fn export_native_reports_a_missing_runtime_library() {
+    let project = TestProject::new(
+        "export_no_runtime",
+        r#"pub fn main() -> Nil {
+  Nil
+}
+"#,
+    );
+    let output = project.export_native_command(
+        &[],
+        &[("GLEAM_NATIVE_RUNTIME_LIB", "/nonexistent/libruntime.a")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected failure.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("GLEAM_NATIVE_RUNTIME_LIB") && stderr.contains("does not exist"),
+        "stderr: {stderr}"
     );
 }
 

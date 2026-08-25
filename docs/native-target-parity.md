@@ -240,8 +240,22 @@ platform C convention.
 - ❌ `gleam test` (needs a gleeunit story or a native test runner)
 - ❌ Debug info (DWARF via `gimli`) — spans must keep flowing through the IR
   so this stays possible
-- ❌ Cross-compilation (Cranelift supports foreign ISAs; needs target triple
-  plumbing and linking strategy)
+- ✅ Cross-compilation: `gleam export native --platform <name>` with the
+  curated platforms `linux-arm64` / `linux-x64` (musl, fully static),
+  `linux-arm64-gnu` / `linux-x64-gnu` (dynamic glibc), and `macos-arm64` /
+  `macos-x64`. Cranelift compiles the object for the platform's triple
+  (baseline CPU features); the runtime library is resolved per platform —
+  `--runtime-lib` flag, `GLEAM_NATIVE_RUNTIME_LIB`,
+  `libnative_runtime_static-<triple>.a` beside the gleam binary, or cargo's
+  `target/<triple>/<profile>/` development layout (built with
+  `cargo build -p native-runtime-static --target <triple>`). Linking uses
+  the host `cc` where it can (its own platform; both macOS architectures
+  via `-arch`), otherwise `zig cc -target` when zig is on PATH (with zig's
+  bundled libunwind supplying the `_Unwind_*` symbols Rust references), and
+  `--linker` / `GLEAM_NATIVE_LINKER` overrides everything. Without a usable
+  linker the object file is kept and the exact manual link command is
+  printed. All platforms are 64-bit little-endian Unix; Windows needs a
+  runtime port (signal-based stack overflow handling) first
 - ❌ Re-enable the native row in `test-output`'s all-target macro and add
   language-conformance execution tests (the real proof of parity)
 

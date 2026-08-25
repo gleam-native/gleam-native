@@ -645,9 +645,13 @@ impl Command {
                 let paths = find_project_paths(directory)?;
                 export::escript(&paths)
             }
-            Self::Export(ExportTarget::Native) => {
+            Self::Export(ExportTarget::Native {
+                platform,
+                runtime_lib,
+                linker,
+            }) => {
                 let paths = find_project_paths(directory)?;
-                export::native(&paths)
+                export::native(&paths, platform, runtime_lib, linker)
             }
             Self::Export(ExportTarget::HexTarball) => {
                 let paths = find_project_paths(directory)?;
@@ -690,8 +694,20 @@ pub enum ExportTarget {
     Escript,
     /// Precompiled Erlang, suitable for deployment
     ErlangShipment,
-    /// An ahead-of-time compiled native executable for this machine
-    Native,
+    /// An ahead-of-time compiled native executable
+    Native {
+        /// The platform to compile for, defaulting to this machine
+        #[arg(long, value_enum)]
+        platform: Option<export::NativePlatform>,
+
+        /// Path of the native runtime static library to link against
+        #[arg(long)]
+        runtime_lib: Option<Utf8PathBuf>,
+
+        /// The linker command to use, e.g. "zig cc"
+        #[arg(long)]
+        linker: Option<String>,
+    },
     /// The package bundled into a tarball, suitable for publishing to Hex
     HexTarball,
     /// The JavaScript prelude module

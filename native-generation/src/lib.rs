@@ -76,6 +76,50 @@ mod tests {
         assert_eq!(add(20, 22), 42);
     }
 
+    /// Cross-compilation: the same program compiles to an object file for
+    /// every supported platform, with the right container format and
+    /// machine type.
+    #[test]
+    fn object_emission_for_every_platform() {
+        let module = native_ir::Module {
+            name: "app".into(),
+            functions: vec![native_ir::Function::Defined {
+                name: "main".into(),
+                parameters: vec![],
+                body: vec![native_ir::Statement::Expression(
+                    native_ir::Expression::IntBinary {
+                        operator: native_ir::IntOperator::Add,
+                        left: Box::new(native_ir::Expression::Int(40)),
+                        right: Box::new(native_ir::Expression::Int(2)),
+                    },
+                )],
+            }],
+        };
+
+        let elf = |bytes: &[u8], machine: u16| {
+            assert_eq!(&bytes[..4], b"\x7fELF");
+            assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), machine);
+        };
+        let macho = |bytes: &[u8], cpu_type: u32| {
+            assert_eq!(&bytes[..4], &0xFEED_FACFu32.to_le_bytes());
+            assert_eq!(
+                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                cpu_type
+            );
+        };
+
+        let compile = |triple| {
+            crate::object::compile(std::slice::from_ref(&module), "app", 1024, Some(triple))
+                .expect(triple)
+        };
+        elf(&compile("aarch64-unknown-linux-musl"), 183);
+        elf(&compile("x86_64-unknown-linux-musl"), 62);
+        elf(&compile("aarch64-unknown-linux-gnu"), 183);
+        elf(&compile("x86_64-unknown-linux-gnu"), 62);
+        macho(&compile("aarch64-apple-darwin"), 0x0100_000C);
+        macho(&compile("x86_64-apple-darwin"), 0x0100_0007);
+    }
+
     /// End-to-end: build a tiny two-module program in native IR, JIT it, and
     /// run `main`. Uses the runtime's `print_int` external and an addition
     /// that stays on the fast path plus one that overflows to a big integer.

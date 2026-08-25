@@ -218,14 +218,121 @@ fn write_entrypoint_script(
     Ok(())
 }
 
-/// Compile the project ahead of time into a native executable for this
-/// machine, written to the project root and named after the package.
+/// A platform `gleam export native` can compile for. Every platform is a
+/// 64-bit little-endian Unix; Windows needs a runtime port (signal-based
+/// stack overflow handling, at least) before it can join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NativePlatform {
+    /// 64-bit ARM Linux, statically linked against musl libc
+    LinuxArm64,
+    /// 64-bit x86 Linux, statically linked against musl libc
+    LinuxX64,
+    /// 64-bit ARM Linux, dynamically linked against glibc
+    LinuxArm64Gnu,
+    /// 64-bit x86 Linux, dynamically linked against glibc
+    LinuxX64Gnu,
+    /// Apple silicon macOS
+    MacosArm64,
+    /// Intel macOS
+    MacosX64,
+}
+
+impl NativePlatform {
+    /// The command line name, as clap renders it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::LinuxArm64 => "linux-arm64",
+            Self::LinuxX64 => "linux-x64",
+            Self::LinuxArm64Gnu => "linux-arm64-gnu",
+            Self::LinuxX64Gnu => "linux-x64-gnu",
+            Self::MacosArm64 => "macos-arm64",
+            Self::MacosX64 => "macos-x64",
+        }
+    }
+
+    /// The Rust/LLVM target triple: what Cranelift compiles for, and what
+    /// `cargo build --target` expects when building the runtime library.
+    pub fn triple(self) -> &'static str {
+        match self {
+            Self::LinuxArm64 => "aarch64-unknown-linux-musl",
+            Self::LinuxX64 => "x86_64-unknown-linux-musl",
+            Self::LinuxArm64Gnu => "aarch64-unknown-linux-gnu",
+            Self::LinuxX64Gnu => "x86_64-unknown-linux-gnu",
+            Self::MacosArm64 => "aarch64-apple-darwin",
+            Self::MacosX64 => "x86_64-apple-darwin",
+        }
+    }
+
+    /// The equivalent `zig cc -target` triple.
+    fn zig_target(self) -> &'static str {
+        match self {
+            Self::LinuxArm64 => "aarch64-linux-musl",
+            Self::LinuxX64 => "x86_64-linux-musl",
+            Self::LinuxArm64Gnu => "aarch64-linux-gnu",
+            Self::LinuxX64Gnu => "x86_64-linux-gnu",
+            Self::MacosArm64 => "aarch64-macos",
+            Self::MacosX64 => "x86_64-macos",
+        }
+    }
+
+    /// The architecture as Rust's `std::env::consts::ARCH` names it.
+    fn architecture(self) -> &'static str {
+        match self {
+            Self::LinuxArm64 | Self::LinuxArm64Gnu | Self::MacosArm64 => "aarch64",
+            Self::LinuxX64 | Self::LinuxX64Gnu | Self::MacosX64 => "x86_64",
+        }
+    }
+
+    fn is_linux(self) -> bool {
+        matches!(
+            self,
+            Self::LinuxArm64 | Self::LinuxX64 | Self::LinuxArm64Gnu | Self::LinuxX64Gnu
+        )
+    }
+
+    fn is_musl(self) -> bool {
+        matches!(self, Self::LinuxArm64 | Self::LinuxX64)
+    }
+
+    fn is_macos(self) -> bool {
+        matches!(self, Self::MacosArm64 | Self::MacosX64)
+    }
+
+    /// The `cc -arch` name for macOS platforms.
+    fn macos_architecture(self) -> &'static str {
+        match self {
+            Self::MacosArm64 => "arm64",
+            _ => "x86_64",
+        }
+    }
+
+    /// Whether this platform is exactly the machine gleam is running on, so
+    /// host-native artifacts (the plain runtime library) are usable.
+    fn matches_host(self) -> bool {
+        if self.architecture() != std::env::consts::ARCH {
+            return false;
+        }
+        if self.is_macos() {
+            return cfg!(target_os = "macos");
+        }
+        cfg!(target_os = "linux") && self.is_musl() == cfg!(target_env = "musl")
+    }
+}
+
+/// Compile the project ahead of time into a native executable, written to
+/// the project root and named after the package. Compiles for the machine
+/// gleam is running on unless a platform is given.
 ///
 /// The Cranelift-generated object file is linked against the
 /// `native-runtime-static` library (which provides the runtime and the C
-/// `main`) with the system C compiler driver, which supplies the platform
-/// startup files and default libraries.
-pub(crate) fn native(paths: &ProjectPaths) -> Result<()> {
+/// `main`). The host's C compiler driver links host-compatible platforms;
+/// other platforms use `zig cc` or an explicit `--linker` command.
+pub(crate) fn native(
+    paths: &ProjectPaths,
+    platform: Option<NativePlatform>,
+    runtime_lib: Option<Utf8PathBuf>,
+    linker: Option<String>,
+) -> Result<()> {
     let target = Target::Native;
     let mode = Mode::Prod;
     let build = paths.build_directory_for_target(mode, target);
@@ -261,42 +368,170 @@ pub(crate) fn native(paths: &ProjectPaths) -> Result<()> {
         &modules,
         package_name,
         built.root_package.config.native.stack_size_megabytes,
+        platform.map(NativePlatform::triple),
     )
     .map_err(fail)?;
     let object_path = build.join(format!("{package_name}.o"));
     fs::write_bytes(&object_path, &object)?;
 
-    let runtime_library = runtime_static_library().map_err(fail)?;
+    let runtime_library = runtime_static_library(platform, runtime_lib).map_err(fail)?;
     let executable_path = paths.root().join(package_name.as_str());
-    link_executable(&object_path, &runtime_library, &executable_path)?;
+    let linker_command = select_linker(platform, linker).map_err(|error| {
+        let (mut example, example_program) = match platform {
+            Some(platform) => (format!("zig cc -target {}", platform.zig_target()), "zig"),
+            None => ("cc".into(), "cc"),
+        };
+        example.push_str(&format!(
+            " {object_path} {runtime_library} -o {executable_path}"
+        ));
+        for flag in link_flags(platform, example_program) {
+            example.push(' ');
+            example.push_str(flag);
+        }
+        fail(format!(
+            "{error}
+
+The compiled object file has been kept at:
+
+    {object_path}
+
+and the matching runtime library is at:
+
+    {runtime_library}
+
+so once a linker is available the manual link is:
+
+    {example}"
+        ))
+    })?;
+    link_executable(
+        &linker_command,
+        platform,
+        &object_path,
+        &runtime_library,
+        &executable_path,
+    )?;
 
     crate::cli::print_exported(package_name);
-    println!(
-        "
+    match platform {
+        Some(platform) => println!(
+            "
+Your {} executable has been generated to {executable_path}.
+",
+            platform.name()
+        ),
+        None => println!(
+            "
 Your native executable has been generated to {executable_path}.
 ",
-    );
+        ),
+    }
 
     Ok(())
 }
 
+/// The extra flags the link needs: the libraries the Rust runtime expects
+/// on Linux, fully static linking on musl, and — when the linker is zig,
+/// which has no implicit libgcc — zig's bundled libunwind for the
+/// `_Unwind_*` symbols Rust's panic machinery references.
+fn link_flags(platform: Option<NativePlatform>, linker_program: &str) -> Vec<&'static str> {
+    let mut flags = vec![];
+    let linux = platform.map_or(cfg!(target_os = "linux"), NativePlatform::is_linux);
+    if linux {
+        flags.extend(["-lpthread", "-ldl", "-lm"]);
+    }
+    if platform.is_some_and(NativePlatform::is_musl) {
+        flags.push("-static");
+    }
+    let zig = std::path::Path::new(linker_program)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("zig"));
+    if linux && zig {
+        flags.push("-lunwind");
+    }
+    flags
+}
+
+/// Chooses the linker command: an explicit `--linker` or
+/// `GLEAM_NATIVE_LINKER` override, the host's C compiler driver where it can
+/// link the platform (its own, and on macOS the other architecture via
+/// `-arch`), and `zig cc` for everything else.
+fn select_linker(
+    platform: Option<NativePlatform>,
+    linker: Option<String>,
+) -> Result<Vec<String>, String> {
+    let split = |command: String, source: &str| {
+        let words: Vec<String> = command.split_whitespace().map(String::from).collect();
+        if words.is_empty() {
+            return Err(format!("{source} is empty"));
+        }
+        Ok(words)
+    };
+    if let Some(command) = linker {
+        return split(command, "--linker");
+    }
+    if let Ok(command) = std::env::var("GLEAM_NATIVE_LINKER") {
+        return split(command, "GLEAM_NATIVE_LINKER");
+    }
+    let Some(platform) = platform else {
+        return Ok(vec!["cc".into()]);
+    };
+    if platform.is_macos() && cfg!(target_os = "macos") {
+        return Ok(vec![
+            "cc".into(),
+            "-arch".into(),
+            platform.macos_architecture().into(),
+        ]);
+    }
+    if platform.matches_host() {
+        return Ok(vec!["cc".into()]);
+    }
+    if zig_is_available() {
+        return Ok(vec![
+            "zig".into(),
+            "cc".into(),
+            "-target".into(),
+            platform.zig_target().into(),
+        ]);
+    }
+    Err(format!(
+        "there is no linker available for {}: this machine's C compiler \
+cannot link for it, and `zig` was not found on PATH.
+
+Install zig (https://ziglang.org) to cross-link executables, or pass a \
+suitable cross linker with --linker (also settable as GLEAM_NATIVE_LINKER).",
+        platform.name()
+    ))
+}
+
+/// Whether `zig` can be run, making `zig cc` available as a cross linker.
+fn zig_is_available() -> bool {
+    std::process::Command::new("zig")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Links the object file and the runtime library into an executable with the
-/// system C compiler driver.
+/// given C-driver-style linker command.
 fn link_executable(
+    linker: &[String],
+    platform: Option<NativePlatform>,
     object: &Utf8PathBuf,
     runtime_library: &Utf8PathBuf,
     executable: &Utf8PathBuf,
 ) -> Result<()> {
-    let program = "cc";
+    let (program, leading_arguments) = linker.split_first().expect("linker command is non-empty");
     let mut command = std::process::Command::new(program);
     let _ = command
+        .args(leading_arguments)
         .arg(object)
         .arg(runtime_library)
         .arg("-o")
-        .arg(executable);
-    if cfg!(target_os = "linux") {
-        let _ = command.args(["-lpthread", "-ldl", "-lm"]);
-    }
+        .arg(executable)
+        .args(link_flags(platform, program));
     let output = command.output().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => Error::ShellProgramNotFound {
             program: program.into(),
@@ -318,11 +553,22 @@ fn link_executable(
     Ok(())
 }
 
-/// Locates the `native-runtime-static` library executables are linked
-/// against: the path in the `GLEAM_NATIVE_RUNTIME_LIB` environment variable
-/// if set, otherwise `libnative_runtime_static.a` next to the running
-/// `gleam` binary.
-fn runtime_static_library() -> Result<Utf8PathBuf, String> {
+/// Locates the `native-runtime-static` library to link against, compiled
+/// for the given platform (or the host). The search order is the
+/// `--runtime-lib` flag, the `GLEAM_NATIVE_RUNTIME_LIB` environment
+/// variable, a `libnative_runtime_static[-<triple>].a` next to the running
+/// `gleam` binary, and — for development builds running from a cargo target
+/// directory — cargo's `<triple>/<profile>` cross-compilation layout.
+fn runtime_static_library(
+    platform: Option<NativePlatform>,
+    flag: Option<Utf8PathBuf>,
+) -> Result<Utf8PathBuf, String> {
+    if let Some(path) = flag {
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!("--runtime-lib is {path}, which does not exist"));
+    }
     if let Ok(path) = std::env::var("GLEAM_NATIVE_RUNTIME_LIB") {
         let path = Utf8PathBuf::from(path);
         if path.is_file() {
@@ -334,17 +580,67 @@ fn runtime_static_library() -> Result<Utf8PathBuf, String> {
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the gleam executable: {error}"))?;
-    match executable
+    let directory = executable
         .parent()
-        .map(|directory| directory.join("libnative_runtime_static.a"))
-    {
-        Some(path) if path.is_file() => Utf8PathBuf::from_path_buf(path)
-            .map_err(|path| format!("non UTF-8 path: {}", path.display())),
-        _ => Err("could not find libnative_runtime_static.a next to the gleam \
-executable. Build it with `cargo build -p native-runtime-static` or set \
-GLEAM_NATIVE_RUNTIME_LIB to its path."
-            .into()),
+        .ok_or("could not locate the gleam executable's directory")?;
+
+    let mut candidates = vec![];
+    match platform {
+        None => candidates.push(directory.join("libnative_runtime_static.a")),
+        Some(platform) => {
+            let triple = platform.triple();
+            candidates.push(directory.join(format!("libnative_runtime_static-{triple}.a")));
+            // A development build running from cargo's target directory:
+            // cross-compiled artifacts live in target/<triple>/<profile>/
+            // next to this binary's target/<profile>/.
+            if let (Some(target_directory), Some(profile)) =
+                (directory.parent(), directory.file_name())
+            {
+                candidates.push(
+                    target_directory
+                        .join(triple)
+                        .join(profile)
+                        .join("libnative_runtime_static.a"),
+                );
+            }
+            // The platform is this very machine, so the host library fits.
+            if platform.matches_host() {
+                candidates.push(directory.join("libnative_runtime_static.a"));
+            }
+        }
     }
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Utf8PathBuf::from_path_buf(candidate.clone())
+                .map_err(|path| format!("non UTF-8 path: {}", path.display()));
+        }
+    }
+
+    let searched: Vec<String> = candidates
+        .iter()
+        .map(|candidate| format!("    {}", candidate.display()))
+        .collect();
+    let build_command = match platform {
+        Some(platform) => format!(
+            "rustup target add {triple}
+    cargo build -p native-runtime-static --target {triple}",
+            triple = platform.triple()
+        ),
+        None => "cargo build -p native-runtime-static".into(),
+    };
+    Err(format!(
+        "could not find the native runtime library. Searched:
+
+{}
+
+Build it in the gleam source tree with:
+
+    {build_command}
+
+or point at an existing one with --runtime-lib (also settable as \
+GLEAM_NATIVE_RUNTIME_LIB).",
+        searched.join("\n")
+    ))
 }
 
 pub fn hex_tarball(paths: &ProjectPaths) -> Result<()> {
