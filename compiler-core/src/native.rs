@@ -38,7 +38,18 @@ fn lower_int(value: &BigInt) -> native_ir::Expression {
     }
 }
 
-pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
+pub fn module(
+    module: &TypedModule,
+    package_root: &camino::Utf8Path,
+) -> Result<native_ir::Module, Error> {
+    // The path `echo` prints, root-relative like the other targets print it.
+    let src_path = module
+        .type_info
+        .src_path
+        .strip_prefix(package_root)
+        .unwrap_or(&module.type_info.src_path)
+        .as_str()
+        .replace('\\', "/");
     let mut functions = Vec::new();
 
     // Imports, type aliases, custom type definitions, and constants
@@ -84,6 +95,7 @@ pub fn module(module: &TypedModule) -> Result<native_ir::Module, Error> {
 
     Ok(native_ir::Module {
         name: module.name.clone().into(),
+        src_path,
         functions,
     })
 }
@@ -909,7 +921,9 @@ impl Lowerer<'_> {
                         *arity,
                         *variant_index,
                     )),
-                    _ => Err(self.unsupported("this kind of constant")),
+                    ValueConstructorVariant::LocalVariable { .. } => {
+                        Err(self.unsupported("this kind of constant"))
+                    }
                 }
             }
             Constant::BinaryOperator {
@@ -1543,6 +1557,8 @@ impl Lowerer<'_> {
             native_ir::EchoKind::Bool
         } else if type_.is_nil() {
             native_ir::EchoKind::Nil
+        } else if type_.is_list() {
+            native_ir::EchoKind::List
         } else {
             native_ir::EchoKind::Structural
         };
@@ -1594,7 +1610,7 @@ mod tests {
             None,
         )
         .expect("should compile");
-        super::module(&module).expect("should lower")
+        super::module(&module, camino::Utf8Path::new("/root")).expect("should lower")
     }
 
     #[test]

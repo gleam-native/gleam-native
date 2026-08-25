@@ -1,0 +1,77 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+pub type Shape {
+  Circle(radius: Float)
+  Rect(width: Float, height: Float)
+  Point
+}
+
+pub type Person {
+  Person(name: String, age: Int)
+}
+
+fn area(shape: Shape) -> Float {
+  case shape {
+    Circle(radius) -> 3.0 *. radius *. radius
+    Rect(width, height) -> width *. height
+    Point -> 0.0
+  }
+}
+
+fn birthday(person: Person) -> Person {
+  Person(..person, age: person.age + 1)
+}
+
+fn safe_div(a: Int, b: Int) -> Result(Int, String) {
+  case b == 0 {
+    True -> Error("division by zero")
+    False -> Ok(a / b)
+  }
+}
+
+pub fn main() -> Nil {
+  echo area(Circle(1.5))
+  echo area(Rect(2.5, 1.5))
+  echo area(Point) == 0.0
+  let alice = Person("Alice", 30)
+  let older = birthday(alice)
+  echo older.name
+  echo older.age
+  // Records are immutable: the original is untouched.
+  echo alice.age
+  echo safe_div(84, 2)
+  echo safe_div(1, 0)
+  // Deep structural equality.
+  echo older == Person("Alice", 31)
+  echo alice == older
+  Nil
+}
+
+
+--- gleam run output ----------------
+[90msrc/main.gleam:34[39m
+6.75
+[90msrc/main.gleam:35[39m
+3.75
+[90msrc/main.gleam:36[39m
+True
+[90msrc/main.gleam:39[39m
+"Alice"
+[90msrc/main.gleam:40[39m
+31
+[90msrc/main.gleam:42[39m
+30
+[90msrc/main.gleam:43[39m
+Ok(42)
+[90msrc/main.gleam:44[39m
+Error("division by zero")
+[90msrc/main.gleam:46[39m
+True
+[90msrc/main.gleam:47[39m
+False

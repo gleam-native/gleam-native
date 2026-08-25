@@ -430,6 +430,62 @@ Your native executable has been generated to {executable_path}.
     Ok(())
 }
 
+/// Builds the project for the native target in production mode and compiles
+/// it ahead of time into an executable for this machine, whose entry is the
+/// `main` function of the given module. Quiet, and the executable lands at
+/// the given path: used by the conformance test suite in `test-output`,
+/// whose case projects name their main module `main` and capture the
+/// program's output.
+pub fn native_executable_for_tests(
+    paths: &ProjectPaths,
+    main_module: &str,
+    executable_path: &Utf8PathBuf,
+    runtime_lib: Option<Utf8PathBuf>,
+) -> Result<()> {
+    let target = Target::Native;
+    let mode = Mode::Prod;
+    let build = paths.build_directory_for_target(mode, target);
+    fs::delete_directory(&build)?;
+
+    let built = crate::build::main(
+        paths,
+        Options {
+            root_target_support: TargetSupport::Enforced,
+            warnings_as_errors: false,
+            codegen: Codegen::All,
+            compile: Compile::All,
+            mode,
+            target: Some(target),
+            no_print_progress: true,
+            erlang_output: ErlangOutput::Binary,
+        },
+        crate::build::download_dependencies(paths, gleam_core::build::NullTelemetry)?,
+    )?;
+    let _: ModuleFunction = built.get_main_function(&main_module.into(), target)?;
+
+    let fail = |error: String| Error::NativeExecutableGeneration { error };
+    let modules = crate::run::load_native_modules(&build).map_err(fail)?;
+    let object = native_generation::object::compile(
+        &modules,
+        main_module,
+        built.root_package.config.native.stack_size_megabytes,
+        None,
+    )
+    .map_err(fail)?;
+    let object_path = build.join("main.o");
+    fs::write_bytes(&object_path, &object)?;
+
+    let runtime_library = runtime_static_library(None, runtime_lib).map_err(fail)?;
+    let linker_command = select_linker(None, None).map_err(fail)?;
+    link_executable(
+        &linker_command,
+        None,
+        &object_path,
+        &runtime_library,
+        executable_path,
+    )
+}
+
 /// The extra flags the link needs: the libraries the Rust runtime expects
 /// on Linux, fully static linking on musl, and — when the linker is zig,
 /// which has no implicit libgcc — zig's bundled libunwind for the

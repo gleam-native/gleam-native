@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+name = "native_configured_stack_size"
+version = "1.0.0"
+
+[native]
+stack_size_megabytes = 4

@@ -97,8 +97,11 @@ fn constructor_name(display: u16) -> Option<&'static str> {
     }
 }
 
-const fn closure_header(captures: u32) -> u64 {
-    KIND_CLOSURE | ((captures as u64) << 32)
+/// The closure header: capture count where records keep their arity, and
+/// the function's own arity (without the closure argument) where records
+/// keep their tag, read back by `echo`'s function rendering.
+const fn closure_header(captures: u32, arity: u32) -> u64 {
+    KIND_CLOSURE | ((arity as u64) << 16) | ((captures as u64) << 32)
 }
 
 fn header_kind(header: u64) -> u64 {
@@ -1372,10 +1375,11 @@ pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64, display: u64) ->
 
 /// Allocates a closure: a header word, a slot for the code pointer, and
 /// `captures` capture words, all stored by generated code after this call.
+/// `arity` is the function's parameter count, kept for `echo`.
 #[unsafe(no_mangle)]
-pub extern "C" fn gleam_native_closure_new(captures: u64) -> u64 {
+pub extern "C" fn gleam_native_closure_new(captures: u64, arity: u64) -> u64 {
     let value = allocate_words(2 + captures as usize);
-    unsafe { *(value as *mut u64) = closure_header(captures as u32) };
+    unsafe { *(value as *mut u64) = closure_header(captures as u32, arity as u32) };
     value
 }
 
@@ -1493,6 +1497,30 @@ fn deep_eq(left: u64, right: u64) -> bool {
 /// structurally as `@tag(field, ...)` since constructor names do not exist
 /// at run time. Booleans and other immediates nested inside structures
 /// print as their integer encoding.
+/// Renders a string the way `echo` does on every target: the common
+/// escapes by name, other control characters (and the C1 range) as
+/// zero-padded uppercase `\u{XXXX}`, everything else literally.
+fn inspect_string(string: &str) -> String {
+    let mut out = String::with_capacity(string.len() + 2);
+    out.push('"');
+    for character in string.chars() {
+        match character {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{c}' => out.push_str("\\f"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            character if character < ' ' || ('\u{7f}'..'\u{a0}').contains(&character) => {
+                out.push_str(&format!("\\u{{{:04X}}}", character as u32));
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn inspect(value: u64) -> String {
     if value & 1 == 1 {
         return format!("{}", (value as i64) >> 1);
@@ -1501,8 +1529,20 @@ fn inspect(value: u64) -> String {
     match header_kind(header) {
         KIND_BIGINT => format!("{}", bigint_value(value)),
         KIND_FLOAT => format!("{:?}", float_value(value)),
-        KIND_STRING => format!("{:?}", string_value(value)),
-        KIND_CLOSURE => "//fn".to_string(),
+        KIND_STRING => inspect_string(string_value(value)),
+        KIND_CLOSURE => {
+            // Parameters render as `a`, `b`, ... from the arity stored in
+            // the header, matching the other targets.
+            let arity = record_tag(header) as u64;
+            let parameters: Vec<String> = (0..arity)
+                .map(|index| {
+                    char::from_u32(('a' as u32) + (index % 26) as u32)
+                        .expect("letter")
+                        .to_string()
+                })
+                .collect();
+            format!("//fn({}) {{ ... }}", parameters.join(", "))
+        }
         KIND_BITARRAY => {
             let payload = bitarray_value(value);
             let whole = (payload.bits / 8) as usize;
@@ -1526,14 +1566,32 @@ fn inspect(value: u64) -> String {
             match record_display(header) {
                 DISPLAY_TUPLE => format!("#({})", fields(value, header).join(", ")),
                 DISPLAY_LIST => {
-                    // Walk the cons chain.
+                    // Walk the cons chain. A non-empty list whose elements
+                    // are all integers in the printable ASCII range renders
+                    // as a charlist, as on the other targets.
                     let mut items = Vec::new();
+                    let mut chars = Some(String::new());
                     let mut current = value;
                     while current & 1 == 0 {
-                        items.push(inspect(record_field(current, 0)));
+                        let element = record_field(current, 0);
+                        if let Some(text) = &mut chars {
+                            let printable = element & 1 == 1
+                                && (32..=126).contains(&((element as i64) >> 1));
+                            if printable {
+                                text.push((((element as i64) >> 1) as u8) as char);
+                            } else {
+                                chars = None;
+                            }
+                        }
+                        items.push(inspect(element));
                         current = record_field(current, 1);
                     }
-                    format!("[{}]", items.join(", "))
+                    match chars {
+                        Some(text) if !items.is_empty() => {
+                            format!("charlist.from_string(\"{text}\")")
+                        }
+                        _ => format!("[{}]", items.join(", ")),
+                    }
                 }
                 display => match constructor_name(display) {
                     Some(name) if record_arity(header) == 0 => name.to_string(),
@@ -1562,22 +1620,27 @@ pub unsafe extern "C" fn gleam_native_echo(
     kind: u64,
     value: u64,
     message: u64,
-    module: *const u8,
-    module_length: u64,
+    path: *const u8,
+    path_length: u64,
     line: u64,
 ) -> u64 {
-    let module = unsafe {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(module, module_length as usize))
+    let path = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(path, path_length as usize))
     };
     let rendered = match kind {
         1 => format!("{}", untag(value)),
         2 => format!("{:?}", float_value(value)),
-        3 => format!("{:?}", string_value(value)),
+        3 => inspect_string(string_value(value)),
         4 => (if value == TRUE { "True" } else { "False" }).to_string(),
         5 => "Nil".to_string(),
+        // A statically-known list: the empty list is a bare tagged integer
+        // that structural inspection cannot identify.
+        6 if value == NIL => "[]".to_string(),
         _ => inspect(value),
     };
-    eprint!("{module}:{line}");
+    // The location is greyed with the same ANSI codes the other targets
+    // use, matching their output exactly.
+    eprint!("\u{1b}[90m{path}:{line}\u{1b}[39m");
     if message != 0 {
         eprint!(" {}", string_value(message));
     }

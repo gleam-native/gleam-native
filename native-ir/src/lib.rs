@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 27;
+pub const FORMAT_VERSION: u32 = 28;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -28,6 +28,9 @@ pub struct Artifact {
 pub struct Module {
     /// The Gleam module name, with `/` separators, e.g. `gleam/wibble`.
     pub name: String,
+    /// The module's source path relative to its package root, e.g.
+    /// `src/main.gleam`, printed by `echo` like the other targets do.
+    pub src_path: String,
     pub functions: Vec<Function>,
 }
 
@@ -460,6 +463,9 @@ pub enum EchoKind {
     String,
     Bool,
     Nil,
+    /// The static type is a list: the empty list is a bare tagged integer,
+    /// so without this kind a top-level `echo []` would print `0`.
+    List,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

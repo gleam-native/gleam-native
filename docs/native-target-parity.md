@@ -180,16 +180,21 @@ platform C convention.
   all arithmetic and comparison operators)
 - ✅ `panic`, `todo` with module/function/line metadata baked into the call
   site, lazily-evaluated message expressions, exit code 1
-- ✅ `echo`: prints `module:line` (plus the optional `as` message) and the
-  value to standard error, returning the value — in expression position and
-  inside pipelines (`|> echo |>` prints the mid-pipeline value). Output is
-  Gleam-pretty: record headers carry a display-only constructor id (masked
-  out of variant checks and equality) resolved through a name registry the
-  JIT hands the runtime, so custom types print as `Person("Ada", 36)`,
-  lists as `[1, 2]`, tuples as `#(...)`, and `Ok`/`Error` by name. Scalars
-  use the static type at the echo site. One representational limit remains:
-  `Bool`, `Nil`, and the empty list are bare tagged integers, so *nested*
-  inside structures they print as their integer encoding
+- ✅ `echo`: prints the ANSI-greyed root-relative source location
+  (`src/main.gleam:5`, byte-identical to the other targets, plus the
+  optional `as` message) and the value to standard error, returning the
+  value — in expression position and inside pipelines (`|> echo |>` prints
+  the mid-pipeline value). Output is Gleam-pretty and matches the other
+  targets: custom types print as `Person("Ada", 36)`, lists as `[1, 2]`
+  (non-empty all-printable-ASCII integer lists as
+  `charlist.from_string("...")`), tuples as `#(...)`, `Ok`/`Error` by name,
+  strings with the shared escape rules, and functions as
+  `//fn(a, b) { ... }` from the arity stored in the closure header. Scalars
+  and top-level empty lists use the static type at the echo site. One
+  representational limit remains: `Bool`, `Nil`, and the empty list are
+  bare tagged integers, so *nested* inside structures they print as their
+  integer encoding (tracked by `echo_tuple`'s native-specific conformance
+  snapshot)
 - ✅ Value formatting: the runtime's `inspect` now renders constructor
   names, ready to back a `gleam/string.inspect` external
 - ✅ Reference counting: a count word before every heap object, with
@@ -276,8 +281,28 @@ platform C convention.
   linker the object file is kept and the exact manual link command is
   printed. All platforms are 64-bit little-endian Unix; Windows needs a
   runtime port (signal-based stack overflow handling) first
-- ❌ Re-enable the native row in `test-output`'s all-target macro and add
-  language-conformance execution tests (the real proof of parity)
+- ✅ Language-conformance execution tests: the native row in `test-output`'s
+  all-target macro is enabled — native runs every shared case (compiled
+  ahead of time and executed, its stderr byte-compared against the same
+  snapshot Erlang and the three JavaScript runtimes produce) except
+  `echo_dict` (needs the standard library). Cases whose output legitimately
+  diverges (`echo_tuple`'s nested booleans, plus the per-target
+  `echo_float`/`echo_custom_type`/`echo_bitarray`) have native-specific
+  snapshots documenting their output. The language-semantics tests formerly
+  in `gleam-bin/tests/native_target.rs` are migrated to conformance cases
+  that use `echo` for output, so most run on *every* target sharing one
+  snapshot (tuples, lists, bit arrays, custom types, closures, case
+  matching, arithmetic, destructuring, fizzbuzz, negation and constant
+  forms, tail recursion). Behavior JavaScript legitimately computes
+  differently — arbitrary-precision integers, 128-bit bit array reads,
+  native-endianness segments — lives in `big_integers` and
+  `bit_arrays_wide`, where Erlang and native share the snapshot. Runtime
+  failures (`panic`, `todo`, `let assert`, `assert`) run on Erlang and
+  native with per-target snapshots (the JavaScript runtimes embed
+  machine-specific paths in stack traces). Only `native_strings` (native
+  runtime string externals) and the stack-size cases remain native-only;
+  `gleam-bin` keeps the tooling tests (arguments, test runner,
+  export/cross-compilation, artifact hygiene)
 
 ## Ecosystem
 

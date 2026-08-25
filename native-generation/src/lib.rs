@@ -83,6 +83,7 @@ mod tests {
     fn object_emission_for_every_platform() {
         let module = native_ir::Module {
             name: "app".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![native_ir::Function::Defined {
                 name: "main".into(),
                 parameters: vec![],
@@ -127,6 +128,7 @@ mod tests {
     fn jit_runs_main_of_a_program() {
         let dependency = native_ir::Module {
             name: "wibble/wobble".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![
                 native_ir::Function::External {
                     name: "print_int".into(),
@@ -148,6 +150,7 @@ mod tests {
         };
         let root = native_ir::Module {
             name: "app".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![native_ir::Function::Defined {
                 name: "main".into(),
                 parameters: vec![],
@@ -189,6 +192,7 @@ mod tests {
     fn jit_runs_big_integer_literals() {
         let module = native_ir::Module {
             name: "app".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![native_ir::Function::Defined {
                 name: "main".into(),
                 parameters: vec![],
@@ -213,6 +217,7 @@ mod tests {
     fn jit_runs_float_literals() {
         let module = native_ir::Module {
             name: "app".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![
                 native_ir::Function::External {
                     name: "print_float".into(),
@@ -241,6 +246,7 @@ mod tests {
     fn jit_runs_case_expressions() {
         let module = native_ir::Module {
             name: "app".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![native_ir::Function::Defined {
                 name: "main".into(),
                 parameters: vec![],
@@ -283,6 +289,7 @@ mod tests {
     fn jit_compiles_panic_expressions() {
         let module = native_ir::Module {
             name: "app".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![
                 native_ir::Function::Defined {
                     name: "explode".into(),
@@ -314,6 +321,7 @@ mod tests {
     fn jit_runs_string_literals() {
         let module = native_ir::Module {
             name: "app".into(),
+            src_path: "src/main.gleam".into(),
             functions: vec![
                 native_ir::Function::External {
                     name: "println".into(),

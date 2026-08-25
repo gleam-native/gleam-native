@@ -68,7 +68,7 @@ mod compile_package;
 mod config;
 mod dependencies;
 mod docs;
-mod export;
+pub mod export;
 mod fix;
 mod format;
 pub mod fs;

@@ -1,0 +1,27 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+pub fn main() -> Nil {
+  echo "before"
+  panic as "boom"
+}
+
+
+--- exit status ---------------------
+1
+
+--- standard output -----------------
+
+--- standard error ------------------
+[90msrc/main.gleam:5[39m
+"before"
+runtime error: panic
+
+boom
+
+    main.main:6

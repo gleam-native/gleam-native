@@ -1,0 +1,68 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+const answer = 42
+
+const limits = #(1, 100)
+
+const defaults = [42, 7]
+
+fn sum(list: List(Int)) -> Int {
+  case list {
+    [] -> 0
+    [first, ..rest] -> first + sum(rest)
+  }
+}
+
+pub fn main() -> Nil {
+  echo answer
+  echo limits.1 - limits.0
+  echo sum(defaults)
+  // Truncating division, dividend-sign remainder, zero rules.
+  echo -7 / 2
+  echo -7 % 2
+  echo 1 / 0
+  echo 0.1 +. 0.2
+  echo 1.0 /. 0.0 == 0.0
+  echo 2 <= 2
+  echo [1, 2] == [1, 2]
+  echo #(1, "a") == #(1, "b")
+  // echo passes its value through.
+  let through = echo 21 * 2
+  echo through
+  Nil
+}
+
+
+--- gleam run output ----------------
+[90msrc/main.gleam:18[39m
+42
+[90msrc/main.gleam:19[39m
+99
+[90msrc/main.gleam:20[39m
+49
+[90msrc/main.gleam:22[39m
+-3
+[90msrc/main.gleam:23[39m
+-1
+[90msrc/main.gleam:24[39m
+0
+[90msrc/main.gleam:25[39m
+0.30000000000000004
+[90msrc/main.gleam:26[39m
+True
+[90msrc/main.gleam:27[39m
+True
+[90msrc/main.gleam:28[39m
+True
+[90msrc/main.gleam:29[39m
+False
+[90msrc/main.gleam:31[39m
+42
+[90msrc/main.gleam:32[39m
+42

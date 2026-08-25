@@ -189,7 +189,7 @@ impl RuntimeFunctions {
             bitarray_read_int: declare(BITARRAY_READ_INT, 5)?,
             bitarray_slice: declare(BITARRAY_SLICE, 4)?,
             record_new: declare(RECORD_NEW, 3)?,
-            closure_new: declare(CLOSURE_NEW, 1)?,
+            closure_new: declare(CLOSURE_NEW, 2)?,
             deep_eq: declare(DEEP_EQ, 2)?,
             echo: declare(ECHO, 6)?,
             inc: declare(INC, 1)?,
@@ -205,6 +205,7 @@ enum PendingFunction {
     Lambda {
         id: FuncId,
         module_name: String,
+        src_path: String,
         parameters: Vec<String>,
         captures: Vec<String>,
         body: Vec<native_ir::Statement>,
@@ -317,7 +318,7 @@ impl<'a, M: Module> Translator<'a, M> {
             let id = self
                 .function_id(&module.name, name)
                 .expect("declared in first pass");
-            self.define_function(id, &module.name, parameters, body)?;
+            self.define_function(id, &module.name, &module.src_path, parameters, body)?;
             self.define_pending()?;
         }
         Ok(())
@@ -331,10 +332,13 @@ impl<'a, M: Module> Translator<'a, M> {
                 PendingFunction::Lambda {
                     id,
                     module_name,
+                    src_path,
                     parameters,
                     captures,
                     body,
-                } => self.define_lambda(id, &module_name, &parameters, &captures, &body)?,
+                } => {
+                    self.define_lambda(id, &module_name, &src_path, &parameters, &captures, &body)?
+                }
                 PendingFunction::Wrapper {
                     id,
                     target,
@@ -352,6 +356,7 @@ impl<'a, M: Module> Translator<'a, M> {
         &mut self,
         id: FuncId,
         module_name: &str,
+        src_path: &str,
         parameters: &[String],
         captures: &[String],
         body: &[native_ir::Statement],
@@ -393,6 +398,7 @@ impl<'a, M: Module> Translator<'a, M> {
             functions: &self.functions,
             runtime: self.runtime,
             module_name,
+            src_path,
             module: self.module,
             builder: &mut builder,
             environment,
@@ -478,6 +484,7 @@ impl<'a, M: Module> Translator<'a, M> {
         &mut self,
         id: FuncId,
         module_name: &str,
+        src_path: &str,
         parameters: &[String],
         body: &[native_ir::Statement],
     ) -> Result<(), String> {
@@ -507,6 +514,7 @@ impl<'a, M: Module> Translator<'a, M> {
             functions: &self.functions,
             runtime: self.runtime,
             module_name,
+            src_path,
             module: self.module,
             builder: &mut builder,
             environment,
@@ -589,6 +597,8 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     functions: &'a HashMap<(String, String), (FuncId, bool)>,
     runtime: RuntimeFunctions,
     module_name: &'a str,
+    /// The module's package-root-relative source path, printed by `echo`.
+    src_path: &'a str,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
     environment: HashMap<String, Variable>,
@@ -606,13 +616,24 @@ struct FunctionTranslator<'a, 'b, M: Module> {
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
     /// Allocates a closure: one word for the code pointer followed by the
-    /// captured values, read out of the current environment.
-    fn make_closure(&mut self, function: FuncId, captures: &[String]) -> Result<Value, String> {
+    /// captured values, read out of the current environment. The arity is
+    /// the function's parameter count without the closure argument, stored
+    /// for `echo`'s function rendering.
+    fn make_closure(
+        &mut self,
+        function: FuncId,
+        captures: &[String],
+        arity: u32,
+    ) -> Result<Value, String> {
         let capture_count = self.builder.ins().iconst(types::I64, captures.len() as i64);
+        let arity = self.builder.ins().iconst(types::I64, arity as i64);
         let closure_new_ref = self
             .module
             .declare_func_in_func(self.runtime.closure_new, self.builder.func);
-        let call = self.builder.ins().call(closure_new_ref, &[capture_count]);
+        let call = self
+            .builder
+            .ins()
+            .call(closure_new_ref, &[capture_count, arity]);
         let closure = self.builder.inst_results(call)[0];
 
         let function_ref = self.module.declare_func_in_func(function, self.builder.func);
@@ -1212,11 +1233,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.pending.push(PendingFunction::Lambda {
                     id,
                     module_name: self.module_name.to_string(),
+                    src_path: self.src_path.to_string(),
                     parameters: parameters.clone(),
                     captures: captures.clone(),
                     body: body.clone(),
                 });
-                self.make_closure(id, &captures)
+                self.make_closure(id, &captures, parameters.len() as u32)
             }
 
             native_ir::Expression::FunctionReference {
@@ -1252,7 +1274,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         id
                     }
                 };
-                self.make_closure(id, &[])
+                self.make_closure(id, &[], *arity)
             }
 
             native_ir::Expression::CallValue { callee, arguments } => {
@@ -1384,6 +1406,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         native_ir::EchoKind::String => 3,
                         native_ir::EchoKind::Bool => 4,
                         native_ir::EchoKind::Nil => 5,
+                        native_ir::EchoKind::List => 6,
                     },
                 );
                 let value = self.expression(value)?;
@@ -1391,9 +1414,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     Some(message) => (self.expression(message)?, true),
                     None => (self.builder.ins().iconst(types::I64, 0), false),
                 };
-                let module_name = self.module_name.to_string();
+                let src_path = self.src_path.to_string();
                 let (module_pointer, module_length) =
-                    self.constant_bytes(module_name.as_bytes())?;
+                    self.constant_bytes(src_path.as_bytes())?;
                 let line = self.builder.ins().iconst(types::I64, *line as i64);
                 let echo_ref = self
                     .module

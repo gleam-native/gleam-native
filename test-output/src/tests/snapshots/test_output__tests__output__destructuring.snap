@@ -1,0 +1,50 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+pub type Config {
+  Config(host: String, port: Int)
+}
+
+fn found(value: Int) -> Result(Int, String) {
+  Ok(value)
+}
+
+pub fn main() -> Nil {
+  let #(a, b) = #(40, 2)
+  echo a + b
+  let Config(host: host, port: port) = Config("localhost", 8080)
+  echo host
+  echo port
+  let assert [first, ..rest] = [1, 2, 3]
+  let assert [second, ..] = rest
+  echo first + second
+  let assert Ok(value) = found(9000)
+  echo value
+  let assert "gleam-" <> version = "gleam-1.18"
+  echo version
+  let assert <<x:16>> = <<2, 1>>
+  echo x
+  Nil
+}
+
+
+--- gleam run output ----------------
+[90msrc/main.gleam:14[39m
+42
+[90msrc/main.gleam:16[39m
+"localhost"
+[90msrc/main.gleam:17[39m
+8080
+[90msrc/main.gleam:20[39m
+3
+[90msrc/main.gleam:22[39m
+9000
+[90msrc/main.gleam:24[39m
+"1.18"
+[90msrc/main.gleam:26[39m
+513

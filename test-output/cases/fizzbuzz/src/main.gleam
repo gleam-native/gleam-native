@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+fn fizzbuzz(n: Int, limit: Int) -> Nil {
+  case n > limit {
+    True -> Nil
+    False -> {
+      case n % 3, n % 5 {
+        0, 0 -> {
+          echo "FizzBuzz"
+          Nil
+        }
+        0, _ -> {
+          echo "Fizz"
+          Nil
+        }
+        _, 0 -> {
+          echo "Buzz"
+          Nil
+        }
+        _, _ -> {
+          echo n
+          Nil
+        }
+      }
+      fizzbuzz(n + 1, limit)
+    }
+  }
+}
+
+pub fn main() -> Nil {
+  fizzbuzz(1, 15)
+}

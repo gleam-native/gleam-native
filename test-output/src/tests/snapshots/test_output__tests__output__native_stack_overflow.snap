@@ -1,0 +1,32 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+fn deep(n: Int) -> Int {
+  case n {
+    0 -> 0
+    _ -> 1 + deep(n - 1)
+  }
+}
+
+pub fn main() -> Nil {
+  print_int(deep(100_000_000))
+}
+
+
+--- exit status ---------------------
+1
+
+--- standard output -----------------
+
+--- standard error ------------------
+runtime error: stack overflow
+
+The program recursed too deeply. Gleam tail calls run in constant stack space, but deeply nested non-tail recursion exhausted the stack.
