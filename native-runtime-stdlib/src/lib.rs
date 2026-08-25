@@ -35,7 +35,7 @@ pub extern "C" fn gleam_native_inspect_value(value: u64) -> u64 {
 }
 
 fn str_value(value: u64) -> &'static str {
-    string_value(value).as_str()
+    string_value(value)
 }
 
 /// True and False as Gleam values.
@@ -397,7 +397,7 @@ pub extern "C" fn gleam_native_string_byte_slice(string: u64, index: u64, length
 pub extern "C" fn gleam_native_string_crop(string: u64, substring: u64) -> u64 {
     let subject = str_value(string);
     match subject.find(str_value(substring)) {
-        Some(index) => box_string(subject[index..].to_string()),
+        Some(index) => box_string_slice(string, index, subject.len() - index),
         None => gleam_native_inc(string),
     }
 }
@@ -432,7 +432,7 @@ pub extern "C" fn gleam_native_string_split_once(string: u64, substring: u64) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_string_remove_prefix(string: u64, prefix: u64) -> u64 {
     match str_value(string).strip_prefix(str_value(prefix)) {
-        Some(rest) => box_string(rest.to_string()),
+        Some(rest) => box_string_slice(string, str_value(string).len() - rest.len(), rest.len()),
         None => gleam_native_inc(string),
     }
 }
@@ -442,7 +442,7 @@ pub extern "C" fn gleam_native_string_remove_prefix(string: u64, prefix: u64) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_string_remove_suffix(string: u64, suffix: u64) -> u64 {
     match str_value(string).strip_suffix(str_value(suffix)) {
-        Some(rest) => box_string(rest.to_string()),
+        Some(rest) => box_string_slice(string, 0, rest.len()),
         None => gleam_native_inc(string),
     }
 }
@@ -457,7 +457,11 @@ pub extern "C" fn gleam_native_string_pop_char(string: u64) -> u64 {
     match subject.chars().next() {
         Some(character) => make_tuple2(
             tag_small_int(character as i64),
-            box_string(subject[character.len_utf8()..].to_string()),
+            box_string_slice(
+                string,
+                character.len_utf8(),
+                subject.len() - character.len_utf8(),
+            ),
         ),
         None => make_tuple2(tag_small_int(0), gleam_native_inc(string)),
     }
@@ -469,7 +473,19 @@ pub extern "C" fn gleam_native_string_pop_char(string: u64) -> u64 {
 pub extern "C" fn gleam_native_string_char_slice(string: u64, from: u64, length: u64) -> u64 {
     let from = ((from as i64) >> 1).max(0) as usize;
     let length = ((length as i64) >> 1).max(0) as usize;
-    box_string(str_value(string).chars().skip(from).take(length).collect::<String>())
+    let subject = str_value(string);
+    if length == 0 {
+        return box_string("");
+    }
+    let mut boundaries = subject
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(subject.len()));
+    let Some(start) = boundaries.nth(from) else {
+        return box_string("");
+    };
+    let end = boundaries.nth(length.wrapping_sub(1)).unwrap_or(subject.len());
+    box_string_slice(string, start, end - start)
 }
 
 // ---------------------------------------------------------------------------

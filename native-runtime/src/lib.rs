@@ -183,7 +183,70 @@ pub fn box_float(value: f64) -> u64 {
 }
 
 pub fn box_string(value: impl Into<CompactString>) -> u64 {
-    box_heap(KIND_STRING, value.into())
+    box_heap(KIND_STRING, StringPayload::Owned(value.into()))
+}
+
+/// A string's payload: its own bytes, or a view into another string's.
+/// A view keeps an owned reference to its parent — always an `Owned`
+/// string — so `rest`-of-string values from pattern matches and the
+/// standard library's parsing loops share one buffer instead of copying
+/// the remainder each step.
+pub enum StringPayload {
+    Owned(CompactString),
+    View(StringView),
+}
+
+/// A view's fields; dropping one releases the parent reference.
+pub struct StringView {
+    parent: u64,
+    offset: u32,
+    length: u32,
+}
+
+impl Drop for StringView {
+    fn drop(&mut self) {
+        let _ = gleam_native_dec(self.parent);
+    }
+}
+
+/// Slices at or below this many bytes are copied inline rather than
+/// viewed: the copy is as cheap as the view and never pins the parent
+/// buffer.
+const MAX_INLINE_SLICE: usize = 24;
+
+/// A string holding `parent`'s bytes from `offset` for `length` bytes,
+/// both on character boundaries: inline-copied when short, otherwise a
+/// view sharing the (root) parent's buffer.
+pub fn box_string_slice(parent: u64, offset: usize, length: usize) -> u64 {
+    if length <= MAX_INLINE_SLICE {
+        return box_string(&string_value(parent)[offset..offset + length]);
+    }
+    // Point at the root so view chains stay one level deep.
+    let (root, base) = match unsafe { &(*container::<StringPayload>(parent)).value } {
+        StringPayload::Owned(_) => (parent, 0),
+        StringPayload::View(view) => (view.parent, view.offset as usize),
+    };
+    let (Ok(offset), Ok(length)) = (
+        u32::try_from(base + offset),
+        u32::try_from(length),
+    ) else {
+        return box_string(&string_value(parent)[offset..offset + length]);
+    };
+    box_heap(
+        KIND_STRING,
+        StringPayload::View(StringView {
+            parent: gleam_native_inc(root),
+            offset,
+            length,
+        }),
+    )
+}
+
+/// A slice of `parent` given as a subslice of its own text, as the string
+/// functions returning `&str` regions (trims, split parts) produce.
+fn slice_of(parent: u64, sub: &str) -> u64 {
+    let offset = sub.as_ptr() as usize - string_value(parent).as_ptr() as usize;
+    box_string_slice(parent, offset, sub.len())
 }
 
 pub fn heap_header(value: u64) -> u64 {
@@ -198,8 +261,18 @@ pub fn float_value(value: u64) -> f64 {
     unsafe { (*container::<f64>(value)).value }
 }
 
-pub fn string_value(value: u64) -> &'static CompactString {
-    unsafe { &(*container::<CompactString>(value)).value }
+pub fn string_value(value: u64) -> &'static str {
+    match unsafe { &(*container::<StringPayload>(value)).value } {
+        StringPayload::Owned(string) => string.as_str(),
+        StringPayload::View(view) => {
+            let StringPayload::Owned(parent) =
+                (unsafe { &(*container::<StringPayload>(view.parent)).value })
+            else {
+                unreachable!("view parents are owned strings");
+            };
+            &parent[view.offset as usize..(view.offset + view.length) as usize]
+        }
+    }
 }
 
 /// A bit array's payload: a bit count and MSB-first packed bytes, the
@@ -606,7 +679,8 @@ pub unsafe extern "C" fn gleam_native_string_starts_with(
 /// a valid character boundary within it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u64) -> u64 {
-    box_string(&string_value(subject)[offset as usize..])
+    let length = string_value(subject).len() - offset as usize;
+    box_string_slice(subject, offset as usize, length)
 }
 
 /// Builds a two-element tuple (a record with tag 0).
@@ -715,7 +789,7 @@ pub unsafe extern "C" fn gleam_native_string_reverse(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_contains(string: u64, needle: u64) -> u64 {
-    if string_value(string).contains(string_value(needle).as_str()) {
+    if string_value(string).contains(string_value(needle)) {
         TRUE
     } else {
         FALSE
@@ -727,7 +801,7 @@ pub unsafe extern "C" fn gleam_native_string_contains(string: u64, needle: u64) 
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64) -> u64 {
-    if string_value(string).ends_with(string_value(suffix).as_str()) {
+    if string_value(string).ends_with(string_value(suffix)) {
         TRUE
     } else {
         FALSE
@@ -739,7 +813,7 @@ pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64)
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim(string: u64) -> u64 {
-    box_string(string_value(string).trim_matches(TRIMMED_WHITESPACE))
+    slice_of(string, string_value(string).trim_matches(TRIMMED_WHITESPACE))
 }
 
 /// The whitespace characters `string.trim` removes on every target: ASCII
@@ -754,7 +828,7 @@ const TRIMMED_WHITESPACE: &[char] = &[
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
-    box_string(string_value(string).trim_start_matches(TRIMMED_WHITESPACE))
+    slice_of(string, string_value(string).trim_start_matches(TRIMMED_WHITESPACE))
 }
 
 /// # Safety
@@ -762,7 +836,7 @@ pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_end(string: u64) -> u64 {
-    box_string(string_value(string).trim_end_matches(TRIMMED_WHITESPACE))
+    slice_of(string, string_value(string).trim_end_matches(TRIMMED_WHITESPACE))
 }
 
 /// The `length` grapheme clusters starting at grapheme index `start`
@@ -793,7 +867,7 @@ pub unsafe extern "C" fn gleam_native_string_replace(
     pattern: u64,
     replacement: u64,
 ) -> u64 {
-    box_string(string_value(string).replace(string_value(pattern).as_str(), string_value(replacement)))
+    box_string(string_value(string).replace(string_value(pattern), string_value(replacement)))
 }
 
 /// Splits on a separator, returning a list of strings. An empty separator
@@ -804,15 +878,14 @@ pub unsafe extern "C" fn gleam_native_string_replace(
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_split(string: u64, on: u64) -> u64 {
-    let string = string_value(string);
+    let text = string_value(string);
     let on = string_value(on);
     if on.is_empty() {
-        return make_list(vec![box_string(string.as_str())]);
+        return make_list(vec![gleam_native_inc(string)]);
     }
     make_list(
-        string
-            .split(on.as_str())
-            .map(box_string)
+        text.split(on)
+            .map(|part| slice_of(string, part))
             .collect(),
     )
 }
@@ -825,15 +898,13 @@ pub unsafe extern "C" fn gleam_native_string_split(string: u64, on: u64) -> u64 
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_pop_grapheme(string: u64) -> u64 {
-    let string = string_value(string);
-    match string.grapheme_indices(true).next() {
+    let text = string_value(string);
+    match text.grapheme_indices(true).next() {
         None => make_error(NIL),
-        Some((_, head)) => {
-            make_ok(make_tuple2(
-                box_string(head),
-                box_string(&string[head.len()..]),
-            ))
-        }
+        Some((_, head)) => make_ok(make_tuple2(
+            box_string(head),
+            box_string_slice(string, head.len(), text.len() - head.len()),
+        )),
     }
 }
 
@@ -1673,7 +1744,7 @@ fn free_object(value: u64, worklist: &mut Vec<u64>) {
         KIND_BIGINT => free_payload::<BigInt>(value),
         // A float box is count, header, and payload: the three-word class.
         KIND_FLOAT => free_words(count, 3),
-        KIND_STRING => free_payload::<CompactString>(value),
+        KIND_STRING => free_payload::<StringPayload>(value),
         KIND_BITARRAY => free_payload::<BitArrayPayload>(value),
         KIND_DICT => {
             // Dropping the persistent map releases exactly the tree
