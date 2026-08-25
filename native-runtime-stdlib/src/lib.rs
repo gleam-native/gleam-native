@@ -823,9 +823,19 @@ pub extern "C" fn gleam_native_dict_has_key(key: u64, dict: u64) -> u64 {
 /// The key and value come first, matching `maps:put/3`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_insert(key: u64, value: u64, dict: u64) -> u64 {
-    // The persistent map's clone is O(1); the insert path-copies O(log n)
-    // nodes. Any replaced entry (and whichever of the old and new keys the
-    // map lets go of) releases its reference on drop.
+    // A uniquely-referenced dict — the common accumulator in a fold of
+    // inserts — mutates in place: nothing else can observe it, and its
+    // trie nodes stay unshared, so no path copies at all.
+    if sole_reference(dict) {
+        let _ = dict_payload_mut(dict).map.insert(
+            DictKey(gleam_native_inc(key)),
+            DictEntry(gleam_native_inc(value)),
+        );
+        return gleam_native_inc(dict);
+    }
+    // Otherwise the persistent map's clone is O(1); the insert path-copies
+    // O(log n) nodes. Any replaced entry (and whichever of the old and new
+    // keys the map lets go of) releases its reference on drop.
     let mut map = dict_payload(dict).map.clone();
     let _ = map.insert(
         DictKey(gleam_native_inc(key)),
@@ -861,6 +871,10 @@ pub extern "C" fn gleam_native_dict_to_list(dict: u64) -> u64 {
 /// which in-place mutation path-copies as it touches nodes.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_to_transient(dict: u64) -> u64 {
+    // A uniquely-referenced dict simply becomes the transient.
+    if sole_reference(dict) {
+        return gleam_native_inc(dict);
+    }
     box_dict(DictPayload {
         map: dict_payload(dict).map.clone(),
     })

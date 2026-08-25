@@ -261,6 +261,7 @@ pub fn float_value(value: u64) -> f64 {
     unsafe { (*container::<f64>(value)).value }
 }
 
+#[inline]
 pub fn string_value(value: u64) -> &'static str {
     match unsafe { &(*container::<StringPayload>(value)).value } {
         StringPayload::Owned(string) => string.as_str(),
@@ -270,7 +271,14 @@ pub fn string_value(value: u64) -> &'static str {
             else {
                 unreachable!("view parents are owned strings");
             };
-            &parent[view.offset as usize..(view.offset + view.length) as usize]
+            // Views are constructed on character boundaries within the
+            // parent, so resolution skips the boundary re-checks.
+            unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    parent.as_ptr().add(view.offset as usize),
+                    view.length as usize,
+                ))
+            }
         }
     }
 }
@@ -2006,6 +2014,16 @@ pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
         // Closures and unknown kinds: identity order.
         _ => left.cmp(&right),
     }
+}
+
+/// Whether an external's heap argument is the last reference to its
+/// value. The caller passes arguments as owned temporaries and releases
+/// them right after the call, so a count of one means nothing else can
+/// observe the value: an external may recycle it in place and return a
+/// fresh reference to it instead of building a copy.
+#[inline]
+pub fn sole_reference(value: u64) -> bool {
+    unsafe { *((value - 8) as *const u64) == 1 }
 }
 
 pub fn dict_payload(value: u64) -> &'static DictPayload {
