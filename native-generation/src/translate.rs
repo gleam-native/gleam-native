@@ -18,7 +18,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{DataDescription, FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 /// The symbols of the runtime's integer arithmetic slow paths.
 pub const INT_ADD_SLOW: &str = "gleam_native_int_add_slow";
@@ -81,9 +81,14 @@ pub const DEEP_EQ: &str = "gleam_native_eq";
 /// The symbol of the runtime's `echo` implementation.
 pub const ECHO: &str = "gleam_native_echo";
 
-/// The symbols of the runtime's reference counting operations.
-pub const INC: &str = "gleam_native_inc";
-pub const DEC: &str = "gleam_native_dec";
+/// The symbol of the runtime's destructor for an object whose reference
+/// count has reached zero: the slow path behind the decrement generated
+/// code emits inline.
+pub const DESTROY: &str = "gleam_native_destroy";
+
+/// The symbol of the runtime data word holding the program thread's
+/// allocation pool address, read by inline pooled allocations.
+pub const POOL: &str = "gleam_native_pool";
 
 /// The symbol of the runtime's panic/todo report-and-abort function.
 pub const PANIC: &str = "gleam_native_panic";
@@ -148,14 +153,18 @@ struct RuntimeFunctions {
     closure_new: FuncId,
     deep_eq: FuncId,
     echo: FuncId,
-    inc: FuncId,
-    dec: FuncId,
+    destroy: FuncId,
     panic: FuncId,
+    /// The pool-address data symbol, for inline pooled allocation.
+    pool: DataId,
 }
 
 impl RuntimeFunctions {
     fn declare(module: &mut impl Module) -> Result<Self, String> {
         let call_conv = module.isa().default_call_conv();
+        let pool = module
+            .declare_data(POOL, Linkage::Import, true, false)
+            .map_err(|error| error.to_string())?;
         let mut declare = |symbol: &str, arity: usize| {
             module
                 .declare_function(symbol, Linkage::Import, &c_signature(call_conv, arity))
@@ -192,9 +201,9 @@ impl RuntimeFunctions {
             closure_new: declare(CLOSURE_NEW, 2)?,
             deep_eq: declare(DEEP_EQ, 2)?,
             echo: declare(ECHO, 6)?,
-            inc: declare(INC, 1)?,
-            dec: declare(DEC, 1)?,
+            destroy: declare(DESTROY, 1)?,
             panic: declare(PANIC, 7)?,
+            pool,
         })
     }
 }
@@ -452,23 +461,20 @@ impl<'a, M: Module> Translator<'a, M> {
 
         let closure = builder.block_params(entry)[0];
         let arguments: Vec<Value> = builder.block_params(entry)[1..].to_vec();
-        let dec_ref = self
-            .module
-            .declare_func_in_func(self.runtime.dec, builder.func);
         let target_ref = self.module.declare_func_in_func(target, builder.func);
         if target_external {
             // Externals borrow: call, then release what this wrapper owns.
             let call = builder.ins().call(target_ref, &arguments);
             let result = builder.inst_results(call)[0];
-            let _ = builder.ins().call(dec_ref, &[closure]);
+            emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
             for argument in &arguments {
-                let _ = builder.ins().call(dec_ref, &[*argument]);
+                emit_dec(self.module, self.runtime.destroy, &mut builder, *argument);
             }
             builder.ins().return_(&[result]);
         } else {
             // Gleam functions own their arguments: release the closure and
             // transfer the rest with a genuine tail call.
-            let _ = builder.ins().call(dec_ref, &[closure]);
+            emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
             builder.ins().return_call(target_ref, &arguments);
         }
         builder.finalize(self.module.target_config());
@@ -577,6 +583,66 @@ impl<'a, M: Module> Translator<'a, M> {
     }
 }
 
+/// Emits an inline reference count increment: nothing for immediates, one
+/// added to the count word before the object for heap values.
+fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
+    let heap = builder.create_block();
+    let done = builder.create_block();
+    let immediate = builder.ins().band_imm_u(value, 1);
+    builder.ins().brif(immediate, done, &[], heap, &[]);
+    builder.seal_block(heap);
+
+    builder.switch_to_block(heap);
+    let count = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), value, -8);
+    let incremented = builder.ins().iadd_imm_s(count, 1);
+    let _ = builder
+        .ins()
+        .store(MemFlagsData::trusted(), incremented, value, -8);
+    builder.ins().jump(done, &[]);
+    builder.seal_block(done);
+
+    builder.switch_to_block(done);
+}
+
+/// Emits an inline reference count decrement: nothing for immediates, one
+/// subtracted from the count word for heap values, and a cold runtime
+/// destroy call when the count reaches zero.
+fn emit_dec<M: Module>(
+    module: &mut M,
+    destroy: FuncId,
+    builder: &mut FunctionBuilder<'_>,
+    value: Value,
+) {
+    let heap = builder.create_block();
+    let dead = builder.create_block();
+    let done = builder.create_block();
+    let immediate = builder.ins().band_imm_u(value, 1);
+    builder.ins().brif(immediate, done, &[], heap, &[]);
+    builder.seal_block(heap);
+
+    builder.switch_to_block(heap);
+    let count = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), value, -8);
+    let decremented = builder.ins().iadd_imm_s(count, -1);
+    let _ = builder
+        .ins()
+        .store(MemFlagsData::trusted(), decremented, value, -8);
+    builder.ins().brif(decremented, done, &[], dead, &[]);
+    builder.seal_block(dead);
+    builder.set_cold_block(dead);
+
+    builder.switch_to_block(dead);
+    let destroy_ref = module.declare_func_in_func(destroy, builder.func);
+    let _ = builder.ins().call(destroy_ref, &[value]);
+    builder.ins().jump(done, &[]);
+    builder.seal_block(done);
+
+    builder.switch_to_block(done);
+}
+
 /// How a decision tree's leaves behave: `case` clause bodies run in their
 /// own scope, while assignment destructuring binds into the enclosing scope
 /// and yields the subject value.
@@ -625,16 +691,19 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         captures: &[String],
         arity: u32,
     ) -> Result<Value, String> {
-        let capture_count = self.builder.ins().iconst(types::I64, captures.len() as i64);
-        let arity = self.builder.ins().iconst(types::I64, arity as i64);
-        let closure_new_ref = self
-            .module
-            .declare_func_in_func(self.runtime.closure_new, self.builder.func);
-        let call = self
-            .builder
-            .ins()
-            .call(closure_new_ref, &[capture_count, arity]);
-        let closure = self.builder.inst_results(call)[0];
+        let header = native_runtime::closure_header(captures.len() as u32, arity);
+        let closure = self.pool_alloc(2 + captures.len(), header, |this| {
+            let capture_count = this.builder.ins().iconst(types::I64, captures.len() as i64);
+            let arity = this.builder.ins().iconst(types::I64, arity as i64);
+            let closure_new_ref = this
+                .module
+                .declare_func_in_func(this.runtime.closure_new, this.builder.func);
+            let call = this
+                .builder
+                .ins()
+                .call(closure_new_ref, &[capture_count, arity]);
+            Ok(this.builder.inst_results(call)[0])
+        })?;
 
         let function_ref = self.module.declare_func_in_func(function, self.builder.func);
         let pointer_type = self.module.target_config().pointer_type();
@@ -784,19 +853,101 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
     /// Emits a reference count increment. Yields the value for chaining.
     fn inc(&mut self, value: Value) -> Value {
-        let inc_ref = self
-            .module
-            .declare_func_in_func(self.runtime.inc, self.builder.func);
-        let _ = self.builder.ins().call(inc_ref, &[value]);
+        emit_inc(self.builder, value);
         value
     }
 
     /// Emits a reference count decrement.
     fn dec(&mut self, value: Value) {
-        let dec_ref = self
+        emit_dec(self.module, self.runtime.destroy, self.builder, value);
+    }
+
+    /// Emits an inline pooled allocation of `object_words` words (header
+    /// included) with the given constant header word, popping the program
+    /// thread's free list for the size class. `slow` emits the fallback
+    /// runtime call, taken when the pool is empty or not yet published —
+    /// or, for objects too large to pool, unconditionally. The fallback
+    /// also writes the header, so only field words remain to store.
+    fn pool_alloc(
+        &mut self,
+        object_words: usize,
+        header: u64,
+        slow: impl FnOnce(&mut Self) -> Result<Value, String>,
+    ) -> Result<Value, String> {
+        // The class index is the block's total size, count word included,
+        // mirroring the runtime's pool layout.
+        let total = 1 + object_words;
+        if total >= native_runtime::POOL_CLASSES {
+            return slow(self);
+        }
+        let check = self.builder.create_block();
+        let hit = self.builder.create_block();
+        let miss = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        let pool_ref = self
             .module
-            .declare_func_in_func(self.runtime.dec, self.builder.func);
-        let _ = self.builder.ins().call(dec_ref, &[value]);
+            .declare_data_in_func(self.runtime.pool, self.builder.func);
+        let pointer_type = self.module.target_config().pointer_type();
+        let pool_address = self.builder.ins().symbol_value(pointer_type, pool_ref);
+        let pool =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), pool_address, 0);
+        self.builder.ins().brif(pool, check, &[], miss, &[]);
+        self.builder.seal_block(check);
+
+        self.builder.switch_to_block(check);
+        let head_offset = (8 * total) as i32;
+        let head = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), pool, head_offset);
+        self.builder.ins().brif(head, hit, &[], miss, &[]);
+        self.builder.seal_block(hit);
+        self.builder.seal_block(miss);
+        self.builder.set_cold_block(miss);
+
+        // Pop the block: its count word holds the next free block. The
+        // count becomes one (this allocation's reference) and the header
+        // is a compile-time constant.
+        self.builder.switch_to_block(hit);
+        let next = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), head, 0);
+        let _ = self
+            .builder
+            .ins()
+            .store(MemFlagsData::trusted(), next, pool, head_offset);
+        let blocks_offset = (8 * (native_runtime::POOL_CLASSES + total)) as i32;
+        let blocks =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), pool, blocks_offset);
+        let blocks = self.builder.ins().iadd_imm_s(blocks, -1);
+        let _ = self
+            .builder
+            .ins()
+            .store(MemFlagsData::trusted(), blocks, pool, blocks_offset);
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let _ = self.builder.ins().store(MemFlagsData::trusted(), one, head, 0);
+        let header_value = self.builder.ins().iconst(types::I64, header as i64);
+        let _ = self
+            .builder
+            .ins()
+            .store(MemFlagsData::trusted(), header_value, head, 8);
+        let value = self.builder.ins().iadd_imm_s(head, 8);
+        self.builder.ins().jump(join, &[value.into()]);
+
+        self.builder.switch_to_block(miss);
+        let slow_value = slow(self)?;
+        self.builder.ins().jump(join, &[slow_value.into()]);
+        self.builder.seal_block(join);
+
+        self.builder.switch_to_block(join);
+        Ok(self.builder.block_params(join)[0])
     }
 
     /// Translates a statement sequence with ownership bookkeeping: values of
@@ -1176,17 +1327,24 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 for argument in arguments {
                     values.push(self.expression(argument)?);
                 }
-                let tag = self.builder.ins().iconst(types::I64, *tag as i64);
-                let arity = self.builder.ins().iconst(types::I64, values.len() as i64);
-                let display = self.builder.ins().iconst(types::I64, display as i64);
-                let record_new_ref = self
-                    .module
-                    .declare_func_in_func(self.runtime.record_new, self.builder.func);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(record_new_ref, &[tag, arity, display]);
-                let record = self.builder.inst_results(call)[0];
+                let arity = values.len();
+                // The header is a compile-time constant, mirroring the
+                // runtime allocator's formula.
+                let header = native_runtime::record_header(*tag, arity as u32)
+                    | ((display as u64) << 48);
+                let record = self.pool_alloc(1 + arity, header, |this| {
+                    let tag = this.builder.ins().iconst(types::I64, *tag as i64);
+                    let arity = this.builder.ins().iconst(types::I64, arity as i64);
+                    let display = this.builder.ins().iconst(types::I64, display as i64);
+                    let record_new_ref = this
+                        .module
+                        .declare_func_in_func(this.runtime.record_new, this.builder.func);
+                    let call = this
+                        .builder
+                        .ins()
+                        .call(record_new_ref, &[tag, arity, display]);
+                    Ok(this.builder.inst_results(call)[0])
+                })?;
                 for (index, value) in values.into_iter().enumerate() {
                     let _ = self.builder.ins().store(
                         MemFlagsData::trusted(),
@@ -2270,11 +2428,20 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             .builder
             .ins()
             .bitcast(types::I64, MemFlagsData::new(), value);
-        let from_bits_ref = self
-            .module
-            .declare_func_in_func(self.runtime.float_from_bits, self.builder.func);
-        let call = self.builder.ins().call(from_bits_ref, &[bits]);
-        Ok(self.builder.inst_results(call)[0])
+        let boxed = self.pool_alloc(2, native_runtime::KIND_FLOAT, |this| {
+            let from_bits_ref = this
+                .module
+                .declare_func_in_func(this.runtime.float_from_bits, this.builder.func);
+            let call = this.builder.ins().call(from_bits_ref, &[bits]);
+            Ok(this.builder.inst_results(call)[0])
+        })?;
+        // The fallback stored the same payload; an unconditional store
+        // keeps the block structure simple.
+        let _ = self
+            .builder
+            .ins()
+            .store(MemFlagsData::trusted(), bits, boxed, 8);
+        Ok(boxed)
     }
 
     /// Turns an i8 comparison flag into a tagged boolean (1 or 3).

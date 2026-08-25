@@ -109,7 +109,7 @@ pub(crate) fn constructor_name(display: u16) -> Option<&'static str> {
 /// The closure header: capture count where records keep their arity, and
 /// the function's own arity (without the closure argument) where records
 /// keep their tag, read back by `echo`'s function rendering.
-const fn closure_header(captures: u32, arity: u32) -> u64 {
+pub const fn closure_header(captures: u32, arity: u32) -> u64 {
     KIND_CLOSURE | ((arity as u64) << 16) | ((captures as u64) << 32)
 }
 
@@ -987,6 +987,7 @@ pub fn run_program_thread_with(
         .name("gleam-main".into())
         .stack_size(stack_size)
         .spawn(move || {
+            publish_pool();
             install_stack_overflow_handler();
             body();
         })
@@ -1488,23 +1489,52 @@ fn word_layout(words: usize) -> std::alloc::Layout {
 /// [`allocate_words`] to hand straight back instead of going through the
 /// system allocator each time. A freed block stores the next free block's
 /// address in its count word, so the pool needs no memory of its own.
-struct Pool {
+///
+/// The layout is part of the code generation contract: generated code pops
+/// free lists inline through [`gleam_native_pool`], reading `heads[total]`
+/// at byte offset `8 * total` and `counts[total]` at byte offset
+/// `8 * (POOL_CLASSES + total)`.
+#[repr(C)]
+pub struct Pool {
     /// The first free block of each size class (0 when empty), indexed by
     /// the block's total size in words, count word included.
     heads: [Cell<u64>; POOL_CLASSES],
     /// How many blocks each class holds, enforcing
     /// [`POOL_CLASS_CAPACITY`].
-    counts: [Cell<u32>; POOL_CLASSES],
+    counts: [Cell<u64>; POOL_CLASSES],
 }
 
 /// One class per total word count: count and header words plus up to 32
 /// fields. Larger objects use the system allocator directly.
-const POOL_CLASSES: usize = 35;
+pub const POOL_CLASSES: usize = 35;
 
 /// The most blocks a size class retains. Frees beyond this go back to the
 /// system allocator, bounding how much freed memory the pool can hold onto
 /// after a large working set shrinks.
-const POOL_CLASS_CAPACITY: u32 = 4096;
+const POOL_CLASS_CAPACITY: u64 = 4096;
+
+/// The address of the program thread's [`Pool`], published by
+/// [`run_program_thread_with`] before any Gleam code runs so that generated
+/// code (which runs only on that thread) can pop pooled allocations inline.
+/// Zero until published; inline fast paths check and fall back to the
+/// runtime's allocation call.
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static gleam_native_pool: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The symbol generated code reads the program thread's pool through.
+pub const POOL_SYMBOL: &str = "gleam_native_pool";
+
+/// Publishes the calling thread's pool for generated code.
+fn publish_pool() {
+    POOL.with(|pool| {
+        gleam_native_pool.store(
+            pool as *const Pool as u64,
+            std::sync::atomic::Ordering::Release,
+        )
+    });
+}
 
 thread_local! {
     static POOL: Pool = const {
@@ -1564,6 +1594,14 @@ pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
             return NIL;
         }
     }
+    destroy(value);
+    NIL
+}
+
+/// Destroys an object whose reference count has already reached zero: the
+/// slow path behind the decrement generated code emits inline.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_destroy(value: u64) -> u64 {
     destroy(value);
     NIL
 }
@@ -2423,6 +2461,16 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("gleam_native_eq", gleam_native_eq as *const u8),
         ("gleam_native_inc", gleam_native_inc as *const u8),
         ("gleam_native_dec", gleam_native_dec as *const u8),
+        (
+            "gleam_native_destroy",
+            gleam_native_destroy as *const u8,
+        ),
+        // A data symbol, not a function: generated code loads the program
+        // thread's pool address through it for inline pooled allocation.
+        (
+            POOL_SYMBOL,
+            (&raw const gleam_native_pool) as *const u8,
+        ),
         ("gleam_native_echo", gleam_native_echo as *const u8),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
