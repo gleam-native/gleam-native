@@ -74,20 +74,21 @@ platform C convention.
   constructor destructuring); bindings persist in the enclosing scope
 - ✅ `let assert` (pattern match or panic with the optional `as` message,
   module/function/line metadata, exit code 1)
-- 🚧 `case` expressions — lowered from the `CompiledCase` decision tree as
-  planned. Working: multi-subject matches, literal checks (small and big
-  integers, floats, strings), `Bool`/`Nil` variant checks (with the
+- ✅ `case` expressions — lowered from the `CompiledCase` decision tree as
+  planned: multi-subject matches, literal checks (small and big integers,
+  floats, strings), `Bool`/`Nil` variant checks (with the
   variant-index-to-tagged-word mapping: `True` is variant 0 but encodes
   as 1), variable and discard patterns, pattern bindings, alternative
   patterns (`a | b`)
-- 🚧 Destructuring pattern kinds: constructors with fields, tuples, lists
-  (`[x, ..rest]`, nested patterns), and string prefixes
-  (`"pre" <> rest`, including `as` bindings, in `case` and `let assert`)
-  work, including untested final variants of exhaustive matches, whose
-  fields arrive via the fallback. Bit array patterns are fully supported
-- 🚧 Guards (`if` clauses): operators, negation, variables, tuple indexing,
-  and scalar literal constants work (sharing the expression operator
-  lowering). Not yet: field access and module constants in guards
+- ✅ Destructuring pattern kinds: constructors with fields, tuples, lists
+  (`[x, ..rest]`, nested patterns), string prefixes (`"pre" <> rest`,
+  including `as` bindings, in `case` and `let assert`), and bit arrays —
+  including untested final variants of exhaustive matches, whose fields
+  arrive via the fallback
+- ✅ Guards (`if` clauses): operators, negation, variables, tuple indexing,
+  record field access (including chained access), and constants of every
+  kind — scalar and composite literals and module constants, local and
+  module-qualified (sharing the expression operator and constant lowering)
 - ✅ `use` expressions (the type checker's desugared callback call is
   lowered directly)
 - ✅ `assert` (with the optional `as` message, location metadata, exit

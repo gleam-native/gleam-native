@@ -661,7 +661,17 @@ impl Lowerer<'_> {
                     index: *index as u32,
                 })
             }
-            ClauseGuard::FieldAccess { .. } => Err(self.unsupported("field access in guards")),
+            ClauseGuard::FieldAccess {
+                container,
+                index: Some(index),
+                ..
+            } => Ok(native_ir::Expression::FieldAccess {
+                record: Box::new(self.guard(container)?),
+                index: *index as u32,
+            }),
+            ClauseGuard::FieldAccess { index: None, .. } => {
+                Err(self.unsupported("this guard expression"))
+            }
             ClauseGuard::ModuleSelect { literal, .. } => self.constant(literal),
             ClauseGuard::Invalid { .. } => Err(self.unsupported("this guard expression")),
         }
@@ -2313,6 +2323,54 @@ pub fn main() {
                         native_ir::Expression::Int(0)
                     )],
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn field_access_in_guards() {
+        let module = lower(
+            r#"pub type Person {
+  Person(name: String, age: Int)
+}
+
+pub fn main() {
+  case Person("Ada", 36) {
+    person if person.age > 18 -> 1
+    _ -> 0
+  }
+}"#,
+        );
+        let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
+            panic!("expected a defined function");
+        };
+        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        else {
+            panic!("expected a case expression");
+        };
+        // The guard sits below the single-variant switch.
+        fn find_guard(decision: &native_ir::Decision) -> Option<&native_ir::Expression> {
+            match decision {
+                native_ir::Decision::Guard { guard, .. } => Some(guard),
+                native_ir::Decision::Switch {
+                    choices, fallback, ..
+                } => choices
+                    .iter()
+                    .find_map(|(_, decision)| find_guard(decision))
+                    .or_else(|| find_guard(fallback)),
+                _ => None,
+            }
+        }
+        let guard = find_guard(tree).expect("a guard in the tree");
+        assert_eq!(
+            guard,
+            &native_ir::Expression::IntCompare {
+                operator: native_ir::CompareOperator::GreaterThan,
+                left: Box::new(native_ir::Expression::FieldAccess {
+                    record: Box::new(native_ir::Expression::Variable("person".into())),
+                    index: 1,
+                }),
+                right: Box::new(native_ir::Expression::Int(18)),
             }
         );
     }
