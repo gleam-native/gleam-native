@@ -533,11 +533,18 @@ impl<'a, M: Module> Translator<'a, M> {
 
     /// Generates the C-convention wrapper the host uses to call `main`.
     pub fn define_entry_wrapper(&mut self, main: FuncId) -> Result<FuncId, String> {
+        self.define_c_wrapper(ENTRY_SYMBOL, main)
+    }
+
+    /// Generates a C-convention, zero-argument wrapper around the given
+    /// function, under the given symbol. The test runner uses one per test
+    /// so the host can call compiled tests directly.
+    pub fn define_c_wrapper(&mut self, symbol: &str, target: FuncId) -> Result<FuncId, String> {
         let call_conv = self.module.isa().default_call_conv();
         let signature = c_signature(call_conv, 0);
         let id = self
             .module
-            .declare_function(ENTRY_SYMBOL, Linkage::Export, &signature)
+            .declare_function(symbol, Linkage::Export, &signature)
             .map_err(|error| error.to_string())?;
 
         let mut context = self.module.make_context();
@@ -548,8 +555,8 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let main_ref = self.module.declare_func_in_func(main, builder.func);
-        let call = builder.ins().call(main_ref, &[]);
+        let target_ref = self.module.declare_func_in_func(target, builder.func);
+        let call = builder.ins().call(target_ref, &[]);
         let result = builder.inst_results(call)[0];
         builder.ins().return_(&[result]);
         builder.finalize(self.module.target_config());

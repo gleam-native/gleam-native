@@ -351,6 +351,10 @@ pub enum Command {
     /// Run the project tests
     ///
     /// This command runs the `main` function from the `<PROJECT_NAME>_test` module.
+    ///
+    /// On the native target it instead discovers and runs the public
+    /// zero-argument functions ending in `_test` from the modules in the
+    /// `test` directory, reporting each outcome.
     #[command(trailing_var_arg = true)]
     Test {
         /// Which compilation target to use

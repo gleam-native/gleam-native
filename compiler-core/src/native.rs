@@ -20,7 +20,7 @@ use crate::{
     },
     error::Error,
     exhaustiveness,
-    type_::{PRELUDE_MODULE_NAME, Type, ValueConstructorVariant},
+    type_::{ModuleValueConstructor, PRELUDE_MODULE_NAME, Type, ValueConstructorVariant},
 };
 
 /// The tagged word encoding of a small integer; see `native-runtime`.
@@ -290,6 +290,77 @@ impl Lowerer<'_> {
                 }
             },
 
+            // Module-qualified access, `module.name`: the same cases as
+            // `Var` above, driven by `ModuleValueConstructor`.
+            TypedExpr::ModuleSelect {
+                constructor,
+                module_name,
+                type_,
+                ..
+            } => match constructor {
+                ModuleValueConstructor::Fn { module, name, .. } => {
+                    let arity = type_
+                        .fn_arity()
+                        .ok_or_else(|| self.unsupported("this module access"))?;
+                    Ok(native_ir::Expression::FunctionReference {
+                        module: module.clone().into(),
+                        function: name.clone().into(),
+                        arity: arity as u32,
+                    })
+                }
+                ModuleValueConstructor::Constant { literal, .. } => self.constant(literal),
+                ModuleValueConstructor::Record { name, arity: 0, .. }
+                    if module_name == PRELUDE_MODULE_NAME && name == "Nil" =>
+                {
+                    Ok(native_ir::Expression::Nil)
+                }
+                ModuleValueConstructor::Record { name, arity: 0, .. }
+                    if module_name == PRELUDE_MODULE_NAME
+                        && (name == "True" || name == "False") =>
+                {
+                    Ok(native_ir::Expression::Bool(name == "True"))
+                }
+                ModuleValueConstructor::Record {
+                    name,
+                    arity: 0,
+                    variant_index,
+                    ..
+                } => Ok(native_ir::Expression::Constructor {
+                    tag: *variant_index as u32,
+                    display: native_ir::ConstructorDisplay::Record {
+                        name: name.clone().into(),
+                    },
+                    arguments: vec![],
+                }),
+                // A constructor used as a function value: a lambda that
+                // allocates the record.
+                ModuleValueConstructor::Record {
+                    name,
+                    arity,
+                    variant_index,
+                    ..
+                } => {
+                    let parameters: Vec<String> =
+                        (0..*arity).map(|index| format!("$field{index}")).collect();
+                    let arguments = parameters
+                        .iter()
+                        .map(|name| native_ir::Expression::Variable(name.clone()))
+                        .collect();
+                    Ok(native_ir::Expression::Lambda {
+                        parameters,
+                        body: vec![native_ir::Statement::Expression(
+                            native_ir::Expression::Constructor {
+                                tag: *variant_index as u32,
+                                display: native_ir::ConstructorDisplay::Record {
+                                    name: name.clone().into(),
+                                },
+                                arguments,
+                            },
+                        )],
+                    })
+                }
+            },
+
             TypedExpr::Call {
                 fun, arguments, ..
             } => {
@@ -321,6 +392,32 @@ impl Lowerer<'_> {
                             callee: Box::new(self.expression(fun)?),
                             arguments,
                         }),
+                    },
+                    TypedExpr::ModuleSelect { constructor, .. } => match constructor {
+                        ModuleValueConstructor::Fn { module, name, .. } => {
+                            Ok(native_ir::Expression::Call {
+                                module: module.clone().into(),
+                                function: name.clone().into(),
+                                arguments,
+                            })
+                        }
+                        ModuleValueConstructor::Record {
+                            name,
+                            variant_index,
+                            ..
+                        } => Ok(native_ir::Expression::Constructor {
+                            tag: *variant_index as u32,
+                            display: native_ir::ConstructorDisplay::Record {
+                                name: name.clone().into(),
+                            },
+                            arguments,
+                        }),
+                        ModuleValueConstructor::Constant { .. } => {
+                            Ok(native_ir::Expression::CallValue {
+                                callee: Box::new(self.expression(fun)?),
+                                arguments,
+                            })
+                        }
                     },
                     _ => Ok(native_ir::Expression::CallValue {
                         callee: Box::new(self.expression(fun)?),

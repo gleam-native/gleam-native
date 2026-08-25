@@ -101,6 +101,9 @@ platform C convention.
 
 - ✅ Module function definitions with parameters
 - ✅ Direct calls, including cross-module calls
+- ✅ Module-qualified access (`module.function(..)`, `module.constant`,
+  `module.Constructor`, and qualified functions or constructors used as
+  values), sharing the unqualified lowering paths
 - ✅ Guaranteed tail calls between Gleam functions: calls in tail position
   (including through blocks and case clauses) compile to genuine
   `return_call`/`return_call_indirect` transfers, so self- and mutual tail
@@ -237,7 +240,19 @@ platform C convention.
   named after the package. The static library is looked up next to the
   `gleam` binary (`libnative_runtime_static.a`), overridable with
   `GLEAM_NATIVE_RUNTIME_LIB`
-- ❌ `gleam test` (needs a gleeunit story or a native test runner)
+- ✅ `gleam test` — a built-in runner (gleeunit needs the standard library,
+  which native does not support yet): the harness discovers public
+  zero-argument `*_test` functions in the root package's `test`-directory
+  modules — gleeunit's convention, so suites stay compatible — compiles
+  them with a C-convention wrapper each, and runs them in order on the
+  program thread. A failing test's panic report is printed and the run
+  resumes with the next test: in test mode `gleam_native_panic` re-enters
+  the runner loop instead of exiting, abandoning the failed test's frames
+  and allocations (the process exits at the end of the run, so the leak is
+  harmless). Output is a `PASS`/`FAIL` line per test plus a
+  `Ran N tests, F failures` summary; exit code 1 if anything failed. A
+  stack overflow still aborts the whole run, and `gleeunit` itself remains
+  unsupported
 - ❌ Debug info (DWARF via `gimli`) — spans must keep flowing through the IR
   so this stays possible
 - ✅ Cross-compilation: `gleam export native --platform <name>` with the

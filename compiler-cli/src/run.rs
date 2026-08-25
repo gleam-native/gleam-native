@@ -8,8 +8,8 @@ use ecow::EcoString;
 use gleam_core::{
     analyse::TargetSupport,
     build::{
-        Built, Codegen, Compile, ErlangOutput, Mode, NullTelemetry, Options, Runtime, Target,
-        Telemetry,
+        Built, Codegen, Compile, ErlangOutput, Mode, NullTelemetry, Options, Origin, Runtime,
+        Target, Telemetry,
     },
     config::{DenoFlag, PackageConfig},
     error::Error,
@@ -131,6 +131,27 @@ pub fn setup(
     };
 
     let built = crate::build::main(paths, options, manifest)?;
+
+    // On the native target `gleam test` does not run `<package>_test.main`:
+    // the built-in runner discovers and runs the test functions itself,
+    // following gleeunit's convention (the library needs the standard
+    // library, which the native target does not support yet).
+    if target == Target::Native && matches!(which, Which::Test) {
+        if let Some(r) = runtime {
+            return Err(Error::InvalidRuntime {
+                target: Target::Native,
+                invalid_runtime: r,
+            });
+        }
+        let tests = native_test_functions(&built);
+        telemetry.running("the test suite");
+        return run_native_test_command(
+            paths,
+            tests,
+            arguments,
+            mod_config.native.stack_size_megabytes,
+        );
+    }
 
     // A module can not be run if it does not exist or does not have a public main function.
     let main_function = get_or_suggest_main_function(built, &module, target)?;
@@ -284,6 +305,58 @@ fn run_native_command(
     let modules = load_native_modules(&build_directory).unwrap_or_else(|error| fail(error));
 
     match native_generation::jit::run(&modules, module, arguments, stack_size_megabytes) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => fail(error),
+    }
+}
+
+/// The tests the native runner executes: public zero-argument functions
+/// whose names end in `_test`, in the root package's modules from the
+/// `test` directory — the convention gleeunit uses on the other targets.
+/// Modules are visited in name order; functions in source order.
+fn native_test_functions(built: &Built) -> Vec<(String, String)> {
+    let mut modules: Vec<_> = built
+        .root_package
+        .modules
+        .iter()
+        .filter(|module| module.origin == Origin::Test)
+        .collect();
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut tests = vec![];
+    for module in modules {
+        for function in &module.ast.definitions.functions {
+            let Some((_, name)) = &function.name else {
+                continue;
+            };
+            if function.publicity.is_public()
+                && function.arguments.is_empty()
+                && name.ends_with("_test")
+            {
+                tests.push((module.name.to_string(), name.to_string()));
+            }
+        }
+    }
+    tests
+}
+
+/// Like [`run_native_command`], but running the discovered test functions
+/// through the JIT test runner instead of a module's `main`. The runner
+/// reports each test and exits the process itself.
+fn run_native_test_command(
+    paths: &ProjectPaths,
+    tests: Vec<(String, String)>,
+    arguments: Vec<String>,
+    stack_size_megabytes: u64,
+) -> Result<Command, Error> {
+    fn fail(message: String) -> ! {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
+
+    let build_directory = paths.build_directory_for_target(Mode::Dev, Target::Native);
+    let modules = load_native_modules(&build_directory).unwrap_or_else(|error| fail(error));
+
+    match native_generation::jit::run_tests(&modules, &tests, arguments, stack_size_megabytes) {
         Ok(()) => std::process::exit(0),
         Err(error) => fail(error),
     }

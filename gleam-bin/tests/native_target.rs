@@ -40,10 +40,30 @@ impl TestProject {
         self.run_with_arguments(&[])
     }
 
+    /// A project with an additional `test/{name}_test.gleam` module.
+    fn with_test_module(name: &str, source: &str, test_source: &str) -> Self {
+        let project = Self::new(name, source);
+        std::fs::create_dir_all(project.root.join("test")).expect("create test directory");
+        std::fs::write(
+            project.root.join("test").join(format!("{name}_test.gleam")),
+            test_source,
+        )
+        .expect("write test source");
+        project
+    }
+
     fn run_with_arguments(&self, arguments: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_gleam"))
             .arg("run")
             .args(arguments)
+            .current_dir(&self.root)
+            .output()
+            .expect("run the gleam binary")
+    }
+
+    fn test(&self) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_gleam"))
+            .arg("test")
             .current_dir(&self.root)
             .output()
             .expect("run the gleam binary")
@@ -1157,6 +1177,152 @@ stderr: {stderr}"
     assert!(stdout.contains("10000000"), "stdout: {stdout}");
     assert!(stdout.contains("5000050000"), "stdout: {stdout}");
     assert!(stdout.contains("done"), "stdout: {stdout}");
+}
+
+#[test]
+fn test_runner_passing_suite() {
+    // `gleam test` discovers public zero-argument `*_test` functions in the
+    // test directory and runs each; the test module imports the code under
+    // test with module-qualified calls, constants, and constructors.
+    let project = TestProject::with_test_module(
+        "runner_pass",
+        r#"pub const answer = 42
+
+pub type Shape {
+  Circle(radius: Float)
+  Point
+}
+
+pub fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+"#,
+        r#"import runner_pass
+
+pub fn add_test() {
+  assert runner_pass.add(40, runner_pass.answer - 40) == 42
+}
+
+pub fn shapes_test() {
+  let shape = runner_pass.Circle(2.0)
+  assert shape != runner_pass.Point
+  let make = runner_pass.Circle
+  assert make(2.0) == shape
+}
+
+fn helper() -> Int {
+  1
+}
+
+pub fn not_a_test(value: Int) -> Int {
+  value + helper()
+}
+"#,
+    );
+
+    let output = project.test();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a passing suite should exit 0.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("  PASS runner_pass_test.add_test\n")
+            && stdout.contains("  PASS runner_pass_test.shapes_test\n"),
+        "expected a PASS line per test.
+stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Ran 2 tests, 0 failures"),
+        "helper, non-test, and private functions must not be discovered.
+stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_runner_continues_after_a_failure() {
+    // A failing test is reported and the remaining tests still run; the
+    // process exits 1 with a summary counting the failure.
+    let project = TestProject::with_test_module(
+        "runner_fail",
+        r#"pub fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+"#,
+        r#"import runner_fail
+
+pub fn a_first_test() {
+  assert runner_fail.add(1, 1) == 2
+}
+
+pub fn b_broken_test() {
+  assert runner_fail.add(2, 2) == 5 as "two and two is not five"
+}
+
+pub fn c_last_test() {
+  assert runner_fail.add(3, 3) == 6
+}
+"#,
+    );
+
+    let output = project.test();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failing suite should exit 1.
+stdout: {stdout}
+stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("  PASS runner_fail_test.a_first_test\n")
+            && stdout.contains("  FAIL runner_fail_test.b_broken_test\n")
+            && stdout.contains("  PASS runner_fail_test.c_last_test\n"),
+        "the test after the failure must still run.
+stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Ran 3 tests, 1 failure"),
+        "unexpected summary.
+stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("runtime error: assert") && stderr.contains("two and two is not five"),
+        "the failure report should appear on stderr.
+stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_runner_empty_suite() {
+    // A project without tests runs cleanly and reports zero tests.
+    let project = TestProject::new(
+        "runner_empty",
+        r#"pub fn main() -> Nil {
+  Nil
+}
+"#,
+    );
+    let output = project.test();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an empty suite should exit 0.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Ran 0 tests, 0 failures"),
+        "unexpected summary.
+stdout: {stdout}"
+    );
 }
 
 #[test]

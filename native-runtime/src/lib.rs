@@ -911,6 +911,17 @@ pub fn run_program_thread(
     stack_size_megabytes: u64,
     entry: extern "C" fn() -> u64,
 ) -> Result<(), String> {
+    run_program_thread_with(stack_size_megabytes, move || {
+        let _ = entry();
+    })
+}
+
+/// [`run_program_thread`] for an arbitrary body: used by the test runner,
+/// whose entry is a Rust loop over the compiled test functions.
+pub fn run_program_thread_with(
+    stack_size_megabytes: u64,
+    body: impl FnOnce() + Send + 'static,
+) -> Result<(), String> {
     let stack_size = usize::try_from(stack_size_megabytes.max(1))
         .unwrap_or(usize::MAX)
         .saturating_mul(1024 * 1024);
@@ -919,12 +930,66 @@ pub fn run_program_thread(
         .stack_size(stack_size)
         .spawn(move || {
             install_stack_overflow_handler();
-            let _ = entry();
+            body();
         })
         .map_err(|error| format!("could not start the program thread: {error}"))?
         .join()
         .map_err(|_| "the program crashed".to_string())?;
     Ok(())
+}
+
+/// The state of a `gleam test` run: the discovered tests and the run's
+/// progress. Present only while tests are executing; its presence is what
+/// switches [`gleam_native_panic`] into recoverable test mode.
+struct TestRun {
+    /// Test display names and their C-convention entry wrappers.
+    tests: Vec<(String, extern "C" fn() -> u64)>,
+    /// The index of the next test to start.
+    next: std::sync::atomic::AtomicUsize,
+    /// How many tests have failed so far.
+    failed: std::sync::atomic::AtomicUsize,
+}
+
+static TEST_RUN: std::sync::OnceLock<TestRun> = std::sync::OnceLock::new();
+
+/// Runs the given tests in order on the current thread, reporting each
+/// outcome, then exits the process: 0 if every test passed, 1 otherwise.
+///
+/// A failing test panics into [`gleam_native_panic`], which reports the
+/// failure and resumes the run by calling [`continue_test_run`] rather than
+/// returning through the failed test's stack frames. Those frames (and the
+/// failed test's allocations) are simply abandoned — the process exits when
+/// the run finishes, so the leak is harmless. A stack overflow is not
+/// recoverable this way and still aborts the whole run.
+pub fn run_tests(tests: Vec<(String, extern "C" fn() -> u64)>) -> ! {
+    let _ = TEST_RUN.set(TestRun {
+        tests,
+        next: std::sync::atomic::AtomicUsize::new(0),
+        failed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    continue_test_run()
+}
+
+/// Runs every not-yet-started test to completion, then reports the summary
+/// and exits the process. Called from [`run_tests`] and re-entered by
+/// [`gleam_native_panic`] after a test fails.
+fn continue_test_run() -> ! {
+    use std::sync::atomic::Ordering;
+    let run = TEST_RUN.get().expect("a test run is in progress");
+    loop {
+        let index = run.next.fetch_add(1, Ordering::SeqCst);
+        let Some((name, function)) = run.tests.get(index) else {
+            break;
+        };
+        let _ = function();
+        println!("  PASS {name}");
+    }
+    let total = run.tests.len();
+    let failed = run.failed.load(Ordering::SeqCst);
+    let plural = if failed == 1 { "failure" } else { "failures" };
+    println!();
+    println!("Ran {total} tests, {failed} {plural}");
+    std::process::exit(if failed == 0 { 0 } else { 1 });
 }
 
 /// The symbol of the program data blob that ahead-of-time compilation embeds
@@ -1569,11 +1634,32 @@ pub unsafe extern "C" fn gleam_native_panic(
     } else {
         string_value(message)
     };
+    // Under `gleam test` the panic is a test failure: name the test on
+    // standard output alongside the PASS lines before the report.
+    let failed_test = TEST_RUN.get().and_then(|run| {
+        let index = run
+            .next
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .checked_sub(1)?;
+        let (test_name, _) = run.tests.get(index)?;
+        Some((run, test_name))
+    });
+    if let Some((_, test_name)) = &failed_test {
+        println!("  FAIL {test_name}");
+    }
     eprintln!("runtime error: {name}");
     eprintln!();
     eprintln!("{message}");
     eprintln!();
     eprintln!("    {module}.{function}:{line}");
+    if let Some((run, _)) = failed_test {
+        let _ = run
+            .failed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Resume with the next test instead of exiting; the failed test's
+        // frames below this one are abandoned.
+        continue_test_run();
+    }
     std::process::exit(1);
 }
 
