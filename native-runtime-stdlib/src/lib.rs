@@ -260,6 +260,27 @@ pub unsafe extern "C" fn gleam_native_float_floor(value: u64) -> u64 {
     box_float(float_value(value).floor())
 }
 
+/// Three-way float comparison as a tagged -1/0/1: one call and two loads
+/// where the Gleam implementation chained two boxed comparisons. Matches
+/// its exact semantics, IEEE included: a NaN is neither equal nor less,
+/// so it compares "greater".
+///
+/// # Safety
+///
+/// See [`gleam_native_float_ceiling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gleam_native_float_compare(left: u64, right: u64) -> u64 {
+    let left = float_value(left);
+    let right = float_value(right);
+    tag_small_int(if left == right {
+        0
+    } else if left < right {
+        -1
+    } else {
+        1
+    })
+}
+
 /// Rounds to the nearest integer, ties away from zero, like
 /// `erlang:round/1`.
 ///
@@ -1192,6 +1213,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         (
             "gleam_native_float_parse",
             gleam_native_float_parse as *const u8,
+        ),
+        (
+            "gleam_native_float_compare",
+            gleam_native_float_compare as *const u8,
         ),
         (
             "gleam_native_float_ceiling",
