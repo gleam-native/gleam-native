@@ -824,6 +824,40 @@ pub unsafe extern "C" fn gleam_native_float_to_string(value: u64) -> u64 {
     box_string(format!("{:?}", float_value(value)))
 }
 
+/// Installs a handler that reports stack overflows (and other fatal memory
+/// faults) as a runtime error with exit code 1 instead of a raw signal
+/// death. Uses an alternate signal stack, since the main stack is exhausted
+/// when a stack overflow fires.
+pub fn install_stack_overflow_handler() {
+    unsafe {
+        let stack = libc::stack_t {
+            ss_sp: std::alloc::alloc(
+                std::alloc::Layout::from_size_align(64 * 1024, 16).expect("layout"),
+            ) as *mut libc::c_void,
+            ss_flags: 0,
+            ss_size: 64 * 1024,
+        };
+        let _ = libc::sigaltstack(&stack, std::ptr::null_mut());
+
+        extern "C" fn handler(_signal: libc::c_int) {
+            let message = b"runtime error: stack overflow
+
+The program recursed too deeply. Gleam tail calls run in constant stack space, but deeply nested non-tail recursion exhausted the stack.
+";
+            unsafe {
+                let _ = libc::write(2, message.as_ptr() as *const libc::c_void, message.len());
+                libc::_exit(1);
+            }
+        }
+
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_ONSTACK;
+        let _ = libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut());
+        let _ = libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
+    }
+}
+
 /// The command line arguments the host passes in before running `main`.
 static START_ARGUMENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 

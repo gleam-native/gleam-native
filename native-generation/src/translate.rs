@@ -212,14 +212,16 @@ enum PendingFunction {
     Wrapper {
         id: FuncId,
         target: FuncId,
+        target_external: bool,
         arity: u32,
     },
 }
 
 pub struct Translator<'a, M: Module> {
     module: &'a mut M,
-    /// Gleam (module, function) to declared Cranelift function.
-    functions: HashMap<(String, String), FuncId>,
+    /// Gleam (module, function) to declared Cranelift function and whether
+    /// it is an external (C convention, borrows its arguments).
+    functions: HashMap<(String, String), (FuncId, bool)>,
     runtime: RuntimeFunctions,
     pending: Vec<PendingFunction>,
     /// One wrapper per module function used as a value.
@@ -255,7 +257,7 @@ impl<'a, M: Module> Translator<'a, M> {
     pub fn function_id(&self, module: &str, function: &str) -> Option<FuncId> {
         self.functions
             .get(&(module.to_string(), function.to_string()))
-            .copied()
+            .map(|(id, _)| *id)
     }
 
     /// First pass: declare every function of every module so that call sites
@@ -263,7 +265,7 @@ impl<'a, M: Module> Translator<'a, M> {
     pub fn declare_module(&mut self, module: &native_ir::Module) -> Result<(), String> {
         let call_conv = self.module.isa().default_call_conv();
         for function in &module.functions {
-            let (name, id) = match function {
+            let (name, id, external) = match function {
                 native_ir::Function::Defined {
                     name, parameters, ..
                 } => {
@@ -276,7 +278,7 @@ impl<'a, M: Module> Translator<'a, M> {
                             &gleam_signature(parameters.len()),
                         )
                         .map_err(|error| error.to_string())?;
-                    (name, id)
+                    (name, id, false)
                 }
                 native_ir::Function::External {
                     name,
@@ -291,12 +293,12 @@ impl<'a, M: Module> Translator<'a, M> {
                             &c_signature(call_conv, *arity as usize),
                         )
                         .map_err(|error| error.to_string())?;
-                    (name, id)
+                    (name, id, true)
                 }
             };
             let _ = self
                 .functions
-                .insert((module.name.clone(), name.clone()), id);
+                .insert((module.name.clone(), name.clone()), (id, external));
         }
         Ok(())
     }
@@ -333,9 +335,12 @@ impl<'a, M: Module> Translator<'a, M> {
                     captures,
                     body,
                 } => self.define_lambda(id, &module_name, &parameters, &captures, &body)?,
-                PendingFunction::Wrapper { id, target, arity } => {
-                    self.define_wrapper(id, target, arity)?
-                }
+                PendingFunction::Wrapper {
+                    id,
+                    target,
+                    target_external,
+                    arity,
+                } => self.define_wrapper(id, target, target_external, arity)?,
             }
         }
         Ok(())
@@ -363,11 +368,13 @@ impl<'a, M: Module> Translator<'a, M> {
 
         let closure = builder.block_params(entry)[0];
         let mut environment = HashMap::new();
+        let mut scope_owned = Vec::new();
         for (index, parameter) in parameters.iter().enumerate() {
             let value = builder.block_params(entry)[1 + index];
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
             let _ = environment.insert(parameter.clone(), variable);
+            scope_owned.push((parameter.clone(), variable));
         }
         for (index, capture) in captures.iter().enumerate() {
             let value = builder.ins().load(
@@ -379,6 +386,7 @@ impl<'a, M: Module> Translator<'a, M> {
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
             let _ = environment.insert(capture.clone(), variable);
+            scope_owned.push((capture.clone(), variable));
         }
 
         let mut function_translator = FunctionTranslator {
@@ -393,10 +401,21 @@ impl<'a, M: Module> Translator<'a, M> {
             generated_counter: &mut self.generated_counter,
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
-            scope_owned: Vec::new(),
+            scope_owned,
         };
-        let result = function_translator.statements(body)?;
-        builder.ins().return_(&[result]);
+        // The capture slots take their own references, then the closure
+        // itself (owned by this call) is released.
+        for index in 0..captures.len() {
+            let slot = function_translator.scope_owned[parameters.len() + index].1;
+            let value = function_translator.builder.use_var(slot);
+            let _ = function_translator.inc(value);
+        }
+        function_translator.dec(closure);
+        if let Some(result) =
+            function_translator.statements_scoped(body, 0, Some(Vec::new()))?
+        {
+            builder.ins().return_(&[result]);
+        }
         builder.finalize(self.module.target_config());
 
         self.module
@@ -407,8 +426,14 @@ impl<'a, M: Module> Translator<'a, M> {
     }
 
     /// Defines the wrapper that adapts a directly-callable function to the
-    /// closure calling convention: ignore the closure, forward the rest.
-    fn define_wrapper(&mut self, id: FuncId, target: FuncId, arity: u32) -> Result<(), String> {
+    /// closure calling convention: release the closure, forward the rest.
+    fn define_wrapper(
+        &mut self,
+        id: FuncId,
+        target: FuncId,
+        target_external: bool,
+        arity: u32,
+    ) -> Result<(), String> {
         let mut context = self.module.make_context();
         context.func.signature = gleam_signature(1 + arity as usize);
 
@@ -419,11 +444,27 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
+        let closure = builder.block_params(entry)[0];
         let arguments: Vec<Value> = builder.block_params(entry)[1..].to_vec();
+        let dec_ref = self
+            .module
+            .declare_func_in_func(self.runtime.dec, builder.func);
         let target_ref = self.module.declare_func_in_func(target, builder.func);
-        let call = builder.ins().call(target_ref, &arguments);
-        let result = builder.inst_results(call)[0];
-        builder.ins().return_(&[result]);
+        if target_external {
+            // Externals borrow: call, then release what this wrapper owns.
+            let call = builder.ins().call(target_ref, &arguments);
+            let result = builder.inst_results(call)[0];
+            let _ = builder.ins().call(dec_ref, &[closure]);
+            for argument in &arguments {
+                let _ = builder.ins().call(dec_ref, &[*argument]);
+            }
+            builder.ins().return_(&[result]);
+        } else {
+            // Gleam functions own their arguments: release the closure and
+            // transfer the rest with a genuine tail call.
+            let _ = builder.ins().call(dec_ref, &[closure]);
+            builder.ins().return_call(target_ref, &arguments);
+        }
         builder.finalize(self.module.target_config());
 
         self.module
@@ -451,11 +492,15 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.seal_block(entry);
 
         let mut environment = HashMap::new();
+        let mut scope_owned = Vec::new();
         for (index, parameter) in parameters.iter().enumerate() {
             let value = builder.block_params(entry)[index];
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
             let _ = environment.insert(parameter.clone(), variable);
+            // The callee owns its arguments; parameters are released like
+            // any other scope binding (or early, when dead).
+            scope_owned.push((parameter.clone(), variable));
         }
 
         let mut function_translator = FunctionTranslator {
@@ -470,10 +515,13 @@ impl<'a, M: Module> Translator<'a, M> {
             generated_counter: &mut self.generated_counter,
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
-            scope_owned: Vec::new(),
+            scope_owned,
         };
-        let result = function_translator.statements(body)?;
-        builder.ins().return_(&[result]);
+        if let Some(result) =
+            function_translator.statements_scoped(body, 0, Some(Vec::new()))?
+        {
+            builder.ins().return_(&[result]);
+        }
         builder.finalize(self.module.target_config());
 
         self.module
@@ -517,9 +565,13 @@ impl<'a, M: Module> Translator<'a, M> {
 /// How a decision tree's leaves behave: `case` clause bodies run in their
 /// own scope, while assignment destructuring binds into the enclosing scope
 /// and yields the subject value.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DecisionMode<'a> {
-    Case,
+    Case {
+        /// In tail position: the owned values (enclosing scopes, subjects)
+        /// to release before a tail transfer inside a clause.
+        tail: Option<Vec<Value>>,
+    },
     Assignment {
         result: Value,
         on_failure: Option<&'a native_ir::AssignmentFailure>,
@@ -527,7 +579,7 @@ enum DecisionMode<'a> {
 }
 
 struct FunctionTranslator<'a, 'b, M: Module> {
-    functions: &'a HashMap<(String, String), FuncId>,
+    functions: &'a HashMap<(String, String), (FuncId, bool)>,
     runtime: RuntimeFunctions,
     module_name: &'a str,
     module: &'a mut M,
@@ -725,6 +777,23 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     /// is incremented since both the binding and the sequence result own it.
     fn statements(&mut self, statements: &[native_ir::Statement]) -> Result<Value, String> {
         let scope_start = self.scope_owned.len();
+        match self.statements_scoped(statements, scope_start, None)? {
+            Some(value) => Ok(value),
+            None => unreachable!("tail transfer outside a tail context"),
+        }
+    }
+
+    /// Like [`Self::statements`], but with an explicit scope start (so
+    /// function parameters participate in scope release) and, when in tail
+    /// position, the owned values of enclosing scopes to release before a
+    /// tail transfer. Returns `None` when the sequence ended in a genuine
+    /// tail call and control never returns here.
+    fn statements_scoped(
+        &mut self,
+        statements: &[native_ir::Statement],
+        scope_start: usize,
+        tail: Option<Vec<Value>>,
+    ) -> Result<Option<Value>, String> {
         let mut result = None;
         for (index, statement) in statements.iter().enumerate() {
             let is_final = index + 1 == statements.len();
@@ -735,13 +804,34 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     std::slice::from_ref(statement),
                     &std::collections::HashSet::new(),
                 );
-                let tail = self.scope_owned.split_off(scope_start);
-                for (name, slot) in tail {
+                let kept = self.scope_owned.split_off(scope_start);
+                for (name, slot) in kept {
                     if free.contains(&name) {
                         self.scope_owned.push((name, slot));
                     } else {
                         let value = self.builder.use_var(slot);
                         self.dec(value);
+                    }
+                }
+                // In tail position, a final call transfers control: hand it
+                // the values still owed a release.
+                if let (Some(outer), native_ir::Statement::Expression(expression)) =
+                    (&tail, statement)
+                {
+                    let mut cleanups = outer.clone();
+                    for (_, slot) in &self.scope_owned[scope_start..] {
+                        cleanups.push(self.builder.use_var(*slot));
+                    }
+                    match self.expression_tail(expression, cleanups)? {
+                        None => {
+                            // Transferred; only the bookkeeping remains.
+                            self.scope_owned.truncate(scope_start);
+                            return Ok(None);
+                        }
+                        Some(value) => {
+                            result = Some(value);
+                            break;
+                        }
                     }
                 }
             }
@@ -776,7 +866,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
                     let join = self.builder.create_block();
                     self.builder.append_block_param(join, types::I64);
-                    self.decision(
+                    let _ = self.decision(
                         &variables,
                         tree,
                         join,
@@ -805,7 +895,114 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             let value = self.builder.use_var(slot);
             self.dec(value);
         }
-        Ok(result)
+        Ok(Some(result))
+    }
+
+    /// Translates an expression in tail position: a call becomes a genuine
+    /// tail transfer (releasing `cleanups` between argument evaluation and
+    /// the transfer), and blocks and case expressions propagate tailness
+    /// inwards. Returns `None` when control was transferred.
+    fn expression_tail(
+        &mut self,
+        expression: &native_ir::Expression,
+        cleanups: Vec<Value>,
+    ) -> Result<Option<Value>, String> {
+        match expression {
+            native_ir::Expression::Call {
+                module,
+                function,
+                arguments,
+            } => {
+                let (id, external) = *self
+                    .functions
+                    .get(&(module.clone(), function.clone()))
+                    .ok_or_else(|| format!("unknown function `{module}.{function}`"))?;
+                if external {
+                    // C-convention functions cannot be tail called.
+                    return Ok(Some(self.expression(expression)?));
+                }
+                let mut values = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    values.push(self.expression(argument)?);
+                }
+                for cleanup in cleanups {
+                    self.dec(cleanup);
+                }
+                let function_ref = self.module.declare_func_in_func(id, self.builder.func);
+                self.builder.ins().return_call(function_ref, &values);
+                Ok(None)
+            }
+
+            native_ir::Expression::CallValue { callee, arguments } => {
+                let callee = self.expression(callee)?;
+                let mut values = Vec::with_capacity(1 + arguments.len());
+                values.push(callee);
+                for argument in arguments {
+                    values.push(self.expression(argument)?);
+                }
+                let code = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), callee, 8);
+                for cleanup in cleanups {
+                    self.dec(cleanup);
+                }
+                let signature = self.builder.import_signature(gleam_signature(values.len()));
+                self.builder
+                    .ins()
+                    .return_call_indirect(signature, code, &values);
+                Ok(None)
+            }
+
+            native_ir::Expression::Block(statements) => {
+                let scope_start = self.scope_owned.len();
+                self.statements_scoped(statements, scope_start, Some(cleanups))
+            }
+
+            native_ir::Expression::Case {
+                subjects,
+                subject_ids,
+                tree,
+            } => {
+                let mut variables = HashMap::new();
+                let mut subject_values = Vec::with_capacity(subjects.len());
+                for (id, subject) in subject_ids.iter().zip(subjects) {
+                    let value = self.expression(subject)?;
+                    let _ = variables.insert(*id, value);
+                    subject_values.push(value);
+                }
+                let mut tail_cleanups = cleanups;
+                tail_cleanups.extend(subject_values.iter().copied());
+
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+                let joined = self.decision(
+                    &variables,
+                    tree,
+                    join,
+                    DecisionMode::Case {
+                        tail: Some(tail_cleanups),
+                    },
+                )?;
+                self.builder.seal_block(join);
+                self.builder.switch_to_block(join);
+                if joined {
+                    let result = self.builder.block_params(join)[0];
+                    for subject in subject_values {
+                        self.dec(subject);
+                    }
+                    Ok(Some(result))
+                } else {
+                    // Every branch transferred; the join is unreachable.
+                    self.builder
+                        .ins()
+                        .trap(TrapCode::user(1).expect("valid trap code"));
+                    Ok(None)
+                }
+            }
+
+            _ => Ok(Some(self.expression(expression)?)),
+        }
     }
 
     fn expression(&mut self, expression: &native_ir::Expression) -> Result<Value, String> {
@@ -865,10 +1062,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 function,
                 arguments,
             } => {
-                let id = self
+                let (id, external) = *self
                     .functions
                     .get(&(module.clone(), function.clone()))
-                    .copied()
                     .ok_or_else(|| format!("unknown function `{module}.{function}`"))?;
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
@@ -877,9 +1073,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let function_ref = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(function_ref, &values);
                 let result = self.builder.inst_results(call)[0];
-                // The callee borrowed the arguments.
-                for value in values {
-                    self.dec(value);
+                // Gleam callees own their arguments; externals only borrow.
+                if external {
+                    for value in values {
+                        self.dec(value);
+                    }
                 }
                 Ok(result)
             }
@@ -910,7 +1108,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
-                self.decision(&variables, tree, join, DecisionMode::Case)?;
+                let _ = self.decision(&variables, tree, join, DecisionMode::Case { tail: None })?;
                 self.builder.seal_block(join);
 
                 self.builder.switch_to_block(join);
@@ -1019,10 +1217,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 function,
                 arity,
             } => {
-                let target = self
+                let (target, target_external) = *self
                     .functions
                     .get(&(module.clone(), function.clone()))
-                    .copied()
                     .ok_or_else(|| format!("unknown function `{module}.{function}`"))?;
                 let key = (module.clone(), function.clone());
                 let id = match self.wrappers.get(&key) {
@@ -1041,6 +1238,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         self.pending.push(PendingFunction::Wrapper {
                             id,
                             target,
+                            target_external,
                             arity: *arity,
                         });
                         let _ = self.wrappers.insert(key, id);
@@ -1066,10 +1264,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .import_signature(gleam_signature(values.len()));
                 let call = self.builder.ins().call_indirect(signature, code, &values);
                 let result = self.builder.inst_results(call)[0];
-                // The callee borrowed the closure and the arguments.
-                for value in values {
-                    self.dec(value);
-                }
+                // The callee owns the closure and the arguments.
                 Ok(result)
             }
 
@@ -1440,14 +1635,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         tree: &native_ir::Decision,
         join: Block,
         mode: DecisionMode<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         match tree {
             native_ir::Decision::Run { bindings, body } => {
                 // In a case expression, clause bindings must not leak past
                 // this clause. In an assignment they are the whole point and
                 // persist in the enclosing scope.
                 let saved_environment = match mode {
-                    DecisionMode::Case => Some(self.environment.clone()),
+                    DecisionMode::Case { .. } => Some(self.environment.clone()),
                     DecisionMode::Assignment { .. } => None,
                 };
                 let mut binding_slots = Vec::with_capacity(bindings.len());
@@ -1557,14 +1752,31 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     binding_slots.push((name.clone(), variable));
                 }
                 let result = match mode {
-                    DecisionMode::Case => {
-                        let result = self.statements(body)?;
-                        // Clause bindings end with the clause.
-                        for (_, slot) in binding_slots {
-                            let value = self.builder.use_var(slot);
-                            self.dec(value);
+                    DecisionMode::Case { tail } => {
+                        let scope_start = self.scope_owned.len();
+                        let tail = tail.map(|mut cleanups| {
+                            for (_, slot) in &binding_slots {
+                                cleanups.push(self.builder.use_var(*slot));
+                            }
+                            cleanups
+                        });
+                        match self.statements_scoped(body, scope_start, tail)? {
+                            None => {
+                                // The clause tail-transferred; nothing joins.
+                                if let Some(environment) = saved_environment {
+                                    self.environment = environment;
+                                }
+                                return Ok(false);
+                            }
+                            Some(result) => {
+                                // Clause bindings end with the clause.
+                                for (_, slot) in binding_slots {
+                                    let value = self.builder.use_var(slot);
+                                    self.dec(value);
+                                }
+                                result
+                            }
                         }
-                        result
                     }
                     DecisionMode::Assignment { result, .. } => {
                         // Assignment bindings live on in the enclosing scope.
@@ -1576,7 +1788,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 if let Some(environment) = saved_environment {
                     self.environment = environment;
                 }
-                Ok(())
+                Ok(true)
             }
 
             native_ir::Decision::Fail => match mode {
@@ -1592,7 +1804,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         failure.line,
                     )?;
                     self.builder.ins().jump(join, &[result.into()]);
-                    Ok(())
+                    Ok(true)
                 }
                 // Otherwise the type system guarantees exhaustiveness; this
                 // node is unreachable at run time.
@@ -1600,7 +1812,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     self.builder
                         .ins()
                         .trap(TrapCode::user(1).expect("valid trap code"));
-                    Ok(())
+                    Ok(false)
                 }
             },
 
@@ -1730,12 +1942,35 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.builder.seal_block(false_block);
 
                 self.builder.switch_to_block(true_block);
-                let result = self.statements(if_true)?;
-                for slot in &binding_slots {
-                    let value = self.builder.use_var(*slot);
-                    self.dec(value);
-                }
-                self.builder.ins().jump(join, &[result.into()]);
+                let jumped = match &mode {
+                    DecisionMode::Case { tail: Some(outer) } => {
+                        let mut cleanups = outer.clone();
+                        for slot in &binding_slots {
+                            cleanups.push(self.builder.use_var(*slot));
+                        }
+                        let scope_start = self.scope_owned.len();
+                        match self.statements_scoped(if_true, scope_start, Some(cleanups))? {
+                            None => false,
+                            Some(result) => {
+                                for slot in &binding_slots {
+                                    let value = self.builder.use_var(*slot);
+                                    self.dec(value);
+                                }
+                                self.builder.ins().jump(join, &[result.into()]);
+                                true
+                            }
+                        }
+                    }
+                    _ => {
+                        let result = self.statements(if_true)?;
+                        for slot in &binding_slots {
+                            let value = self.builder.use_var(*slot);
+                            self.dec(value);
+                        }
+                        self.builder.ins().jump(join, &[result.into()]);
+                        true
+                    }
+                };
                 self.environment = saved_environment;
 
                 self.builder.switch_to_block(false_block);
@@ -1743,7 +1978,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     let value = self.builder.use_var(*slot);
                     self.dec(value);
                 }
-                self.decision(variables, if_false, join, mode)
+                Ok(self.decision(variables, if_false, join, mode)? || jumped)
             }
 
             native_ir::Decision::Switch {
@@ -1755,6 +1990,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let subject = *variables
                     .get(var)
                     .ok_or_else(|| format!("unbound decision variable {var}"))?;
+                let mut joined = false;
                 for (check, decision) in choices {
                     let matched = match check {
                         native_ir::Check::Variant { tag, fields } => {
@@ -1807,7 +2043,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         _ => vec![],
                     };
                     if extracted.is_empty() {
-                        self.decision(variables, decision, join, mode)?;
+                        joined |= self.decision(variables, decision, join, mode.clone())?;
                     } else {
                         let mut extended = variables.clone();
                         for (index, field) in extracted.iter().enumerate() {
@@ -1819,14 +2055,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             );
                             let _ = extended.insert(*field, value);
                         }
-                        self.decision(&extended, decision, join, mode)?;
+                        joined |= self.decision(&extended, decision, join, mode.clone())?;
                     }
                     self.builder.switch_to_block(next_block);
                 }
                 // An exhaustive match's final variant is not tag-tested,
                 // but its fields still become decision variables.
                 if fallback_fields.is_empty() {
-                    self.decision(variables, fallback, join, mode)
+                    Ok(self.decision(variables, fallback, join, mode)? || joined)
                 } else {
                     let mut extended = variables.clone();
                     for (index, field) in fallback_fields.iter().enumerate() {
@@ -1838,7 +2074,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         );
                         let _ = extended.insert(*field, value);
                     }
-                    self.decision(&extended, fallback, join, mode)
+                    Ok(self.decision(&extended, fallback, join, mode)? || joined)
                 }
             }
         }

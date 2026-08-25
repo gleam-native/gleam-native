@@ -14,6 +14,10 @@ struct TestProject {
 
 impl TestProject {
     fn new(name: &str, source: &str) -> Self {
+        Self::with_config_extras(name, source, "")
+    }
+
+    fn with_config_extras(name: &str, source: &str, config_extras: &str) -> Self {
         let root = std::env::temp_dir().join(format!(
             "gleam-native-{name}-{}",
             std::process::id()
@@ -22,7 +26,9 @@ impl TestProject {
         std::fs::create_dir_all(root.join("src")).expect("create project directories");
         std::fs::write(
             root.join("gleam.toml"),
-            format!("name = \"{name}\"\nversion = \"1.0.0\"\ntarget = \"native\"\n"),
+            format!(
+                "name = \"{name}\"\nversion = \"1.0.0\"\ntarget = \"native\"\n{config_extras}"
+            ),
         )
         .expect("write gleam.toml");
         std::fs::write(root.join("src").join(format!("{name}.gleam")), source)
@@ -1034,5 +1040,135 @@ pub fn main() -> Nil {
     assert!(
         stdout.contains(expected),
         "unexpected output.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn tail_recursion() {
+    // Ten million tail-recursive iterations, both direct and through an
+    // accumulator over a list: genuine tail calls keep the stack constant
+    // where plain calls would overflow long before finishing.
+    let project = TestProject::new(
+        "tail_recursion",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+fn count(n: Int, limit: Int) -> Int {
+  case n >= limit {
+    True -> n
+    False -> count(n + 1, limit)
+  }
+}
+
+fn build(n: Int, acc: List(Int)) -> List(Int) {
+  case n {
+    0 -> acc
+    _ -> build(n - 1, [n, ..acc])
+  }
+}
+
+fn sum(list: List(Int), total: Int) -> Int {
+  case list {
+    [] -> total
+    [first, ..rest] -> sum(rest, total + first)
+  }
+}
+
+pub fn main() -> Nil {
+  print_int(count(0, 10_000_000))
+  print_int(sum(build(100_000, []), 0))
+  println("done")
+}
+"#,
+    );
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "tail recursion should finish.
+stdout: {stdout}
+stderr: {stderr}"
+    );
+    assert!(stdout.contains("10000000"), "stdout: {stdout}");
+    assert!(stdout.contains("5000050000"), "stdout: {stdout}");
+    assert!(stdout.contains("done"), "stdout: {stdout}");
+}
+
+#[test]
+fn stack_overflow() {
+    // Deep recursion that is not in tail position cannot run in constant
+    // stack; it must fail with a comprehensible report, not a raw crash.
+    let project = TestProject::new(
+        "stack_overflow",
+        r#"@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+fn deep(n: Int) -> Int {
+  case n {
+    0 -> 0
+    _ -> 1 + deep(n - 1)
+  }
+}
+
+pub fn main() -> Nil {
+  print_int(deep(100_000_000))
+}
+"#,
+    );
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stack overflow should exit with code 1.
+stdout: {stdout}
+stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("runtime error: stack overflow"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn configured_stack_size() {
+    // A recursion depth that fits comfortably in the default gigabyte must
+    // overflow when the project configures a small stack.
+    let project = TestProject::with_config_extras(
+        "configured_stack_size",
+        r#"@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+fn deep(n: Int) -> Int {
+  case n {
+    0 -> 0
+    _ -> 1 + deep(n - 1)
+  }
+}
+
+pub fn main() -> Nil {
+  print_int(deep(200_000))
+}
+"#,
+        "\n[native]\nstack_size_megabytes = 4\n",
+    );
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a 4 MB stack should overflow.
+stdout: {stdout}
+stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("runtime error: stack overflow"),
+        "stderr: {stderr}"
     );
 }

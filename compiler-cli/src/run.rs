@@ -166,7 +166,13 @@ pub fn setup(
                 target: Target::Native,
                 invalid_runtime: r,
             }),
-            _ => run_native_command(paths, &main_function.package, &module, arguments),
+            _ => run_native_command(
+                paths,
+                &main_function.package,
+                &module,
+                arguments,
+                mod_config.native.stack_size_megabytes,
+            ),
         },
     }
 }
@@ -267,6 +273,7 @@ fn run_native_command(
     _package: &str,
     module: &str,
     arguments: Vec<String>,
+    stack_size_megabytes: u64,
 ) -> Result<Command, Error> {
     fn fail(message: String) -> ! {
         eprintln!("error: {message}");
@@ -301,7 +308,7 @@ fn run_native_command(
         }
     }
 
-    match native_generation::jit::run(&modules, module, arguments) {
+    match native_generation::jit::run(&modules, module, arguments, stack_size_megabytes) {
         Ok(()) => std::process::exit(0),
         Err(error) => fail(error),
     }

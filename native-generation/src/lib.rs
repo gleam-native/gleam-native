@@ -135,7 +135,7 @@ mod tests {
             }],
         };
 
-        crate::jit::run(&[dependency, root], "app", Vec::new()).unwrap();
+        crate::jit::run(&[dependency, root], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
     }
 
     /// A big integer literal flows from the data section through the runtime
@@ -159,7 +159,7 @@ mod tests {
                 )],
             }],
         };
-        crate::jit::run(&[module], "app", Vec::new()).unwrap();
+        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
     }
 
     /// A float literal is boxed via the runtime constructor and can be
@@ -187,7 +187,7 @@ mod tests {
                 },
             ],
         };
-        crate::jit::run(&[module], "app", Vec::new()).unwrap();
+        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
     }
 
     /// A case expression's decision tree compiles and runs: a boolean switch
@@ -229,7 +229,7 @@ mod tests {
                 )],
             }],
         };
-        crate::jit::run(&[module], "app", Vec::new()).unwrap();
+        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
     }
 
     /// A panic expression translates and compiles; `main` must not call it,
@@ -260,7 +260,7 @@ mod tests {
                 },
             ],
         };
-        crate::jit::run(&[module], "app", Vec::new()).unwrap();
+        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
     }
 
     /// A string literal is built from constant data and can be passed to the
@@ -295,6 +295,6 @@ mod tests {
                 },
             ],
         };
-        crate::jit::run(&[module], "app", Vec::new()).unwrap();
+        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
     }
 }

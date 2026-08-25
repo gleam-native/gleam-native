@@ -99,8 +99,13 @@ platform C convention.
 
 - ✅ Module function definitions with parameters
 - ✅ Direct calls, including cross-module calls
-- ✅ Guaranteed tail calls between Gleam functions (`tail` calling
-  convention, in place from day one)
+- ✅ Guaranteed tail calls between Gleam functions: calls in tail position
+  (including through blocks and case clauses) compile to genuine
+  `return_call`/`return_call_indirect` transfers, so self- and mutual tail
+  recursion run in constant stack space. This required flipping argument
+  ownership — Gleam callees own their arguments (externals still borrow) —
+  and tail paths release remaining scope bindings and case subjects between
+  argument evaluation and the transfer
 - ✅ Anonymous functions and closures: lambda-lifted at code generation
   time with free-variable analysis for captures; a closure is a heap object
   `[code pointer, captures...]` and indirect calls use the closure calling
@@ -111,9 +116,12 @@ platform C convention.
 - ✅ Labelled arguments (the type checker reorders them)
 - ✅ Generic functions through the uniform value representation (exercised
   by generic `map`/`fold` over closures and module functions)
-- ❌ Recursion depth: native stacks are finite where the BEAM's are not;
-  self- and mutual tail recursion must not grow the stack (covered by tail
-  calls), and deep non-tail recursion needs at least a sensible crash
+- ✅ Recursion depth: the program runs on a dedicated thread with a 1 GiB
+  stack by default, configurable per project with `stack_size_megabytes`
+  under `[native]` in `gleam.toml`; deep non-tail recursion that exhausts
+  it is caught by a `sigaltstack` handler that reports
+  `runtime error: stack overflow` and exits with code 1 instead of
+  crashing raw
 
 ## Data types
 

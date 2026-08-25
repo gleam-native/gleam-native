@@ -181,6 +181,8 @@ pub struct PackageConfig {
     pub erlang: ErlangConfig,
     #[serde(default)]
     pub javascript: JavaScriptConfig,
+    #[serde(default)]
+    pub native: NativeConfig,
     #[serde(default = "erlang_target")]
     pub target: Target,
     #[serde(default)]
@@ -730,6 +732,7 @@ impl Default for PackageConfig {
             dependencies: HashMap::new(),
             erlang: ErlangConfig::default(),
             javascript: JavaScriptConfig::default(),
+            native: NativeConfig::default(),
             repository: None,
             dev_dependencies: HashMap::new(),
             licences: vec![],
@@ -766,6 +769,28 @@ pub struct JavaScriptConfig {
     pub runtime: Runtime,
     #[serde(default, rename = "deno")]
     pub deno: DenoConfig,
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+pub struct NativeConfig {
+    /// The stack size for programs run on the native target, in megabytes.
+    /// Tail calls run in constant stack space, so this only limits how deep
+    /// non-tail recursion may go before the runtime reports a stack
+    /// overflow.
+    #[serde(default = "default_native_stack_size")]
+    pub stack_size_megabytes: u64,
+}
+
+impl Default for NativeConfig {
+    fn default() -> Self {
+        Self {
+            stack_size_megabytes: default_native_stack_size(),
+        }
+    }
+}
+
+fn default_native_stack_size() -> u64 {
+    1024
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq, Clone)]
@@ -1368,6 +1393,29 @@ pages = [{ title = "My Page", path = "stuff.html", source = "something/../../sec
             .unwrap_err()
             .to_string()
     );
+}
+
+#[test]
+fn native_stack_size_defaults_to_a_gigabyte() {
+    let input = r#"
+name = "one_two"
+"#;
+
+    let config = toml::from_str::<PackageConfig>(input).unwrap();
+    assert_eq!(config.native.stack_size_megabytes, 1024);
+}
+
+#[test]
+fn native_stack_size_can_be_configured() {
+    let input = r#"
+name = "one_two"
+
+[native]
+stack_size_megabytes = 64
+"#;
+
+    let config = toml::from_str::<PackageConfig>(input).unwrap();
+    assert_eq!(config.native.stack_size_megabytes, 64);
 }
 
 #[cfg(windows)]

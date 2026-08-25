@@ -11,7 +11,7 @@ use pretty_assertions::assert_eq;
 use gleam_core::{
     Error,
     build::Runtime,
-    config::{DenoConfig, DenoFlag, Docs, ErlangConfig, JavaScriptConfig},
+    config::{DenoConfig, DenoFlag, Docs, ErlangConfig, JavaScriptConfig, NativeConfig},
     dependency::{PackageFetchError, PackageFetcher},
     manifest::{Base16Checksum, Manifest, ManifestPackage, ManifestPackageSource},
     paths::ProjectPaths,
@@ -1664,6 +1664,7 @@ fn package_config(
                 location: None,
             },
         },
+        native: NativeConfig::default(),
         target: Target::Erlang,
         internal_modules: None,
     }

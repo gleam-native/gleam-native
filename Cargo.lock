@@ -2435,6 +2435,7 @@ dependencies = [
 name = "native-runtime"
 version = "1.0.0"
 dependencies = [
+ "libc",
  "num-bigint 0.5.1",
  "num-traits",
  "unicode-segmentation",
