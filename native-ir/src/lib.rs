@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 24;
+pub const FORMAT_VERSION: u32 = 25;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -238,14 +238,52 @@ pub struct BitSegment {
     pub kind: BitSegmentKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BitSegmentKind {
-    /// An integer of `bits` bits (a multiple of 8, at most 64), truncated.
-    Int { bits: u32, little_endian: bool },
+    /// An integer segment, truncated to the segment size. The size is an
+    /// expression evaluating to the bit count (validated at run time to be
+    /// a non-negative multiple of 8).
+    Int {
+        bits: Box<Expression>,
+        little_endian: bool,
+    },
     /// A string's UTF-8 bytes.
     Utf8String,
     /// Another bit array spliced in whole.
     BitArraySplice,
+}
+
+/// A named segment read a bit array check materializes before evaluating:
+/// later segment sizes may refer to earlier segments (`<<len,
+/// payload:size(len)>>`). The names use a `bit$` prefix, which cannot
+/// collide with Gleam identifiers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SegmentRead {
+    pub name: String,
+    pub offset: Box<Expression>,
+    pub bits: Box<Expression>,
+    pub little_endian: bool,
+    pub signed: bool,
+}
+
+/// A test a bit array check performs, with offsets and sizes as tagged
+/// integer expressions (possibly referring to materialized segment reads).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BitsTest {
+    /// The array is exactly (or at least) this many bits long.
+    Size { bits: Box<Expression>, exact: bool },
+    /// A computed size is not negative.
+    NonNegative { value: Box<Expression> },
+    /// The bytes at the offset equal these constant bytes.
+    Bytes {
+        offset: Box<Expression>,
+        bytes: Vec<u8>,
+    },
+    /// The remainder past the offset is a whole number of bytes.
+    RestIsBytes { offset: Box<Expression> },
+    /// Nothing to test (variable and discard segment patterns); the check
+    /// exists to materialize its reads.
+    AlwaysTrue,
 }
 
 /// A node of a lowered pattern-match decision tree.
@@ -294,8 +332,8 @@ pub enum Bound {
     /// An integer read out of a bit array segment.
     BitsReadInt {
         subject: u32,
-        offset: u64,
-        bits: u32,
+        offset: Box<Expression>,
+        bits: Box<Expression>,
         little_endian: bool,
         signed: bool,
     },
@@ -303,8 +341,8 @@ pub enum Bound {
     /// everything from the offset onwards.
     BitsSlice {
         subject: u32,
-        offset: u64,
-        bits: Option<u64>,
+        offset: Box<Expression>,
+        bits: Option<Box<Expression>>,
     },
 }
 
@@ -333,16 +371,12 @@ pub enum Check {
     /// sequences already processed). The rest is bound separately via
     /// [`Bound::StringSlice`].
     StringPrefix { prefix: String },
-    /// The subject bit array is exactly (or at least) `bits` bits long.
-    BitArraySize { bits: u64, exact: bool },
-    /// The subject bit array holds exactly these bytes at the given bit
-    /// offset (the compiler pre-encodes literal segment matches).
-    BitArrayBytes { offset: u64, bytes: Vec<u8> },
-    /// The subject bit array's remainder past the offset is a whole number
-    /// of bytes.
-    BitArrayRestIsBytes { offset: u64 },
-    /// A check the type system already guarantees; always succeeds.
-    True,
+    /// A bit array test: first the segment reads are materialized as named
+    /// values, then the test runs.
+    BitArray {
+        reads: Vec<SegmentRead>,
+        test: BitsTest,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -519,6 +553,9 @@ fn expression_free(
         Expression::BitArray(segments) => {
             for segment in segments {
                 expression_free(&segment.value, bound, free);
+                if let BitSegmentKind::Int { bits, .. } = &segment.kind {
+                    expression_free(bits, bound, free);
+                }
             }
         }
         Expression::Echo { value, message, .. } => {
@@ -550,9 +587,7 @@ fn decision_free(
             };
             let scope = scope.as_mut().unwrap_or(bound);
             for (name, value) in bindings {
-                if let Bound::Value(expression) = value {
-                    expression_free(expression, scope, free);
-                }
+                bound_free(value, scope, free);
                 let _ = scope.insert(name.clone());
             }
             statements_free(body, scope, free);
@@ -560,7 +595,8 @@ fn decision_free(
         Decision::Switch {
             choices, fallback, ..
         } => {
-            for (_, decision) in choices {
+            for (check, decision) in choices {
+                check_free(check, bound, free);
                 decision_free(decision, bound, free, bindings_persist);
             }
             decision_free(fallback, bound, free, bindings_persist);
@@ -573,9 +609,7 @@ fn decision_free(
         } => {
             let mut scope = bound.clone();
             for (name, value) in bindings {
-                if let Bound::Value(expression) = value {
-                    expression_free(expression, &mut scope, free);
-                }
+                bound_free(value, &mut scope, free);
                 let _ = scope.insert(name.clone());
             }
             expression_free(guard, &mut scope, free);
@@ -645,5 +679,42 @@ mod tests {
         let bound = HashSet::from(["a".to_string()]);
         let free: Vec<String> = free_variables(&body, &bound).into_iter().collect();
         assert_eq!(free, vec!["c".to_string()]);
+    }
+}
+
+fn check_free(check: &Check, bound: &mut HashSet<String>, free: &mut BTreeSet<String>) {
+    let Check::BitArray { reads, test } = check else {
+        return;
+    };
+    for read in reads {
+        expression_free(&read.offset, bound, free);
+        expression_free(&read.bits, bound, free);
+        // The read's name is available to everything after this check.
+        let _ = bound.insert(read.name.clone());
+    }
+    match test {
+        BitsTest::Size { bits, .. } => expression_free(bits, bound, free),
+        BitsTest::NonNegative { value } => expression_free(value, bound, free),
+        BitsTest::Bytes { offset, .. } | BitsTest::RestIsBytes { offset } => {
+            expression_free(offset, bound, free)
+        }
+        BitsTest::AlwaysTrue => {}
+    }
+}
+
+fn bound_free(value: &Bound, bound: &mut HashSet<String>, free: &mut BTreeSet<String>) {
+    match value {
+        Bound::Value(expression) => expression_free(expression, bound, free),
+        Bound::Variable(_) | Bound::StringSlice { .. } => {}
+        Bound::BitsReadInt { offset, bits, .. } => {
+            expression_free(offset, bound, free);
+            expression_free(bits, bound, free);
+        }
+        Bound::BitsSlice { offset, bits, .. } => {
+            expression_free(offset, bound, free);
+            if let Some(bits) = bits {
+                expression_free(bits, bound, free);
+            }
+        }
     }
 }

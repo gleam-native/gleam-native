@@ -35,9 +35,7 @@ platform C convention.
 - ✅ Integer literals beyond the small range (heap big integers built from
   constant data at run time)
 - ✅ `Nil`
-- ✅ Float literals (boxed f64 heap objects; heap objects carry no kind
-  header yet — the type system separates them until polymorphic equality and
-  `echo` exist)
+- ✅ Float literals (boxed f64 heap objects)
 - ✅ String literals (immutable UTF-8 heap strings built from constant data;
   escape sequences processed at lowering time; `println` runtime external)
 - ✅ `True` / `False` (tagged small integers 1 and 0; `print_bool` runtime
@@ -87,7 +85,7 @@ platform C convention.
   (`"pre" <> rest`, including `as` bindings, in `case` and `let assert`)
   work, including untested final variants of exhaustive matches, whose
   fields arrive via the fallback. Bit array patterns work within the
-  byte-aligned constant-size subset
+  byte-aligned subset, including dynamic sizes
 - 🚧 Guards (`if` clauses): operators, negation, variables, tuple indexing,
   and scalar literal constants work (sharing the expression operator
   lowering). Not yet: field access and module constants in guards
@@ -127,21 +125,23 @@ platform C convention.
 - ✅ Custom types: heap records (variant tag word + field words),
   constructors (labelled and positional), field access (`wibble.name`),
   destructuring in `case`; `Result` works as a plain custom type;
-  constructors as function values. Not yet: equality (needs polymorphic
-  deep equality)
+  constructors as function values; structural equality
 - ✅ Record updates (`Wibble(..old, name: "new")`): the type checker's
   desugaring lowers onto existing constructor and field access nodes,
   including non-variable spread expressions
 - 🚧 Strings: UTF-8 heap objects with literals, concatenation, and equality
   done; ordering comparison and the grapheme operations the stdlib relies on
   still need runtime support
-- 🚧 Bit arrays: byte-aligned, constant-sized segments work — construction
-  (int segments with size/unit and endianness, truncation, utf8 strings,
-  bit array splices) and patterns (literal int/string matches via the
-  compiler's pre-encoded bytes, sized and endian/signed integer reads,
-  `rest:bits` captures, in `case` and `let assert`), plus structural
-  equality and `echo`. Not yet: dynamic sizes (`size(n)`), non-byte-aligned
-  segments, floats, UTF-16/32, codepoints; the per-target gates in
+- 🚧 Bit arrays: byte-aligned segments work, with both constant and dynamic
+  sizes — construction (int segments with size/unit expressions, endianness,
+  truncation, wide segments via big integers, utf8 strings, splices) and
+  patterns (literal matches via the compiler's pre-encoded bytes, sized and
+  endian/signed reads including `size(n)` referring to earlier segments,
+  outer variables, and size arithmetic; `bytes-size(n)` payloads;
+  `rest:bits` captures; reads wider than 64 bits produce big integers),
+  plus structural equality and `echo`. Segment sizes are validated at run
+  time. Not yet: non-byte-aligned sizes (a runtime error), floats,
+  UTF-16/32, codepoints; the per-target gates in
   `compiler-core/src/bit_array.rs` still treat native like Erlang
 - ✅ Constants (`const x = …`): inlined at use sites like the Erlang
   target, covering scalars, tuples, lists, records, references to other
