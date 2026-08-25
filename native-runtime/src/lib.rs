@@ -787,6 +787,32 @@ pub unsafe extern "C" fn gleam_native_float_to_string(value: u64) -> u64 {
     box_string(format!("{:?}", float_value(value)))
 }
 
+/// The command line arguments the host passes in before running `main`.
+static START_ARGUMENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Stores the program's command line arguments; called by the host before
+/// `main` runs.
+pub fn set_start_arguments(arguments: Vec<String>) {
+    let _ = START_ARGUMENTS.set(arguments);
+}
+
+/// The command line arguments as a list of strings.
+pub extern "C" fn gleam_native_start_arguments() -> u64 {
+    let arguments = START_ARGUMENTS.get().cloned().unwrap_or_default();
+    make_list(
+        arguments
+            .into_iter()
+            .map(|argument| box_string(argument))
+            .collect(),
+    )
+}
+
+/// Ends the program immediately with the given exit code.
+pub extern "C" fn gleam_native_exit(code: u64) -> u64 {
+    let code = untag(code).to_i32().unwrap_or(1);
+    std::process::exit(code);
+}
+
 /// A new empty bit array, the start of a construction chain.
 pub extern "C" fn gleam_native_bitarray_empty() -> u64 {
     box_bitarray(BitArrayPayload {
@@ -1391,6 +1417,11 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_string_slice_from",
             gleam_native_string_slice_from as *const u8,
         ),
+        (
+            "gleam_native_start_arguments",
+            gleam_native_start_arguments as *const u8,
+        ),
+        ("gleam_native_exit", gleam_native_exit as *const u8),
         (
             "gleam_native_string_byte_size",
             gleam_native_string_byte_size as *const u8,

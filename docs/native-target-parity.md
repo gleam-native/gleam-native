@@ -182,8 +182,11 @@ platform C convention.
   Counts are runtime calls today; Perceus-style reuse and inline fast paths
   are future optimization work
 - ❌ Stack traces or at least source positions on panics
-- ❌ `main` receiving arguments / `argv` access, exit code propagation
-  (`gleam run` currently always exits 0 on success)
+- ✅ Command line arguments and exit codes: `gleam run -- args...` passes
+  the arguments through to the program, readable as a `List(String)` via
+  the `gleam_native_start_arguments` external; the `gleam_native_exit`
+  external ends the program with a chosen code, and a normally-completing
+  `main` exits 0 (runtime failures exit 1)
 
 ## Externals and FFI
 

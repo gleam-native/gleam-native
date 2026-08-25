@@ -266,7 +266,7 @@ fn run_native_command(
     paths: &ProjectPaths,
     _package: &str,
     module: &str,
-    _arguments: Vec<String>,
+    arguments: Vec<String>,
 ) -> Result<Command, Error> {
     fn fail(message: String) -> ! {
         eprintln!("error: {message}");
@@ -301,7 +301,7 @@ fn run_native_command(
         }
     }
 
-    match native_generation::jit::run(&modules, module) {
+    match native_generation::jit::run(&modules, module, arguments) {
         Ok(()) => std::process::exit(0),
         Err(error) => fail(error),
     }

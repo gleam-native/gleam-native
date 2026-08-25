@@ -10,8 +10,14 @@ use cranelift_module::default_libcall_names;
 
 use crate::translate::Translator;
 
-/// JIT-compiles the given modules and calls `main` in `main_module`.
-pub fn run(modules: &[native_ir::Module], main_module: &str) -> Result<(), String> {
+/// JIT-compiles the given modules and calls `main` in `main_module`, with
+/// the given command line arguments available to the program.
+pub fn run(
+    modules: &[native_ir::Module],
+    main_module: &str,
+    arguments: Vec<String>,
+) -> Result<(), String> {
+    native_runtime::set_start_arguments(arguments);
     let mut flag_builder = settings::builder();
     flag_builder
         .set("use_colocated_libcalls", "false")

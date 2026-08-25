@@ -31,8 +31,13 @@ impl TestProject {
     }
 
     fn run(&self) -> std::process::Output {
+        self.run_with_arguments(&[])
+    }
+
+    fn run_with_arguments(&self, arguments: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_gleam"))
             .arg("run")
+            .args(arguments)
             .current_dir(&self.root)
             .output()
             .expect("run the gleam binary")
@@ -928,6 +933,63 @@ tidy
         "unexpected output.
 stdout: {stdout}"
     );
+}
+
+#[test]
+fn arguments_and_exit_codes() {
+    let project = TestProject::new(
+        "arguments",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "gleam_native_start_arguments")
+fn start_arguments() -> List(String)
+
+@external(native, "runtime", "gleam_native_exit")
+fn exit(code: Int) -> Nil
+
+fn print_each(arguments: List(String)) -> Int {
+  case arguments {
+    [] -> 0
+    [argument, ..rest] -> {
+      println(argument)
+      1 + print_each(rest)
+    }
+  }
+}
+
+pub fn main() -> Nil {
+  let count = print_each(start_arguments())
+  // Exit with the number of arguments as the code.
+  exit(count)
+  println("unreachable")
+}
+"#,
+    );
+
+    let output = project.run_with_arguments(&["alpha", "beta", "gamma"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "expected exit code 3.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("alpha
+beta
+gamma
+"),
+        "unexpected output.
+stdout: {stdout}"
+    );
+    assert!(!stdout.contains("unreachable"));
+
+    // Without arguments the program exits zero.
+    let output = project.run();
+    assert_eq!(output.status.code(), Some(0));
 }
 
 #[test]
