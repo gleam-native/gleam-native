@@ -50,6 +50,10 @@ pub const STRING_CONCAT: &str = "gleam_native_string_concat";
 /// The symbol of the runtime's string equality function.
 pub const STRING_EQ: &str = "gleam_native_string_eq";
 
+/// The symbols of the runtime's string prefix operations.
+pub const STRING_STARTS_WITH: &str = "gleam_native_string_starts_with";
+pub const STRING_SLICE_FROM: &str = "gleam_native_string_slice_from";
+
 /// The symbol of the runtime's custom type record allocator.
 pub const RECORD_NEW: &str = "gleam_native_record_new";
 
@@ -110,6 +114,8 @@ struct RuntimeFunctions {
     string_from_bytes: FuncId,
     string_concat: FuncId,
     string_eq: FuncId,
+    string_starts_with: FuncId,
+    string_slice_from: FuncId,
     record_new: FuncId,
     closure_new: FuncId,
     deep_eq: FuncId,
@@ -139,6 +145,8 @@ impl RuntimeFunctions {
             string_from_bytes: declare(STRING_FROM_BYTES, 2)?,
             string_concat: declare(STRING_CONCAT, 2)?,
             string_eq: declare(STRING_EQ, 2)?,
+            string_starts_with: declare(STRING_STARTS_WITH, 3)?,
+            string_slice_from: declare(STRING_SLICE_FROM, 2)?,
             record_new: declare(RECORD_NEW, 2)?,
             closure_new: declare(CLOSURE_NEW, 1)?,
             deep_eq: declare(DEEP_EQ, 2)?,
@@ -1226,6 +1234,18 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             self.inc(value)
                         }
                         native_ir::Bound::Value(expression) => self.expression(expression)?,
+                        native_ir::Bound::StringSlice { subject, offset } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                            let slice_ref = self.module.declare_func_in_func(
+                                self.runtime.string_slice_from,
+                                self.builder.func,
+                            );
+                            let call = self.builder.ins().call(slice_ref, &[subject, offset]);
+                            self.builder.inst_results(call)[0]
+                        }
                     };
                     let variable = self.builder.declare_var(types::I64);
                     self.builder.def_var(variable, value);
@@ -1299,6 +1319,18 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             self.inc(value)
                         }
                         native_ir::Bound::Value(expression) => self.expression(expression)?,
+                        native_ir::Bound::StringSlice { subject, offset } => {
+                            let subject = *variables
+                                .get(subject)
+                                .ok_or_else(|| format!("unbound decision variable {subject}"))?;
+                            let offset = self.builder.ins().iconst(types::I64, *offset as i64);
+                            let slice_ref = self.module.declare_func_in_func(
+                                self.runtime.string_slice_from,
+                                self.builder.func,
+                            );
+                            let call = self.builder.ins().call(slice_ref, &[subject, offset]);
+                            self.builder.inst_results(call)[0]
+                        }
                     };
                     let variable = self.builder.declare_var(types::I64);
                     self.builder.def_var(variable, value);
@@ -1453,6 +1485,18 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             | native_ir::Check::Always { .. }
             | native_ir::Check::NonEmptyList { .. } => {
                 unreachable!("field-extracting checks are handled by the switch")
+            }
+            native_ir::Check::StringPrefix { prefix } => {
+                let (pointer, length) = self.constant_bytes(prefix.as_bytes())?;
+                let starts_with_ref = self
+                    .module
+                    .declare_func_in_func(self.runtime.string_starts_with, self.builder.func);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(starts_with_ref, &[subject, pointer, length]);
+                let matched = self.builder.inst_results(call)[0];
+                Ok(self.builder.ins().band_imm_u(matched, 2))
             }
             native_ir::Check::String(value) => {
                 let literal = self

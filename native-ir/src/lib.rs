@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 22;
+pub const FORMAT_VERSION: u32 = 23;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -268,6 +268,9 @@ pub enum Bound {
     Variable(u32),
     /// A literal from the pattern itself.
     Value(Expression),
+    /// The rest of a string prefix pattern: a fresh string holding the
+    /// subject's contents from the given byte offset onwards.
+    StringSlice { subject: u32, offset: u32 },
 }
 
 /// A runtime check a decision tree performs against a subject.
@@ -291,6 +294,10 @@ pub enum Check {
     /// The subject is a non-empty list: its head and tail become decision
     /// variables.
     NonEmptyList { first: u32, rest: u32 },
+    /// The subject is a string starting with these contents (escape
+    /// sequences already processed). The rest is bound separately via
+    /// [`Bound::StringSlice`].
+    StringPrefix { prefix: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

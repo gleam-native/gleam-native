@@ -7,6 +7,8 @@
 //! outside it produces an error naming the unsupported feature rather than
 //! generating wrong code. The subset grows with the native backend.
 
+use std::collections::HashMap;
+
 use ecow::EcoString;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -130,7 +132,9 @@ impl Lowerer<'_> {
                     .first()
                     .expect("assignment decision tree has a subject")
                     .id as u32;
-                let tree = self.decision(&assignment.compiled_case.tree, None)?;
+                let mut prefix_slices = HashMap::new();
+                let tree =
+                    self.decision(&assignment.compiled_case.tree, None, &mut prefix_slices)?;
                 let on_failure = match &assignment.kind {
                     AssignmentKind::Let | AssignmentKind::Generated => None,
                     AssignmentKind::Assert {
@@ -460,7 +464,8 @@ impl Lowerer<'_> {
                     .iter()
                     .map(|variable| variable.id as u32)
                     .collect();
-                let tree = self.decision(&compiled_case.tree, Some(clauses))?;
+                let mut prefix_slices = HashMap::new();
+                let tree = self.decision(&compiled_case.tree, Some(clauses), &mut prefix_slices)?;
                 let subjects = subjects
                     .iter()
                     .map(|subject| self.expression(subject))
@@ -747,10 +752,11 @@ impl Lowerer<'_> {
         &self,
         decision: &exhaustiveness::Decision,
         clauses: Option<&[TypedClause]>,
+        prefix_slices: &mut HashMap<usize, (u32, u32)>,
     ) -> Result<native_ir::Decision, Error> {
         match decision {
             exhaustiveness::Decision::Run { body } => {
-                self.decision_body(body, clauses)
+                self.decision_body(body, clauses, prefix_slices)
             }
 
             exhaustiveness::Decision::Guard {
@@ -766,14 +772,14 @@ impl Lowerer<'_> {
                     .guard
                     .as_ref()
                     .expect("guard decision on clause with a guard");
-                let bindings = self.bound_values(&if_true.bindings)?;
+                let bindings = self.bound_values(&if_true.bindings, prefix_slices)?;
                 let clause = clauses
                     .get(if_true.clause_index)
                     .expect("decision tree clause index in range");
                 let body = vec![native_ir::Statement::Expression(
                     self.expression(&clause.then)?,
                 )];
-                let if_false = self.decision(if_false, Some(clauses))?;
+                let if_false = self.decision(if_false, Some(clauses), prefix_slices)?;
                 Ok(native_ir::Decision::Guard {
                     bindings,
                     guard: Box::new(self.guard(guard_expression)?),
@@ -794,8 +800,9 @@ impl Lowerer<'_> {
                 let choices = choices
                     .iter()
                     .map(|(check, decision)| {
-                        let check = self.runtime_check(check, &var.type_)?;
-                        let decision = self.decision(decision, clauses)?;
+                        let check =
+                            self.runtime_check(check, &var.type_, subject, prefix_slices)?;
+                        let decision = self.decision(decision, clauses, prefix_slices)?;
                         Ok((check, decision))
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
@@ -804,7 +811,7 @@ impl Lowerer<'_> {
                 // extracts must still be made available.
                 let fallback_fields = match fallback_check.as_ref() {
                     exhaustiveness::FallbackCheck::RuntimeCheck { check } => {
-                        match self.runtime_check(check, &var.type_)? {
+                        match self.runtime_check(check, &var.type_, subject, prefix_slices)? {
                             native_ir::Check::Variant { fields, .. }
                             | native_ir::Check::Always { fields } => fields,
                             native_ir::Check::NonEmptyList { first, rest } => vec![first, rest],
@@ -814,7 +821,7 @@ impl Lowerer<'_> {
                     exhaustiveness::FallbackCheck::InfiniteCatchAll
                     | exhaustiveness::FallbackCheck::CatchAll { .. } => vec![],
                 };
-                let fallback = self.decision(fallback, clauses)?;
+                let fallback = self.decision(fallback, clauses, prefix_slices)?;
                 Ok(native_ir::Decision::Switch {
                     var: subject,
                     choices,
@@ -829,6 +836,8 @@ impl Lowerer<'_> {
         &self,
         check: &exhaustiveness::RuntimeCheck,
         subject_type: &Type,
+        subject: u32,
+        prefix_slices: &mut HashMap<usize, (u32, u32)>,
     ) -> Result<native_ir::Check, Error> {
         match check {
             exhaustiveness::RuntimeCheck::Int { int_value } => {
@@ -860,8 +869,12 @@ impl Lowerer<'_> {
                     })
                 }
             }
-            exhaustiveness::RuntimeCheck::StringPrefix { .. } => {
-                Err(self.unsupported("string prefix patterns"))
+            exhaustiveness::RuntimeCheck::StringPrefix { prefix, rest } => {
+                let prefix: String = crate::strings::convert_string_escape_chars(prefix).into();
+                // The rest variable, when bound, becomes a slice of the
+                // subject past the prefix.
+                let _ = prefix_slices.insert(rest.id, (subject, prefix.len() as u32));
+                Ok(native_ir::Check::StringPrefix { prefix })
             }
             exhaustiveness::RuntimeCheck::Tuple { elements, .. } => {
                 Ok(native_ir::Check::Always {
@@ -887,8 +900,9 @@ impl Lowerer<'_> {
         &self,
         body: &exhaustiveness::Body,
         clauses: Option<&[TypedClause]>,
+        prefix_slices: &HashMap<usize, (u32, u32)>,
     ) -> Result<native_ir::Decision, Error> {
-        let bindings = self.bound_values(&body.bindings)?;
+        let bindings = self.bound_values(&body.bindings, prefix_slices)?;
         // Assignments have no clause bodies: only the bindings matter.
         let body = match clauses {
             Some(clauses) => {
@@ -907,12 +921,19 @@ impl Lowerer<'_> {
     fn bound_values(
         &self,
         body_bindings: &[(EcoString, exhaustiveness::BoundValue)],
+        prefix_slices: &HashMap<usize, (u32, u32)>,
     ) -> Result<Vec<(String, native_ir::Bound)>, Error> {
         let mut bindings = Vec::with_capacity(body_bindings.len());
         for (name, value) in body_bindings {
             let bound = match value {
                 exhaustiveness::BoundValue::Variable(variable) => {
-                    native_ir::Bound::Variable(variable.id as u32)
+                    match prefix_slices.get(&variable.id) {
+                        Some((subject, offset)) => native_ir::Bound::StringSlice {
+                            subject: *subject,
+                            offset: *offset,
+                        },
+                        None => native_ir::Bound::Variable(variable.id as u32),
+                    }
                 }
                 exhaustiveness::BoundValue::LiteralInt(value) => {
                     native_ir::Bound::Value(lower_int(value))
@@ -930,8 +951,13 @@ impl Lowerer<'_> {
                 exhaustiveness::BoundValue::BitArraySlice { .. } => {
                     return Err(self.unsupported("bit array patterns"));
                 }
-                exhaustiveness::BoundValue::StringSlice { .. } => {
-                    return Err(self.unsupported("string prefix patterns"));
+                exhaustiveness::BoundValue::StringSlice { subject, prefix } => {
+                    let prefix: String =
+                        crate::strings::convert_string_escape_chars(prefix).into();
+                    native_ir::Bound::StringSlice {
+                        subject: subject.id as u32,
+                        offset: prefix.len() as u32,
+                    }
                 }
             };
             bindings.push((name.clone().into(), bound));

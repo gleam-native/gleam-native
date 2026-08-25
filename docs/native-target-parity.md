@@ -82,10 +82,11 @@ platform C convention.
   variant-index-to-tagged-word mapping: `True` is variant 0 but encodes
   as 1), variable and discard patterns, pattern bindings, alternative
   patterns (`a | b`)
-- 🚧 Destructuring pattern kinds: constructors with fields, tuples, and
-  lists (`[x, ..rest]`, nested patterns) work, including untested final
-  variants of exhaustive matches, whose fields arrive via the fallback.
-  Still missing: string prefixes and bit arrays
+- 🚧 Destructuring pattern kinds: constructors with fields, tuples, lists
+  (`[x, ..rest]`, nested patterns), and string prefixes
+  (`"pre" <> rest`, including `as` bindings, in `case` and `let assert`)
+  work, including untested final variants of exhaustive matches, whose
+  fields arrive via the fallback. Still missing: bit arrays
 - 🚧 Guards (`if` clauses): operators, negation, variables, tuple indexing,
   and scalar literal constants work (sharing the expression operator
   lowering). Not yet: field access and module constants in guards

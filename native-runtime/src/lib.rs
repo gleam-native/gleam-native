@@ -256,6 +256,39 @@ pub unsafe extern "C" fn gleam_native_string_eq(left: u64, right: u64) -> u64 {
     }
 }
 
+/// Whether a string starts with the UTF-8 bytes at `prefix`, returning
+/// [`TRUE`] or [`FALSE`]. The prefix lives in the compiled program's
+/// constant data.
+///
+/// # Safety
+///
+/// `subject` must be a string created by this runtime and `prefix` must
+/// point to `length` readable bytes.
+pub unsafe extern "C" fn gleam_native_string_starts_with(
+    subject: u64,
+    prefix: *const u8,
+    length: u64,
+) -> u64 {
+    let prefix = unsafe { std::slice::from_raw_parts(prefix, length as usize) };
+    if string_value(subject).as_bytes().starts_with(prefix) {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// A new string holding everything from byte `offset` onwards. Generated
+/// code only calls this after a prefix check, so the offset is always a
+/// character boundary.
+///
+/// # Safety
+///
+/// `subject` must be a string created by this runtime and `offset` must be
+/// a valid character boundary within it.
+pub unsafe extern "C" fn gleam_native_string_slice_from(subject: u64, offset: u64) -> u64 {
+    box_string(string_value(subject)[offset as usize..].to_string())
+}
+
 /// Allocates a custom type record: a header word encoding the variant tag
 /// and field count, followed by `arity` field words which generated code
 /// stores immediately after this call.
@@ -568,6 +601,14 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_string_eq as *const u8,
         ),
         (
+            "gleam_native_string_starts_with",
+            gleam_native_string_starts_with as *const u8,
+        ),
+        (
+            "gleam_native_string_slice_from",
+            gleam_native_string_slice_from as *const u8,
+        ),
+        (
             "gleam_native_record_new",
             gleam_native_record_new as *const u8,
         ),
@@ -726,6 +767,27 @@ mod tests {
             unsafe { gleam_native_string_eq(make_string(""), make_string("")) },
             TRUE
         );
+    }
+
+    #[test]
+    fn string_prefix_operations() {
+        let subject = make_string("héllo world");
+        let prefix = "héllo ";
+        assert_eq!(
+            unsafe {
+                gleam_native_string_starts_with(subject, prefix.as_ptr(), prefix.len() as u64)
+            },
+            TRUE
+        );
+        let wrong = "hello";
+        assert_eq!(
+            unsafe {
+                gleam_native_string_starts_with(subject, wrong.as_ptr(), wrong.len() as u64)
+            },
+            FALSE
+        );
+        let rest = unsafe { gleam_native_string_slice_from(subject, prefix.len() as u64) };
+        assert_eq!(string_value(rest), "world");
     }
 
     #[test]
