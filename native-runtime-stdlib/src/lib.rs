@@ -18,7 +18,6 @@ use num_bigint::BigInt;
 use num_traits::FromPrimitive;
 use num_traits::ToPrimitive;
 use num_traits::Zero;
-use std::collections::BTreeMap;
 
 use native_runtime::*;
 
@@ -753,23 +752,11 @@ pub extern "C" fn gleam_native_bitarray_to_int_and_size(array: u64) -> u64 {
 // representation; the standard library uses them linearly so in-place
 // mutation is safe.
 
-/// A copy of the dict's map with every key and value's reference count
-/// incremented.
-fn clone_dict_map(dict: u64) -> BTreeMap<DictKey, u64> {
-    dict_payload(dict)
-        .map
-        .iter()
-        .map(|(key, value)| {
-            (DictKey(gleam_native_inc(key.0)), gleam_native_inc(*value))
-        })
-        .collect()
-}
-
 /// A new empty dict.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_new() -> u64 {
     box_dict(DictPayload {
-        map: BTreeMap::new(),
+        map: im::OrdMap::new(),
     })
 }
 
@@ -782,8 +769,8 @@ pub extern "C" fn gleam_native_dict_size(dict: u64) -> u64 {
 /// `Ok(value)` for the key, or `Error(Nil)`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_get(dict: u64, key: u64) -> u64 {
-    match dict_payload(dict).map.get(&DictKey(key)) {
-        Some(value) => make_ok(gleam_native_inc(*value)),
+    match dict_payload(dict).map.get(&DictKeyRef(key)) {
+        Some(value) => make_ok(gleam_native_inc(value.0)),
         None => make_error(NIL),
     }
 }
@@ -792,20 +779,21 @@ pub extern "C" fn gleam_native_dict_get(dict: u64, key: u64) -> u64 {
 /// `maps:is_key/2`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_has_key(key: u64, dict: u64) -> u64 {
-    bool_value(dict_payload(dict).map.contains_key(&DictKey(key)))
+    bool_value(dict_payload(dict).map.contains_key(&DictKeyRef(key)))
 }
 
 /// A new dict with the entry added or replaced; the original is unchanged.
 /// The key and value come first, matching `maps:put/3`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_insert(key: u64, value: u64, dict: u64) -> u64 {
-    let mut map = clone_dict_map(dict);
-    if let Some(previous) = map.insert(DictKey(gleam_native_inc(key)), gleam_native_inc(value)) {
-        let _ = gleam_native_dec(previous);
-        // The map keeps the existing key on replacement; release the extra
-        // reference the new key took.
-        let _ = gleam_native_dec(key);
-    }
+    // The persistent map's clone is O(1); the insert path-copies O(log n)
+    // nodes. Any replaced entry (and whichever of the old and new keys the
+    // map lets go of) releases its reference on drop.
+    let mut map = dict_payload(dict).map.clone();
+    let _ = map.insert(
+        DictKey(gleam_native_inc(key)),
+        DictEntry(gleam_native_inc(value)),
+    );
     box_dict(DictPayload { map })
 }
 
@@ -818,17 +806,18 @@ pub extern "C" fn gleam_native_dict_to_list(dict: u64) -> u64 {
             .map
             .iter()
             .map(|(key, value)| {
-                make_tuple2(gleam_native_inc(key.0), gleam_native_inc(*value))
+                make_tuple2(gleam_native_inc(key.0), gleam_native_inc(value.0))
             })
             .collect(),
     )
 }
 
-/// A mutable copy of the dict.
+/// A mutable copy of the dict: an O(1) clone sharing the original's tree,
+/// which in-place mutation path-copies as it touches nodes.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_to_transient(dict: u64) -> u64 {
     box_dict(DictPayload {
-        map: clone_dict_map(dict),
+        map: dict_payload(dict).map.clone(),
     })
 }
 
@@ -843,11 +832,10 @@ pub extern "C" fn gleam_native_dict_from_transient(transient: u64) -> u64 {
 /// matching `maps:put/3`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_transient_insert(key: u64, value: u64, transient: u64) -> u64 {
-    let map = &mut dict_payload_mut(transient).map;
-    if let Some(previous) = map.insert(DictKey(gleam_native_inc(key)), gleam_native_inc(value)) {
-        let _ = gleam_native_dec(previous);
-        let _ = gleam_native_dec(key);
-    }
+    let _ = dict_payload_mut(transient).map.insert(
+        DictKey(gleam_native_inc(key)),
+        DictEntry(gleam_native_inc(value)),
+    );
     gleam_native_inc(transient)
 }
 
@@ -855,11 +843,8 @@ pub extern "C" fn gleam_native_dict_transient_insert(key: u64, value: u64, trans
 /// `maps:remove/2`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dict_transient_delete(key: u64, transient: u64) -> u64 {
-    let map = &mut dict_payload_mut(transient).map;
-    if let Some((removed_key, removed_value)) = map.remove_entry(&DictKey(key)) {
-        let _ = gleam_native_dec(removed_key.0);
-        let _ = gleam_native_dec(removed_value);
-    }
+    // The removed key and value release their references on drop.
+    let _ = dict_payload_mut(transient).map.remove(&DictKeyRef(key));
     gleam_native_inc(transient)
 }
 
@@ -1008,8 +993,8 @@ pub extern "C" fn gleam_native_bare_index(data: u64, key: u64) -> u64 {
         let header = heap_header(data);
         match header_kind(header) {
             KIND_DICT => {
-                return match dict_payload(data).map.get(&DictKey(key)) {
-                    Some(value) => make_ok(make_some(gleam_native_inc(*value))),
+                return match dict_payload(data).map.get(&DictKeyRef(key)) {
+                    Some(value) => make_ok(make_some(gleam_native_inc(value.0))),
                     None => make_ok(make_none()),
                 };
             }
@@ -1423,4 +1408,123 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_percent_decode as *const u8,
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_string(content: &str) -> u64 {
+        unsafe { gleam_native_string_from_bytes(content.as_ptr(), content.len() as u64) }
+    }
+
+    /// The reference count stored in the word before the value pointer.
+    fn rc(value: u64) -> u64 {
+        unsafe { *((value - 8) as *const u64) }
+    }
+
+    /// The payload of an `Ok` result.
+    fn ok_value(result: u64) -> u64 {
+        record_field(result, 0)
+    }
+
+    #[test]
+    fn dict_versions_share_structure_and_reference_counts_balance() {
+        let key = make_string("key");
+        let value_one = make_string("one");
+        let value_two = make_string("two");
+
+        let empty = gleam_native_dict_new();
+        let one = gleam_native_dict_insert(key, value_one, empty);
+        assert_eq!(rc(key), 2);
+        assert_eq!(rc(value_one), 2);
+
+        // A second version replacing the value must leave the first
+        // version readable, however the two share tree nodes.
+        let two = gleam_native_dict_insert(key, value_two, one);
+        let got = gleam_native_dict_get(one, key);
+        assert_eq!(ok_value(got), value_one);
+        let _ = gleam_native_dec(got);
+        let got = gleam_native_dict_get(two, key);
+        assert_eq!(ok_value(got), value_two);
+        let _ = gleam_native_dec(got);
+
+        // Destroying one version must not disturb the other.
+        let _ = gleam_native_dec(two);
+        let got = gleam_native_dict_get(one, key);
+        assert_eq!(ok_value(got), value_one);
+        let _ = gleam_native_dec(got);
+
+        // Destroying every version releases exactly the references the
+        // maps took.
+        let _ = gleam_native_dec(one);
+        let _ = gleam_native_dec(empty);
+        assert_eq!(rc(key), 1);
+        assert_eq!(rc(value_one), 1);
+        assert_eq!(rc(value_two), 1);
+        let _ = gleam_native_dec(key);
+        let _ = gleam_native_dec(value_one);
+        let _ = gleam_native_dec(value_two);
+    }
+
+    #[test]
+    fn transient_mutation_does_not_disturb_the_source_dict() {
+        let key = make_string("k");
+        let original = make_string("v");
+        let updated = make_string("w");
+
+        let empty = gleam_native_dict_new();
+        let dict = gleam_native_dict_insert(key, original, empty);
+
+        // Mutating the transient copy path-copies the shared nodes.
+        let transient = gleam_native_dict_to_transient(dict);
+        let returned = gleam_native_dict_transient_insert(key, updated, transient);
+        let _ = gleam_native_dec(transient);
+        let got = gleam_native_dict_get(dict, key);
+        assert_eq!(ok_value(got), original);
+        let _ = gleam_native_dec(got);
+        let got = gleam_native_dict_get(returned, key);
+        assert_eq!(ok_value(got), updated);
+        let _ = gleam_native_dec(got);
+
+        // Deleting from the transient releases the removed entry.
+        let emptied = gleam_native_dict_transient_delete(key, returned);
+        let _ = gleam_native_dec(returned);
+        assert_eq!(gleam_native_dict_size(emptied), tag_small_int(0));
+        assert_eq!(gleam_native_dict_has_key(key, dict), TRUE);
+
+        let _ = gleam_native_dec(emptied);
+        let _ = gleam_native_dec(dict);
+        let _ = gleam_native_dec(empty);
+        assert_eq!(rc(key), 1);
+        assert_eq!(rc(original), 1);
+        assert_eq!(rc(updated), 1);
+        let _ = gleam_native_dec(key);
+        let _ = gleam_native_dec(original);
+        let _ = gleam_native_dec(updated);
+    }
+
+    #[test]
+    fn many_dict_versions_from_repeated_inserts() {
+        // The regression this design fixes: building versions by repeated
+        // immutable inserts must not copy the whole map each time, and
+        // every version must stay intact. 1000 versions of a growing dict
+        // would take ~500k entry copies with clone-on-write.
+        let mut versions = vec![gleam_native_dict_new()];
+        for n in 0..1000i64 {
+            let key = tag_small_int(n);
+            let value = tag_small_int(n * 2);
+            let previous = *versions.last().expect("versions is never empty");
+            versions.push(gleam_native_dict_insert(key, value, previous));
+        }
+        for (n, version) in versions.iter().enumerate() {
+            assert_eq!(gleam_native_dict_size(*version), tag_small_int(n as i64));
+        }
+        let got = gleam_native_dict_get(versions[1000], tag_small_int(999));
+        assert_eq!(ok_value(got), tag_small_int(1998));
+        let _ = gleam_native_dec(got);
+        for version in versions {
+            let _ = gleam_native_dec(version);
+        }
+    }
 }

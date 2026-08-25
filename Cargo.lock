@@ -2436,6 +2436,7 @@ dependencies = [
 name = "native-runtime"
 version = "1.0.0"
 dependencies = [
+ "im",
  "libc",
  "num-bigint 0.5.1",
  "num-traits",
@@ -2454,6 +2455,7 @@ dependencies = [
 name = "native-runtime-stdlib"
 version = "1.0.0"
 dependencies = [
+ "im",
  "native-runtime",
  "num-bigint 0.5.1",
  "num-traits",

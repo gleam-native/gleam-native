@@ -1506,12 +1506,11 @@ pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
                 drop(unsafe { Box::from_raw(container::<BitArrayPayload>(value)) })
             }
             KIND_DICT => {
-                let payload = unsafe { Box::from_raw(container::<DictPayload>(value)) };
-                for (key, entry) in payload.value.map.iter() {
-                    worklist.push(key.0);
-                    worklist.push(*entry);
-                }
-                drop(payload);
+                // Dropping the persistent map releases exactly the tree
+                // nodes no other dict shares; their keys and entries
+                // release their references through [`DictKey`] and
+                // [`DictEntry`]'s `Drop` implementations.
+                drop(unsafe { Box::from_raw(container::<DictPayload>(value)) });
             }
             _ => {}
         }
@@ -1528,14 +1527,32 @@ pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
 // `native-runtime-stdlib` crate provides the standard library's entry
 // points over them.
 
-/// The ordered map a dict (kind [`KIND_DICT`]) holds. Keys and values own
-/// a reference each.
+/// The ordered map a dict (kind [`KIND_DICT`]) holds: a persistent B-tree
+/// whose clones share structure, so an immutable insert path-copies
+/// O(log n) nodes instead of copying the map. Keys and values own a
+/// reference each, managed by their wrappers' `Clone` and `Drop`: when a
+/// path copy clones a shared node its entries take new references, and
+/// when the last map holding a node drops it its entries release theirs.
 pub struct DictPayload {
-    pub map: std::collections::BTreeMap<DictKey, u64>,
+    pub map: im::OrdMap<DictKey, DictEntry>,
 }
 
-/// A dict key, ordered by [`cmp_values`].
+/// A dict key: an owned reference to a Gleam value, ordered by
+/// [`cmp_values`].
+#[repr(transparent)]
 pub struct DictKey(pub u64);
+
+impl Clone for DictKey {
+    fn clone(&self) -> Self {
+        DictKey(gleam_native_inc(self.0))
+    }
+}
+
+impl Drop for DictKey {
+    fn drop(&mut self) {
+        let _ = gleam_native_dec(self.0);
+    }
+}
 
 impl Ord for DictKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -1556,6 +1573,55 @@ impl PartialEq for DictKey {
 }
 
 impl Eq for DictKey {}
+
+/// A stored dict value: an owned reference to a Gleam value, like
+/// [`DictKey`].
+#[repr(transparent)]
+pub struct DictEntry(pub u64);
+
+impl Clone for DictEntry {
+    fn clone(&self) -> Self {
+        DictEntry(gleam_native_inc(self.0))
+    }
+}
+
+impl Drop for DictEntry {
+    fn drop(&mut self) {
+        let _ = gleam_native_dec(self.0);
+    }
+}
+
+/// A borrowed lookup key: ordered like [`DictKey`] but holding no
+/// reference, so probing a map does not touch reference counts.
+#[repr(transparent)]
+pub struct DictKeyRef(pub u64);
+
+impl std::borrow::Borrow<DictKeyRef> for DictKey {
+    fn borrow(&self) -> &DictKeyRef {
+        // Both types are transparent wrappers around the value word.
+        unsafe { &*(self as *const DictKey as *const DictKeyRef) }
+    }
+}
+
+impl Ord for DictKeyRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_values(self.0, other.0)
+    }
+}
+
+impl PartialOrd for DictKeyRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DictKeyRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for DictKeyRef {}
 
 /// A total order over Gleam values, consistent with structural equality:
 /// `Equal` exactly when [`deep_eq`] holds (floats excepted for NaN, which
@@ -1632,7 +1698,7 @@ pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
                     Ordering::Equal => {}
                     ordering => return ordering,
                 }
-                match cmp_values(*left_value, *right_value) {
+                match cmp_values(left_value.0, right_value.0) {
                     Ordering::Equal => {}
                     ordering => return ordering,
                 }
@@ -1749,7 +1815,7 @@ pub(crate) fn deep_eq(left: u64, right: u64) -> bool {
                     .iter()
                     .zip(right.map.iter())
                     .all(|((left_key, left_value), (right_key, right_value))| {
-                        deep_eq(left_key.0, right_key.0) && deep_eq(*left_value, *right_value)
+                        deep_eq(left_key.0, right_key.0) && deep_eq(left_value.0, right_value.0)
                     })
         }
         // Closures are equal only when identical, handled above.
@@ -1870,7 +1936,7 @@ pub fn inspect(value: u64) -> String {
             let entries: Vec<String> = dict_payload(value)
                 .map
                 .iter()
-                .map(|(key, entry)| format!("#({}, {})", inspect(key.0), inspect(*entry)))
+                .map(|(key, entry)| format!("#({}, {})", inspect(key.0), inspect(entry.0)))
                 .collect();
             format!("dict.from_list([{}])", entries.join(", "))
         }
