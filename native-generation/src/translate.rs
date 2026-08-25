@@ -10,7 +10,7 @@
 //! `tail` function directly, so an entry wrapper with the C convention is
 //! generated for `main`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
@@ -417,6 +417,8 @@ impl<'a, M: Module> Translator<'a, M> {
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
             scope_owned,
+            dying: HashSet::new(),
+            consumed: Vec::new(),
         };
         // The capture slots take their own references, then the closure
         // itself (owned by this call) is released.
@@ -530,6 +532,8 @@ impl<'a, M: Module> Translator<'a, M> {
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
             scope_owned,
+            dying: HashSet::new(),
+            consumed: Vec::new(),
         };
         if let Some(result) =
             function_translator.statements_scoped(body, 0, Some(Vec::new()))?
@@ -580,6 +584,64 @@ impl<'a, M: Module> Translator<'a, M> {
             .map_err(|error| error.to_string())?;
         self.module.clear_context(&mut context);
         Ok(id)
+    }
+}
+
+/// Whether an expression evaluates every one of its variable mentions
+/// exactly once whenever it is evaluated: no branches (`case`,
+/// short-circuiting booleans), no nested scopes (blocks), and no deferred
+/// bodies (lambdas, whose mentions become captures evaluated elsewhere).
+/// Only such expressions may consume a binding at its last use.
+fn straight_line(expression: &native_ir::Expression) -> bool {
+    use native_ir::Expression;
+    match expression {
+        Expression::Case { .. }
+        | Expression::BoolBinary { .. }
+        | Expression::Lambda { .. }
+        | Expression::Block(_) => false,
+        Expression::Int(_)
+        | Expression::BigInt(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Nil
+        | Expression::Bool(_)
+        | Expression::Variable(_)
+        | Expression::EmptyList
+        | Expression::FunctionReference { .. } => true,
+        Expression::Call { arguments, .. } | Expression::Constructor { arguments, .. } => {
+            arguments.iter().all(straight_line)
+        }
+        Expression::CallValue { callee, arguments } => {
+            straight_line(callee) && arguments.iter().all(straight_line)
+        }
+        Expression::IntBinary { left, right, .. }
+        | Expression::IntCompare { left, right, .. }
+        | Expression::FloatBinary { left, right, .. }
+        | Expression::FloatCompare { left, right, .. }
+        | Expression::Equality { left, right, .. }
+        | Expression::StringConcat(left, right) => {
+            straight_line(left) && straight_line(right)
+        }
+        Expression::BoolNot(inner) => straight_line(inner),
+        Expression::FieldAccess { record, .. } => straight_line(record),
+        Expression::BitArray(segments) => segments.iter().all(|segment| {
+            straight_line(&segment.value)
+                && match &segment.kind {
+                    native_ir::BitSegmentKind::Int { bits, .. }
+                    | native_ir::BitSegmentKind::Float { bits, .. } => straight_line(bits),
+                    native_ir::BitSegmentKind::BitArraySplice { bits: Some(bits) } => {
+                        straight_line(bits)
+                    }
+                    native_ir::BitSegmentKind::BitArraySplice { bits: None }
+                    | native_ir::BitSegmentKind::String { .. }
+                    | native_ir::BitSegmentKind::Codepoint { .. } => true,
+                }
+        }),
+        // A panic aborts: mentions before it still evaluate exactly once.
+        Expression::Echo { value, message, .. } => {
+            straight_line(value) && message.as_deref().is_none_or(straight_line)
+        }
+        Expression::Panic { message, .. } => message.as_deref().is_none_or(straight_line),
     }
 }
 
@@ -643,6 +705,12 @@ fn emit_dec<M: Module>(
     builder.switch_to_block(done);
 }
 
+/// The owned values a tail transfer must release between argument
+/// evaluation and the transfer: enclosing scope bindings (with their names,
+/// so a last-use argument can consume its entry) and unnamed temporaries
+/// such as case subjects.
+type Cleanups = Vec<(Option<String>, Value)>;
+
 /// How a decision tree's leaves behave: `case` clause bodies run in their
 /// own scope, while assignment destructuring binds into the enclosing scope
 /// and yields the subject value.
@@ -651,7 +719,7 @@ enum DecisionMode<'a> {
     Case {
         /// In tail position: the owned values (enclosing scopes, subjects)
         /// to release before a tail transfer inside a clause.
-        tail: Option<Vec<Value>>,
+        tail: Option<Cleanups>,
     },
     Assignment {
         result: Value,
@@ -674,10 +742,18 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     display_names: &'a mut Vec<String>,
     display_ids: &'a mut HashMap<String, u16>,
     /// Named variable slots holding owned references, decremented when
-    /// their scope's statement sequence finishes — or just before its final
-    /// statement, for bindings the final statement does not mention, so that
-    /// tail-recursive loops release their garbage every iteration.
+    /// their scope's statement sequence finishes — or earlier, as soon as
+    /// no remaining statement mentions them, so that tail-recursive loops
+    /// release their garbage every iteration.
     scope_owned: Vec<(String, Variable)>,
+    /// Bindings whose next use is their last: that use consumes the
+    /// binding's ownership instead of incrementing here and releasing at
+    /// the scope's end. Armed per straight-line statement (and per tail
+    /// transfer's argument evaluation), empty otherwise.
+    dying: HashSet<String>,
+    /// The names consumed while [`Self::dying`] was armed, so a pending
+    /// tail-transfer release list can skip their entries.
+    consumed: Vec<String>,
 }
 
 impl<M: Module> FunctionTranslator<'_, '_, M> {
@@ -950,6 +1026,51 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         Ok(self.builder.block_params(join)[0])
     }
 
+    /// Arms last-use consumption for a tail transfer's argument evaluation:
+    /// a name owed a release in `cleanups` whose single mention across the
+    /// argument expressions is about to be evaluated unconditionally is
+    /// consumed at that use instead of incremented there and released
+    /// before the transfer.
+    fn arm_last_uses(
+        &mut self,
+        mentioned: &[&native_ir::Expression],
+        cleanups: &[(Option<String>, Value)],
+    ) {
+        self.dying.clear();
+        self.consumed.clear();
+        if !mentioned.iter().all(|expression| straight_line(expression)) {
+            return;
+        }
+        let mut counts = HashMap::new();
+        for expression in mentioned {
+            native_ir::expression_mentions(expression, &mut counts);
+        }
+        for (name, _) in cleanups {
+            if let Some(name) = name
+                && counts.get(name) == Some(&1)
+            {
+                let _ = self.dying.insert(name.clone());
+            }
+        }
+    }
+
+    /// Releases a tail transfer's owed values, minus the entries consumed
+    /// during argument evaluation (innermost entry per consumed name).
+    fn release_cleanups(&mut self, mut cleanups: Cleanups) {
+        self.dying.clear();
+        for name in std::mem::take(&mut self.consumed) {
+            if let Some(position) = cleanups
+                .iter()
+                .rposition(|(entry, _)| entry.as_deref() == Some(name.as_str()))
+            {
+                let _ = cleanups.remove(position);
+            }
+        }
+        for (_, value) in cleanups {
+            self.dec(value);
+        }
+    }
+
     /// Translates a statement sequence with ownership bookkeeping: values of
     /// discarded statements are decremented immediately, `let`-bound slots
     /// are decremented when the sequence finishes, and a final `let`'s value
@@ -971,35 +1092,36 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         &mut self,
         statements: &[native_ir::Statement],
         scope_start: usize,
-        tail: Option<Vec<Value>>,
+        tail: Option<Cleanups>,
     ) -> Result<Option<Value>, String> {
         let mut result = None;
         for (index, statement) in statements.iter().enumerate() {
             let is_final = index + 1 == statements.len();
-            if is_final {
-                // Release bindings the final statement does not mention now,
-                // so a tail call does not keep them alive down the recursion.
-                let free = native_ir::free_variables(
-                    std::slice::from_ref(statement),
-                    &std::collections::HashSet::new(),
-                );
-                let kept = self.scope_owned.split_off(scope_start);
-                for (name, slot) in kept {
-                    if free.contains(&name) {
-                        self.scope_owned.push((name, slot));
-                    } else {
-                        let value = self.builder.use_var(slot);
-                        self.dec(value);
-                    }
+            // What this statement and the rest of the sequence mention.
+            // Bindings mentioned by neither release now, so tail-recursive
+            // loops release their garbage every iteration; a binding whose
+            // single remaining mention is in this statement is consumed by
+            // that use below.
+            let counts = native_ir::mention_counts(std::slice::from_ref(statement));
+            let suffix = native_ir::mention_counts(&statements[index + 1..]);
+            let kept = self.scope_owned.split_off(scope_start);
+            for (name, slot) in kept {
+                if counts.contains_key(&name) || suffix.contains_key(&name) {
+                    self.scope_owned.push((name, slot));
+                } else {
+                    let value = self.builder.use_var(slot);
+                    self.dec(value);
                 }
+            }
+            if is_final {
                 // In tail position, a final call transfers control: hand it
                 // the values still owed a release.
                 if let (Some(outer), native_ir::Statement::Expression(expression)) =
                     (&tail, statement)
                 {
                     let mut cleanups = outer.clone();
-                    for (_, slot) in &self.scope_owned[scope_start..] {
-                        cleanups.push(self.builder.use_var(*slot));
+                    for (name, slot) in &self.scope_owned[scope_start..] {
+                        cleanups.push((Some(name.clone()), self.builder.use_var(*slot)));
                     }
                     match self.expression_tail(expression, cleanups)? {
                         None => {
@@ -1011,6 +1133,21 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             result = Some(value);
                             break;
                         }
+                    }
+                }
+            }
+            // Arm last-use consumption: a binding of this scope whose only
+            // remaining mention sits in a statement that evaluates it
+            // unconditionally moves at that use instead.
+            let armable = match statement {
+                native_ir::Statement::Let { value, .. } => straight_line(value),
+                native_ir::Statement::Expression(expression) => straight_line(expression),
+                native_ir::Statement::Destructure { .. } => false,
+            };
+            if armable {
+                for (name, _) in &self.scope_owned[scope_start..] {
+                    if counts.get(name) == Some(&1) && !suffix.contains_key(name) {
+                        let _ = self.dying.insert(name.clone());
                     }
                 }
             }
@@ -1063,6 +1200,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     result
                 }
             });
+            self.dying.clear();
+            self.consumed.clear();
         }
         let result = match result {
             Some(value) => value,
@@ -1084,7 +1223,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     fn expression_tail(
         &mut self,
         expression: &native_ir::Expression,
-        cleanups: Vec<Value>,
+        cleanups: Cleanups,
     ) -> Result<Option<Value>, String> {
         match expression {
             native_ir::Expression::Call {
@@ -1100,19 +1239,22 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     // C-convention functions cannot be tail called.
                     return Ok(Some(self.expression(expression)?));
                 }
+                let mentioned: Vec<&native_ir::Expression> = arguments.iter().collect();
+                self.arm_last_uses(&mentioned, &cleanups);
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
                     values.push(self.expression(argument)?);
                 }
-                for cleanup in cleanups {
-                    self.dec(cleanup);
-                }
+                self.release_cleanups(cleanups);
                 let function_ref = self.module.declare_func_in_func(id, self.builder.func);
                 self.builder.ins().return_call(function_ref, &values);
                 Ok(None)
             }
 
             native_ir::Expression::CallValue { callee, arguments } => {
+                let mut mentioned: Vec<&native_ir::Expression> = vec![callee];
+                mentioned.extend(arguments.iter());
+                self.arm_last_uses(&mentioned, &cleanups);
                 let callee = self.expression(callee)?;
                 let mut values = Vec::with_capacity(1 + arguments.len());
                 values.push(callee);
@@ -1123,9 +1265,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .builder
                     .ins()
                     .load(types::I64, MemFlagsData::trusted(), callee, 8);
-                for cleanup in cleanups {
-                    self.dec(cleanup);
-                }
+                self.release_cleanups(cleanups);
                 let signature = self.builder.import_signature(gleam_signature(values.len()));
                 self.builder
                     .ins()
@@ -1151,7 +1291,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     subject_values.push(value);
                 }
                 let mut tail_cleanups = cleanups;
-                tail_cleanups.extend(subject_values.iter().copied());
+                tail_cleanups.extend(subject_values.iter().map(|value| (None, *value)));
 
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
@@ -1226,11 +1366,27 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 .iconst(types::I64, if *value { 3 } else { 1 })),
 
             native_ir::Expression::Variable(name) => {
-                let variable = self
+                let variable = *self
                     .environment
                     .get(name)
                     .ok_or_else(|| format!("unbound variable `{name}`"))?;
-                let value = self.builder.use_var(*variable);
+                let value = self.builder.use_var(variable);
+                if self.dying.remove(name) {
+                    // The binding's last use: move its ownership into this
+                    // use instead of an increment here and a release at the
+                    // scope's end. The slot comparison guards against a
+                    // name resolving to a shadowing binding (a guard
+                    // binding, say) that is not the owned entry.
+                    if let Some(position) = self
+                        .scope_owned
+                        .iter()
+                        .rposition(|(owned, slot)| owned == name && *slot == variable)
+                    {
+                        let _ = self.scope_owned.remove(position);
+                        self.consumed.push(name.clone());
+                        return Ok(value);
+                    }
+                }
                 Ok(self.inc(value))
             }
 
@@ -1943,27 +2099,28 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
                 let result = match mode {
                     DecisionMode::Case { tail } => {
+                        // Clause bindings join the scope machinery: the
+                        // body's last-use analysis can consume them, and
+                        // its scope release frees whatever survives. A
+                        // transferring clause may also consume entries of
+                        // enclosing scopes (their release moves into its
+                        // arguments), which is per-path behaviour: restore
+                        // the owned list afterwards so sibling clauses and
+                        // the join path still see every entry.
+                        let saved_owned = self.scope_owned.clone();
                         let scope_start = self.scope_owned.len();
-                        let tail = tail.map(|mut cleanups| {
-                            for (_, slot) in &binding_slots {
-                                cleanups.push(self.builder.use_var(*slot));
-                            }
-                            cleanups
-                        });
+                        self.scope_owned.extend(binding_slots.iter().cloned());
                         match self.statements_scoped(body, scope_start, tail)? {
                             None => {
                                 // The clause tail-transferred; nothing joins.
+                                self.scope_owned = saved_owned;
                                 if let Some(environment) = saved_environment {
                                     self.environment = environment;
                                 }
                                 return Ok(false);
                             }
                             Some(result) => {
-                                // Clause bindings end with the clause.
-                                for (_, slot) in binding_slots {
-                                    let value = self.builder.use_var(slot);
-                                    self.dec(value);
-                                }
+                                self.scope_owned = saved_owned;
                                 result
                             }
                         }
@@ -2135,11 +2292,21 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let jumped = match &mode {
                     DecisionMode::Case { tail: Some(outer) } => {
                         let mut cleanups = outer.clone();
+                        // Guard bindings are released outside the scope
+                        // machinery, so their entries carry no name and are
+                        // never consumed.
                         for slot in &binding_slots {
-                            cleanups.push(self.builder.use_var(*slot));
+                            cleanups.push((None, self.builder.use_var(*slot)));
                         }
+                        // A transferring body may consume enclosing scopes'
+                        // entries; restore the owned list for the guard's
+                        // false path and everything after (see the clause
+                        // body case above).
+                        let saved_owned = self.scope_owned.clone();
                         let scope_start = self.scope_owned.len();
-                        match self.statements_scoped(if_true, scope_start, Some(cleanups))? {
+                        let outcome = self.statements_scoped(if_true, scope_start, Some(cleanups))?;
+                        self.scope_owned = saved_owned;
+                        match outcome {
                             None => false,
                             Some(result) => {
                                 for slot in &binding_slots {

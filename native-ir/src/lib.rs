@@ -9,6 +9,7 @@
 //! of Cranelift so that `compiler-core` remains compilable to WebAssembly.
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -522,32 +523,55 @@ Delete the project's `build` directory and rebuild."
 pub fn free_variables(statements: &[Statement], bound: &HashSet<String>) -> BTreeSet<String> {
     let mut free = BTreeSet::new();
     let mut bound = bound.clone();
-    statements_free(statements, &mut bound, &mut free);
+    statements_free(statements, &mut bound, &mut |name| {
+        let _ = free.insert(name.to_string());
+    });
     free
+}
+
+/// How many times each free variable is mentioned across the statements,
+/// walking exactly like [`free_variables`]. Code generation's last-use
+/// analysis consumes a binding at a use only when its count says that use
+/// is the only one left.
+pub fn mention_counts(statements: &[Statement]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    let mut bound = HashSet::new();
+    statements_free(statements, &mut bound, &mut |name| {
+        *counts.entry(name.to_string()).or_insert(0) += 1;
+    });
+    counts
+}
+
+/// Adds one expression's free-variable mention counts into `counts`.
+pub fn expression_mentions(expression: &Expression, counts: &mut HashMap<String, usize>) {
+    let mut bound = HashSet::new();
+    expression_free(expression, &mut bound, &mut |name| {
+        *counts.entry(name.to_string()).or_insert(0) += 1;
+    });
 }
 
 fn statements_free(
     statements: &[Statement],
     bound: &mut HashSet<String>,
-    free: &mut BTreeSet<String>,
+    sink: &mut dyn FnMut(&str),
 ) {
     for statement in statements {
         match statement {
             Statement::Let { name, value } => {
-                expression_free(value, bound, free);
+                expression_free(value, bound, sink);
                 let _ = bound.insert(name.clone());
             }
             Statement::Destructure { subject, tree, on_failure, .. } => {
-                expression_free(subject, bound, free);
+                expression_free(subject, bound, sink);
                 if let Some(failure) = on_failure
                     && let Some(message) = &failure.message
                 {
-                    expression_free(message, bound, free);
+                    expression_free(message, bound, sink);
                 }
                 // Assignment bindings persist for the following statements.
-                decision_free(tree, bound, free, true);
+                decision_free(tree, bound, sink, true);
             }
-            Statement::Expression(expression) => expression_free(expression, bound, free),
+            Statement::Expression(expression) => expression_free(expression, bound, sink),
         }
     }
 }
@@ -555,12 +579,12 @@ fn statements_free(
 fn expression_free(
     expression: &Expression,
     bound: &mut HashSet<String>,
-    free: &mut BTreeSet<String>,
+    sink: &mut dyn FnMut(&str),
 ) {
     match expression {
         Expression::Variable(name) => {
             if !bound.contains(name) {
-                let _ = free.insert(name.clone());
+                sink(name);
             }
         }
         Expression::Int(_)
@@ -573,17 +597,17 @@ fn expression_free(
         | Expression::FunctionReference { .. } => {}
         Expression::Block(statements) => {
             let mut scope = bound.clone();
-            statements_free(statements, &mut scope, free);
+            statements_free(statements, &mut scope, sink);
         }
         Expression::Call { arguments, .. } | Expression::Constructor { arguments, .. } => {
             for argument in arguments {
-                expression_free(argument, bound, free);
+                expression_free(argument, bound, sink);
             }
         }
         Expression::CallValue { callee, arguments } => {
-            expression_free(callee, bound, free);
+            expression_free(callee, bound, sink);
             for argument in arguments {
-                expression_free(argument, bound, free);
+                expression_free(argument, bound, sink);
             }
         }
         Expression::IntBinary { left, right, .. }
@@ -592,37 +616,37 @@ fn expression_free(
         | Expression::FloatCompare { left, right, .. }
         | Expression::Equality { left, right, .. }
         | Expression::BoolBinary { left, right, .. } => {
-            expression_free(left, bound, free);
-            expression_free(right, bound, free);
+            expression_free(left, bound, sink);
+            expression_free(right, bound, sink);
         }
         Expression::StringConcat(left, right) => {
-            expression_free(left, bound, free);
-            expression_free(right, bound, free);
+            expression_free(left, bound, sink);
+            expression_free(right, bound, sink);
         }
-        Expression::BoolNot(inner) => expression_free(inner, bound, free),
-        Expression::FieldAccess { record, .. } => expression_free(record, bound, free),
+        Expression::BoolNot(inner) => expression_free(inner, bound, sink),
+        Expression::FieldAccess { record, .. } => expression_free(record, bound, sink),
         Expression::Case { subjects, tree, .. } => {
             for subject in subjects {
-                expression_free(subject, bound, free);
+                expression_free(subject, bound, sink);
             }
-            decision_free(tree, bound, free, false);
+            decision_free(tree, bound, sink, false);
         }
         Expression::Lambda { parameters, body } => {
             let mut scope = bound.clone();
             for parameter in parameters {
                 let _ = scope.insert(parameter.clone());
             }
-            statements_free(body, &mut scope, free);
+            statements_free(body, &mut scope, sink);
         }
         Expression::BitArray(segments) => {
             for segment in segments {
-                expression_free(&segment.value, bound, free);
+                expression_free(&segment.value, bound, sink);
                 match &segment.kind {
                     BitSegmentKind::Int { bits, .. } | BitSegmentKind::Float { bits, .. } => {
-                        expression_free(bits, bound, free)
+                        expression_free(bits, bound, sink)
                     }
                     BitSegmentKind::BitArraySplice { bits: Some(bits) } => {
-                        expression_free(bits, bound, free)
+                        expression_free(bits, bound, sink)
                     }
                     BitSegmentKind::BitArraySplice { bits: None }
                     | BitSegmentKind::String { .. }
@@ -631,14 +655,14 @@ fn expression_free(
             }
         }
         Expression::Echo { value, message, .. } => {
-            expression_free(value, bound, free);
+            expression_free(value, bound, sink);
             if let Some(message) = message {
-                expression_free(message, bound, free);
+                expression_free(message, bound, sink);
             }
         }
         Expression::Panic { message, .. } => {
             if let Some(message) = message {
-                expression_free(message, bound, free);
+                expression_free(message, bound, sink);
             }
         }
     }
@@ -647,7 +671,7 @@ fn expression_free(
 fn decision_free(
     decision: &Decision,
     bound: &mut HashSet<String>,
-    free: &mut BTreeSet<String>,
+    sink: &mut dyn FnMut(&str),
     bindings_persist: bool,
 ) {
     match decision {
@@ -659,19 +683,19 @@ fn decision_free(
             };
             let scope = scope.as_mut().unwrap_or(bound);
             for (name, value) in bindings {
-                bound_free(value, scope, free);
+                bound_free(value, scope, sink);
                 let _ = scope.insert(name.clone());
             }
-            statements_free(body, scope, free);
+            statements_free(body, scope, sink);
         }
         Decision::Switch {
             choices, fallback, ..
         } => {
             for (check, decision) in choices {
-                check_free(check, bound, free);
-                decision_free(decision, bound, free, bindings_persist);
+                check_free(check, bound, sink);
+                decision_free(decision, bound, sink, bindings_persist);
             }
-            decision_free(fallback, bound, free, bindings_persist);
+            decision_free(fallback, bound, sink, bindings_persist);
         }
         Decision::Guard {
             bindings,
@@ -681,12 +705,12 @@ fn decision_free(
         } => {
             let mut scope = bound.clone();
             for (name, value) in bindings {
-                bound_free(value, &mut scope, free);
+                bound_free(value, &mut scope, sink);
                 let _ = scope.insert(name.clone());
             }
-            expression_free(guard, &mut scope, free);
-            statements_free(if_true, &mut scope, free);
-            decision_free(if_false, bound, free, bindings_persist);
+            expression_free(guard, &mut scope, sink);
+            statements_free(if_true, &mut scope, sink);
+            decision_free(if_false, bound, sink, bindings_persist);
         }
         Decision::Fail => {}
     }
@@ -754,42 +778,42 @@ mod tests {
     }
 }
 
-fn check_free(check: &Check, bound: &mut HashSet<String>, free: &mut BTreeSet<String>) {
+fn check_free(check: &Check, bound: &mut HashSet<String>, sink: &mut dyn FnMut(&str)) {
     let Check::BitArray { reads, test } = check else {
         return;
     };
     for read in reads {
-        expression_free(&read.offset, bound, free);
-        expression_free(&read.bits, bound, free);
+        expression_free(&read.offset, bound, sink);
+        expression_free(&read.bits, bound, sink);
         // The read's name is available to everything after this check.
         let _ = bound.insert(read.name.clone());
     }
     match test {
-        BitsTest::Size { bits, .. } => expression_free(bits, bound, free),
-        BitsTest::NonNegative { value } => expression_free(value, bound, free),
+        BitsTest::Size { bits, .. } => expression_free(bits, bound, sink),
+        BitsTest::NonNegative { value } => expression_free(value, bound, sink),
         BitsTest::Bytes { offset, .. } | BitsTest::RestIsBytes { offset } => {
-            expression_free(offset, bound, free)
+            expression_free(offset, bound, sink)
         }
         BitsTest::IsFiniteFloat { offset, bits, .. } => {
-            expression_free(offset, bound, free);
-            expression_free(bits, bound, free);
+            expression_free(offset, bound, sink);
+            expression_free(bits, bound, sink);
         }
         BitsTest::AlwaysTrue => {}
     }
 }
 
-fn bound_free(value: &Bound, bound: &mut HashSet<String>, free: &mut BTreeSet<String>) {
+fn bound_free(value: &Bound, bound: &mut HashSet<String>, sink: &mut dyn FnMut(&str)) {
     match value {
-        Bound::Value(expression) => expression_free(expression, bound, free),
+        Bound::Value(expression) => expression_free(expression, bound, sink),
         Bound::Variable(_) | Bound::StringSlice { .. } => {}
         Bound::BitsReadInt { offset, bits, .. } | Bound::BitsReadFloat { offset, bits, .. } => {
-            expression_free(offset, bound, free);
-            expression_free(bits, bound, free);
+            expression_free(offset, bound, sink);
+            expression_free(bits, bound, sink);
         }
         Bound::BitsSlice { offset, bits, .. } => {
-            expression_free(offset, bound, free);
+            expression_free(offset, bound, sink);
             if let Some(bits) = bits {
-                expression_free(bits, bound, free);
+                expression_free(bits, bound, sink);
             }
         }
     }
