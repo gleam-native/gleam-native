@@ -235,7 +235,7 @@ fn push_bit(payload: &mut BitArrayPayload, bit: bool) {
 
 /// Appends `length` bits read from `source` starting at `offset`.
 fn append_bits(payload: &mut BitArrayPayload, source: &[u8], offset: u64, length: u64) {
-    if payload.bits % 8 == 0 && offset % 8 == 0 && length % 8 == 0 {
+    if payload.bits.is_multiple_of(8) && offset.is_multiple_of(8) && length.is_multiple_of(8) {
         // Fully aligned fast path.
         let start = (offset / 8) as usize;
         let end = start + (length / 8) as usize;
@@ -1073,7 +1073,7 @@ pub extern "C" fn gleam_native_start_arguments() -> u64 {
     make_list(
         arguments
             .into_iter()
-            .map(|argument| box_string(argument))
+            .map(box_string)
             .collect(),
     )
 }
@@ -1272,7 +1272,11 @@ pub unsafe extern "C" fn gleam_native_bitarray_bytes_test(
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_rest_is_bytes(array: u64, offset: u64) -> u64 {
     let offset = untag_bits(offset, "offset");
-    if (bitarray_value(array).bits.saturating_sub(offset)) % 8 == 0 {
+    if bitarray_value(array)
+        .bits
+        .saturating_sub(offset)
+        .is_multiple_of(8)
+    {
         TRUE
     } else {
         FALSE

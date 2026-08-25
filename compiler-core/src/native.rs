@@ -299,62 +299,64 @@ impl Lowerer<'_> {
                     .iter()
                     .map(|argument| self.expression(&argument.value))
                     .collect::<Result<Vec<_>, _>>()?;
-                match fun.as_ref() {
-                    TypedExpr::Var { constructor, .. } => match &constructor.variant {
+                // A call to a module function or a constructor compiles
+                // directly; calling any other expression goes through the
+                // closure calling convention.
+                if let TypedExpr::Var { constructor, .. } = fun.as_ref() {
+                    match &constructor.variant {
                         ValueConstructorVariant::ModuleFn { module, name, .. } => {
-                            Ok(native_ir::Expression::Call {
+                            return Ok(native_ir::Expression::Call {
                                 module: module.clone().into(),
                                 function: name.clone().into(),
                                 arguments,
-                            })
+                            });
                         }
                         ValueConstructorVariant::Record {
                             name,
                             variant_index,
                             ..
-                        } => Ok(native_ir::Expression::Constructor {
-                            tag: *variant_index as u32,
-                            display: native_ir::ConstructorDisplay::Record {
-                                name: name.clone().into(),
-                            },
-                            arguments,
-                        }),
-                        _ => Ok(native_ir::Expression::CallValue {
-                            callee: Box::new(self.expression(fun)?),
-                            arguments,
-                        }),
-                    },
-                    TypedExpr::ModuleSelect { constructor, .. } => match constructor {
+                        } => {
+                            return Ok(native_ir::Expression::Constructor {
+                                tag: *variant_index as u32,
+                                display: native_ir::ConstructorDisplay::Record {
+                                    name: name.clone().into(),
+                                },
+                                arguments,
+                            });
+                        }
+                        ValueConstructorVariant::LocalVariable { .. }
+                        | ValueConstructorVariant::ModuleConstant { .. } => {}
+                    }
+                }
+                if let TypedExpr::ModuleSelect { constructor, .. } = fun.as_ref() {
+                    match constructor {
                         ModuleValueConstructor::Fn { module, name, .. } => {
-                            Ok(native_ir::Expression::Call {
+                            return Ok(native_ir::Expression::Call {
                                 module: module.clone().into(),
                                 function: name.clone().into(),
                                 arguments,
-                            })
+                            });
                         }
                         ModuleValueConstructor::Record {
                             name,
                             variant_index,
                             ..
-                        } => Ok(native_ir::Expression::Constructor {
-                            tag: *variant_index as u32,
-                            display: native_ir::ConstructorDisplay::Record {
-                                name: name.clone().into(),
-                            },
-                            arguments,
-                        }),
-                        ModuleValueConstructor::Constant { .. } => {
-                            Ok(native_ir::Expression::CallValue {
-                                callee: Box::new(self.expression(fun)?),
+                        } => {
+                            return Ok(native_ir::Expression::Constructor {
+                                tag: *variant_index as u32,
+                                display: native_ir::ConstructorDisplay::Record {
+                                    name: name.clone().into(),
+                                },
                                 arguments,
-                            })
+                            });
                         }
-                    },
-                    _ => Ok(native_ir::Expression::CallValue {
-                        callee: Box::new(self.expression(fun)?),
-                        arguments,
-                    }),
+                        ModuleValueConstructor::Constant { .. } => {}
+                    }
                 }
+                Ok(native_ir::Expression::CallValue {
+                    callee: Box::new(self.expression(fun)?),
+                    arguments,
+                })
             }
 
             TypedExpr::Fn {
@@ -412,24 +414,22 @@ impl Lowerer<'_> {
                         latest = Some((assignment.name.clone(), assignment.value.type_()));
                     }
                 }
-                let finally = match finally.as_ref() {
-                    TypedExpr::Echo {
-                        expression: None,
-                        message,
+                let finally = if let TypedExpr::Echo {
+                    expression: None,
+                    message,
+                    location,
+                    ..
+                } = finally.as_ref()
+                {
+                    let (name, type_) = latest.expect("echo with no previous step in a pipe");
+                    self.echo(
+                        native_ir::Expression::Variable(name.into()),
+                        &type_,
+                        message.as_deref(),
                         location,
-                        ..
-                    } => {
-                        let (name, type_) = latest
-                            .clone()
-                            .expect("echo with no previous step in a pipe");
-                        self.echo(
-                            native_ir::Expression::Variable(name.into()),
-                            &type_,
-                            message.as_deref(),
-                            location,
-                        )?
-                    }
-                    finally => self.expression(finally)?,
+                    )?
+                } else {
+                    self.expression(finally)?
                 };
                 statements.push(native_ir::Statement::Expression(finally));
                 Ok(native_ir::Expression::Block(statements))
@@ -487,25 +487,33 @@ impl Lowerer<'_> {
                 // The type checker has already desugared the update into a
                 // full constructor argument list where unchanged fields read
                 // from the spread record, referenced by name.
-                let (tag, name) = match constructor.as_ref() {
-                    TypedExpr::Var { constructor, .. } => match &constructor.variant {
+                let constructor = constructor.as_ref();
+                let (tag, name) = if let TypedExpr::Var { constructor, .. } = constructor {
+                    match &constructor.variant {
                         ValueConstructorVariant::Record {
                             name,
                             variant_index,
                             ..
                         } => (*variant_index as u32, name.clone()),
-                        _ => return Err(self.unsupported("this record update")),
-                    },
-                    TypedExpr::ModuleSelect {
-                        constructor:
-                            ModuleValueConstructor::Record {
-                                name,
-                                variant_index,
-                                ..
-                            },
-                        ..
-                    } => (*variant_index as u32, name.clone()),
-                    _ => return Err(self.unsupported("this record update")),
+                        ValueConstructorVariant::LocalVariable { .. }
+                        | ValueConstructorVariant::ModuleFn { .. }
+                        | ValueConstructorVariant::ModuleConstant { .. } => {
+                            return Err(self.unsupported("this record update"));
+                        }
+                    }
+                } else if let TypedExpr::ModuleSelect {
+                    constructor:
+                        ModuleValueConstructor::Record {
+                            name,
+                            variant_index,
+                            ..
+                        },
+                    ..
+                } = constructor
+                {
+                    (*variant_index as u32, name.clone())
+                } else {
+                    return Err(self.unsupported("this record update"));
                 };
                 let arguments = arguments
                     .iter()
@@ -634,57 +642,85 @@ impl Lowerer<'_> {
         left: native_ir::Expression,
         right: native_ir::Expression,
     ) -> Result<native_ir::Expression, Error> {
+        use native_ir::{CompareOperator, FloatOperator, IntOperator};
+
+        fn int_binary(
+            operator: IntOperator,
+            left: Box<native_ir::Expression>,
+            right: Box<native_ir::Expression>,
+        ) -> native_ir::Expression {
+            native_ir::Expression::IntBinary {
+                operator,
+                left,
+                right,
+            }
+        }
+        fn int_compare(
+            operator: CompareOperator,
+            left: Box<native_ir::Expression>,
+            right: Box<native_ir::Expression>,
+        ) -> native_ir::Expression {
+            native_ir::Expression::IntCompare {
+                operator,
+                left,
+                right,
+            }
+        }
+        fn float_binary(
+            operator: FloatOperator,
+            left: Box<native_ir::Expression>,
+            right: Box<native_ir::Expression>,
+        ) -> native_ir::Expression {
+            native_ir::Expression::FloatBinary {
+                operator,
+                left,
+                right,
+            }
+        }
+        fn float_compare(
+            operator: CompareOperator,
+            left: Box<native_ir::Expression>,
+            right: Box<native_ir::Expression>,
+        ) -> native_ir::Expression {
+            native_ir::Expression::FloatCompare {
+                operator,
+                left,
+                right,
+            }
+        }
+
         let left = Box::new(left);
         let right = Box::new(right);
         match operator {
-            BinOp::AddInt | BinOp::SubInt | BinOp::MultInt | BinOp::DivInt
-            | BinOp::RemainderInt => Ok(native_ir::Expression::IntBinary {
-                operator: match operator {
-                    BinOp::AddInt => native_ir::IntOperator::Add,
-                    BinOp::SubInt => native_ir::IntOperator::Subtract,
-                    BinOp::MultInt => native_ir::IntOperator::Multiply,
-                    BinOp::DivInt => native_ir::IntOperator::Divide,
-                    _ => native_ir::IntOperator::Remainder,
-                },
+            BinOp::AddInt => Ok(int_binary(IntOperator::Add, left, right)),
+            BinOp::SubInt => Ok(int_binary(IntOperator::Subtract, left, right)),
+            BinOp::MultInt => Ok(int_binary(IntOperator::Multiply, left, right)),
+            BinOp::DivInt => Ok(int_binary(IntOperator::Divide, left, right)),
+            BinOp::RemainderInt => Ok(int_binary(IntOperator::Remainder, left, right)),
+            BinOp::LtInt => Ok(int_compare(CompareOperator::LessThan, left, right)),
+            BinOp::LtEqInt => Ok(int_compare(CompareOperator::LessThanOrEqual, left, right)),
+            BinOp::GtInt => Ok(int_compare(CompareOperator::GreaterThan, left, right)),
+            BinOp::GtEqInt => Ok(int_compare(
+                CompareOperator::GreaterThanOrEqual,
                 left,
                 right,
-            }),
-            BinOp::LtInt | BinOp::LtEqInt | BinOp::GtInt | BinOp::GtEqInt => {
-                Ok(native_ir::Expression::IntCompare {
-                    operator: match operator {
-                        BinOp::LtInt => native_ir::CompareOperator::LessThan,
-                        BinOp::LtEqInt => native_ir::CompareOperator::LessThanOrEqual,
-                        BinOp::GtInt => native_ir::CompareOperator::GreaterThan,
-                        _ => native_ir::CompareOperator::GreaterThanOrEqual,
-                    },
-                    left,
-                    right,
-                })
-            }
-            BinOp::AddFloat | BinOp::SubFloat | BinOp::MultFloat | BinOp::DivFloat => {
-                Ok(native_ir::Expression::FloatBinary {
-                    operator: match operator {
-                        BinOp::AddFloat => native_ir::FloatOperator::Add,
-                        BinOp::SubFloat => native_ir::FloatOperator::Subtract,
-                        BinOp::MultFloat => native_ir::FloatOperator::Multiply,
-                        _ => native_ir::FloatOperator::Divide,
-                    },
-                    left,
-                    right,
-                })
-            }
-            BinOp::LtFloat | BinOp::LtEqFloat | BinOp::GtFloat | BinOp::GtEqFloat => {
-                Ok(native_ir::Expression::FloatCompare {
-                    operator: match operator {
-                        BinOp::LtFloat => native_ir::CompareOperator::LessThan,
-                        BinOp::LtEqFloat => native_ir::CompareOperator::LessThanOrEqual,
-                        BinOp::GtFloat => native_ir::CompareOperator::GreaterThan,
-                        _ => native_ir::CompareOperator::GreaterThanOrEqual,
-                    },
-                    left,
-                    right,
-                })
-            }
+            )),
+            BinOp::AddFloat => Ok(float_binary(FloatOperator::Add, left, right)),
+            BinOp::SubFloat => Ok(float_binary(FloatOperator::Subtract, left, right)),
+            BinOp::MultFloat => Ok(float_binary(FloatOperator::Multiply, left, right)),
+            BinOp::DivFloat => Ok(float_binary(FloatOperator::Divide, left, right)),
+            BinOp::LtFloat => Ok(float_compare(CompareOperator::LessThan, left, right)),
+            BinOp::LtEqFloat => Ok(float_compare(
+                CompareOperator::LessThanOrEqual,
+                left,
+                right,
+            )),
+            BinOp::GtFloat => Ok(float_compare(CompareOperator::GreaterThan, left, right)),
+            BinOp::GtEqFloat => Ok(float_compare(
+                CompareOperator::GreaterThanOrEqual,
+                left,
+                right,
+            )),
             BinOp::Eq | BinOp::NotEq => {
                 let kind = if left_type.is_int() {
                     native_ir::EqualityKind::Int
@@ -706,11 +742,13 @@ impl Lowerer<'_> {
                     right,
                 })
             }
-            BinOp::And | BinOp::Or => Ok(native_ir::Expression::BoolBinary {
-                operator: match operator {
-                    BinOp::And => native_ir::BoolOperator::And,
-                    _ => native_ir::BoolOperator::Or,
-                },
+            BinOp::And => Ok(native_ir::Expression::BoolBinary {
+                operator: native_ir::BoolOperator::And,
+                left,
+                right,
+            }),
+            BinOp::Or => Ok(native_ir::Expression::BoolBinary {
+                operator: native_ir::BoolOperator::Or,
                 left,
                 right,
             }),
@@ -843,7 +881,9 @@ impl Lowerer<'_> {
                             module,
                             ..
                         } => Some((*variant_index as u32, *arity, module)),
-                        _ => None,
+                        ValueConstructorVariant::LocalVariable { .. }
+                        | ValueConstructorVariant::ModuleFn { .. }
+                        | ValueConstructorVariant::ModuleConstant { .. } => None,
                     })
                     .ok_or_else(|| self.unsupported("this kind of constant"))?;
                 // A constructor with fields referenced without arguments is
@@ -1037,10 +1077,7 @@ impl Lowerer<'_> {
         }
         if is_splice || type_.is_bit_array() {
             return Ok(native_ir::BitSegmentKind::BitArraySplice {
-                bits: match size {
-                    Some(size) => Some(Box::new(Self::multiply(size, unit as u64))),
-                    None => None,
-                },
+                bits: size.map(|size| Box::new(Self::multiply(size, unit as u64))),
             });
         }
         if is_float || type_.is_float() {
@@ -1257,8 +1294,10 @@ impl Lowerer<'_> {
                         // Pack MSB-first, zero-padding the last byte.
                         let mut bytes = vec![0u8; bits.len().div_ceil(8)];
                         for (index, bit) in bits.iter().enumerate() {
-                            if *bit {
-                                bytes[index / 8] |= 1 << (7 - index % 8);
+                            if *bit
+                                && let Some(byte) = bytes.get_mut(index / 8)
+                            {
+                                *byte |= 1 << (7 - index % 8);
                             }
                         }
                         native_ir::BitsTest::Bytes {
@@ -1281,7 +1320,13 @@ impl Lowerer<'_> {
                     BitArrayMatchedValue::Variable(_) | BitArrayMatchedValue::Discard(_) => {
                         native_ir::BitsTest::AlwaysTrue
                     }
-                    _ => return Err(self.unsupported("this bit array pattern")),
+                    // Codepoint and string variable reads, floats, and
+                    // literal ints whose bits could not be computed.
+                    BitArrayMatchedValue::LiteralFloat(_)
+                    | BitArrayMatchedValue::LiteralInt { .. }
+                    | BitArrayMatchedValue::Assign { .. } => {
+                        return Err(self.unsupported("this bit array pattern"));
+                    }
                 }
             }
             BitArrayTest::SegmentIsFiniteFloat { read_action } => {
@@ -1365,7 +1410,13 @@ impl Lowerer<'_> {
                             native_ir::Check::Variant { fields, .. }
                             | native_ir::Check::Always { fields } => fields,
                             native_ir::Check::NonEmptyList { first, rest } => vec![first, rest],
-                            _ => vec![],
+                            native_ir::Check::Int(_)
+                            | native_ir::Check::BigInt(_)
+                            | native_ir::Check::Float(_)
+                            | native_ir::Check::String(_)
+                            | native_ir::Check::Immediate(_)
+                            | native_ir::Check::StringPrefix { .. }
+                            | native_ir::Check::BitArray { .. } => vec![],
                         }
                     }
                     exhaustiveness::FallbackCheck::InfiniteCatchAll
@@ -1391,10 +1442,13 @@ impl Lowerer<'_> {
     ) -> Result<native_ir::Check, Error> {
         match check {
             exhaustiveness::RuntimeCheck::Int { int_value } => {
-                Ok(match lower_int(int_value) {
-                    native_ir::Expression::Int(value) => native_ir::Check::Int(value),
-                    _ => native_ir::Check::BigInt(int_value.to_signed_bytes_le()),
-                })
+                Ok(
+                    if let native_ir::Expression::Int(value) = lower_int(int_value) {
+                        native_ir::Check::Int(value)
+                    } else {
+                        native_ir::Check::BigInt(int_value.to_signed_bytes_le())
+                    },
+                )
             }
             exhaustiveness::RuntimeCheck::Float { float_value } => {
                 Ok(native_ir::Check::Float(float_value.value()))

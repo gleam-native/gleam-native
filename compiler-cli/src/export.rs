@@ -381,9 +381,11 @@ pub(crate) fn native(
             Some(platform) => (format!("zig cc -target {}", platform.zig_target()), "zig"),
             None => ("cc".into(), "cc"),
         };
-        example.push_str(&format!(
+        use std::fmt::Write;
+        let _ = write!(
+            example,
             " {object_path} {runtime_library} -o {executable_path}"
-        ));
+        );
         for flag in link_flags(platform, example_program) {
             example.push(' ');
             example.push_str(flag);
@@ -499,9 +501,9 @@ fn link_flags(platform: Option<NativePlatform>, linker_program: &str) -> Vec<&'s
     if platform.is_some_and(NativePlatform::is_musl) {
         flags.push("-static");
     }
-    let zig = std::path::Path::new(linker_program)
+    let zig = camino::Utf8Path::new(linker_program)
         .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with("zig"));
+        .is_some_and(|name| name.starts_with("zig"));
     if linux && zig {
         flags.push("-lunwind");
     }
