@@ -1803,6 +1803,9 @@ impl GleamFile {
 pub struct CacheFiles {
     pub cache_path: Utf8PathBuf,
     pub meta_path: Utf8PathBuf,
+    /// The native IR artifact written when compiling for the native target;
+    /// absent on the other targets' artefact directories.
+    pub native_ir_path: Utf8PathBuf,
 }
 
 impl CacheFiles {
@@ -1814,16 +1817,25 @@ impl CacheFiles {
         let meta_path = artefact_directory
             .join(file_name.as_str())
             .with_extension("cache_meta");
+        let native_ir_path = artefact_directory
+            .join(file_name.as_str())
+            .with_extension("nir");
 
         Self {
             cache_path,
             meta_path,
+            native_ir_path,
         }
     }
 
     pub fn delete(&self, io: &dyn FileSystemWriter) -> Result<()> {
         io.delete_file(&self.cache_path)?;
-        io.delete_file(&self.meta_path)
+        io.delete_file(&self.meta_path)?;
+        // The native target loads every artifact in the directory eagerly,
+        // so an artifact left behind by a removed module would break
+        // `gleam run` until a clean build. Deleting a missing file is a
+        // no-op, so this costs the other targets nothing.
+        io.delete_file(&self.native_ir_path)
     }
 
     /// Iterates over `.cache_meta` files in the given directory,

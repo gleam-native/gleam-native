@@ -1180,6 +1180,79 @@ stderr: {stderr}"
 }
 
 #[test]
+fn removed_modules_do_not_leave_stale_artifacts() {
+    // Deleting a module must also drop its compiled `.nir` artifact on the
+    // next build: the native runner loads every artifact in the build
+    // directory, so a stale one referencing since-removed functions would
+    // otherwise break `gleam run` until a clean build.
+    let project = TestProject::new(
+        "stale_artifacts",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+pub fn shout() -> Nil {
+  println("shout")
+}
+
+pub fn main() -> Nil {
+  println("first version")
+}
+"#,
+    );
+    let extra_path = project.root.join("src").join("extra.gleam");
+    std::fs::write(
+        &extra_path,
+        r#"import stale_artifacts
+
+pub fn noisy() -> Nil {
+  stale_artifacts.shout()
+}
+"#,
+    )
+    .expect("write extra module");
+
+    let output = project.run();
+    assert!(
+        output.status.success(),
+        "the first build should run.
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Remove the extra module and the function it referenced. The sleep
+    // keeps the rewritten source's modification time clearly newer than
+    // the cached one.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::remove_file(&extra_path).expect("delete extra module");
+    std::fs::write(
+        project.root.join("src").join("stale_artifacts.gleam"),
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+pub fn main() -> Nil {
+  println("second version")
+}
+"#,
+    )
+    .expect("rewrite source");
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the rebuild should prune the removed module's artifact and run.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("second version"),
+        "unexpected output.
+stdout: {stdout}"
+    );
+}
+
+#[test]
 fn negation_and_constant_forms() {
     // Expression-position negation (including big integer promotion at the
     // small-integer minimum), module-qualified record updates, constant bit
