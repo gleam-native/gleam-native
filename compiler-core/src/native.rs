@@ -223,58 +223,16 @@ impl Lowerer<'_> {
                 }
                 ValueConstructorVariant::Record {
                     name,
-                    arity: 0,
-                    module,
-                    ..
-                } if module == PRELUDE_MODULE_NAME && name == "Nil" => {
-                    Ok(native_ir::Expression::Nil)
-                }
-                ValueConstructorVariant::Record {
-                    name,
-                    arity: 0,
-                    module,
-                    ..
-                } if module == PRELUDE_MODULE_NAME && (name == "True" || name == "False") => {
-                    Ok(native_ir::Expression::Bool(name == "True"))
-                }
-                ValueConstructorVariant::Record {
-                    name,
-                    arity: 0,
-                    variant_index,
-                    ..
-                } => Ok(native_ir::Expression::Constructor {
-                    tag: *variant_index as u32,
-                    display: native_ir::ConstructorDisplay::Record {
-                        name: name.clone().into(),
-                    },
-                    arguments: vec![],
-                }),
-                // A constructor used as a function value: a lambda that
-                // allocates the record.
-                ValueConstructorVariant::Record {
                     arity,
+                    module,
                     variant_index,
                     ..
-                } => {
-                    let parameters: Vec<String> =
-                        (0..*arity).map(|index| format!("$field{index}")).collect();
-                    let arguments = parameters
-                        .iter()
-                        .map(|name| native_ir::Expression::Variable(name.clone()))
-                        .collect();
-                    Ok(native_ir::Expression::Lambda {
-                        parameters,
-                        body: vec![native_ir::Statement::Expression(
-                            native_ir::Expression::Constructor {
-                                tag: *variant_index as u32,
-                                display: native_ir::ConstructorDisplay::Record {
-                                    name: name.clone().into(),
-                                },
-                                arguments,
-                            },
-                        )],
-                    })
-                }
+                } => Ok(Self::constructor_value(
+                    module,
+                    name,
+                    *arity,
+                    *variant_index,
+                )),
                 ValueConstructorVariant::ModuleFn {
                     module,
                     name,
@@ -309,56 +267,17 @@ impl Lowerer<'_> {
                     })
                 }
                 ModuleValueConstructor::Constant { literal, .. } => self.constant(literal),
-                ModuleValueConstructor::Record { name, arity: 0, .. }
-                    if module_name == PRELUDE_MODULE_NAME && name == "Nil" =>
-                {
-                    Ok(native_ir::Expression::Nil)
-                }
-                ModuleValueConstructor::Record { name, arity: 0, .. }
-                    if module_name == PRELUDE_MODULE_NAME
-                        && (name == "True" || name == "False") =>
-                {
-                    Ok(native_ir::Expression::Bool(name == "True"))
-                }
-                ModuleValueConstructor::Record {
-                    name,
-                    arity: 0,
-                    variant_index,
-                    ..
-                } => Ok(native_ir::Expression::Constructor {
-                    tag: *variant_index as u32,
-                    display: native_ir::ConstructorDisplay::Record {
-                        name: name.clone().into(),
-                    },
-                    arguments: vec![],
-                }),
-                // A constructor used as a function value: a lambda that
-                // allocates the record.
                 ModuleValueConstructor::Record {
                     name,
                     arity,
                     variant_index,
                     ..
-                } => {
-                    let parameters: Vec<String> =
-                        (0..*arity).map(|index| format!("$field{index}")).collect();
-                    let arguments = parameters
-                        .iter()
-                        .map(|name| native_ir::Expression::Variable(name.clone()))
-                        .collect();
-                    Ok(native_ir::Expression::Lambda {
-                        parameters,
-                        body: vec![native_ir::Statement::Expression(
-                            native_ir::Expression::Constructor {
-                                tag: *variant_index as u32,
-                                display: native_ir::ConstructorDisplay::Record {
-                                    name: name.clone().into(),
-                                },
-                                arguments,
-                            },
-                        )],
-                    })
-                }
+                } => Ok(Self::constructor_value(
+                    module_name,
+                    name,
+                    *arity,
+                    *variant_index,
+                )),
             },
 
             TypedExpr::Call {
@@ -565,6 +484,15 @@ impl Lowerer<'_> {
                         } => (*variant_index as u32, name.clone()),
                         _ => return Err(self.unsupported("this record update")),
                     },
+                    TypedExpr::ModuleSelect {
+                        constructor:
+                            ModuleValueConstructor::Record {
+                                name,
+                                variant_index,
+                                ..
+                            },
+                        ..
+                    } => (*variant_index as u32, name.clone()),
                     _ => return Err(self.unsupported("this record update")),
                 };
                 let arguments = arguments
@@ -667,7 +595,21 @@ impl Lowerer<'_> {
                 location, message, ..
             } => self.panic_expression(native_ir::PanicKind::Todo, message, location),
 
-            _ => Err(self.unsupported("this kind of expression")),
+            TypedExpr::NegateBool { value, .. } => Ok(native_ir::Expression::BoolNot(Box::new(
+                self.expression(value)?,
+            ))),
+
+            // Negation shares subtraction's overflow path: negating the most
+            // negative small integer promotes to a big integer.
+            TypedExpr::NegateInt { value, .. } => Ok(native_ir::Expression::IntBinary {
+                operator: native_ir::IntOperator::Subtract,
+                left: Box::new(native_ir::Expression::Int(0)),
+                right: Box::new(self.expression(value)?),
+            }),
+
+            // Only present when analysis already reported a type error, so
+            // code generation never runs on it.
+            TypedExpr::Invalid { .. } => Err(self.unsupported("this kind of expression")),
         }
     }
 
@@ -813,6 +755,50 @@ impl Lowerer<'_> {
         }
     }
 
+    /// A constructor referenced as a value rather than called: `Nil`,
+    /// `True`, and `False` are immediates, other zero-arity constructors
+    /// allocate their record directly, and constructors with fields become
+    /// a lambda that allocates one.
+    fn constructor_value(
+        module: &str,
+        name: &EcoString,
+        arity: u16,
+        variant_index: u16,
+    ) -> native_ir::Expression {
+        if module == PRELUDE_MODULE_NAME && name == "Nil" {
+            return native_ir::Expression::Nil;
+        }
+        if module == PRELUDE_MODULE_NAME && (name == "True" || name == "False") {
+            return native_ir::Expression::Bool(name == "True");
+        }
+        if arity == 0 {
+            return native_ir::Expression::Constructor {
+                tag: variant_index as u32,
+                display: native_ir::ConstructorDisplay::Record {
+                    name: name.clone().into(),
+                },
+                arguments: vec![],
+            };
+        }
+        let parameters: Vec<String> = (0..arity).map(|index| format!("$field{index}")).collect();
+        let arguments = parameters
+            .iter()
+            .map(|name| native_ir::Expression::Variable(name.clone()))
+            .collect();
+        native_ir::Expression::Lambda {
+            parameters,
+            body: vec![native_ir::Statement::Expression(
+                native_ir::Expression::Constructor {
+                    tag: variant_index as u32,
+                    display: native_ir::ConstructorDisplay::Record {
+                        name: name.clone().into(),
+                    },
+                    arguments,
+                },
+            )],
+        }
+    }
+
     fn constant(
         &self,
         constant: &crate::ast::TypedConstant,
@@ -836,18 +822,29 @@ impl Lowerer<'_> {
                 record_constructor,
                 ..
             } => {
-                let tag = record_constructor
+                let (tag, arity, module) = record_constructor
                     .as_deref()
                     .and_then(|constructor| match &constructor.variant {
-                        ValueConstructorVariant::Record { variant_index, .. } => {
-                            Some(*variant_index as u32)
-                        }
+                        ValueConstructorVariant::Record {
+                            variant_index,
+                            arity,
+                            module,
+                            ..
+                        } => Some((*variant_index as u32, *arity, module)),
                         _ => None,
                     })
                     .ok_or_else(|| self.unsupported("this kind of constant"))?;
+                // A constructor with fields referenced without arguments is
+                // the constructor as a function value, not a record.
+                let Some(arguments) = arguments.as_deref() else {
+                    return Ok(Self::constructor_value(
+                        module,
+                        name,
+                        arity,
+                        tag as u16,
+                    ));
+                };
                 let arguments = arguments
-                    .as_deref()
-                    .unwrap_or_default()
                     .iter()
                     .map(|argument| self.constant(&argument.value))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -900,6 +897,18 @@ impl Lowerer<'_> {
                         function: name.clone().into(),
                         arity: *arity as u32,
                     }),
+                    ValueConstructorVariant::Record {
+                        name,
+                        arity,
+                        module,
+                        variant_index,
+                        ..
+                    } => Ok(Self::constructor_value(
+                        module,
+                        name,
+                        *arity,
+                        *variant_index,
+                    )),
                     _ => Err(self.unsupported("this kind of constant")),
                 }
             }
@@ -914,16 +923,49 @@ impl Lowerer<'_> {
                 let right = self.constant(right)?;
                 self.binary_operator(*operator, &left_type, left, right)
             }
-            _ => Err(self.unsupported("this kind of constant")),
+            Constant::BitArray { segments, .. } => {
+                let mut lowered = Vec::with_capacity(segments.len());
+                for segment in segments {
+                    let kind = self.bit_segment_kind_of(
+                        &segment.options,
+                        &segment.type_,
+                        &mut |value| self.constant(value),
+                    )?;
+                    lowered.push(native_ir::BitSegment {
+                        value: Box::new(self.constant(&segment.value)?),
+                        kind,
+                    });
+                }
+                Ok(native_ir::Expression::BitArray(lowered))
+            }
+            // Analysis desugars record updates in constants and rejects
+            // `todo` and invalid constants before code generation runs.
+            Constant::RecordUpdate { .. } | Constant::Todo { .. } | Constant::Invalid { .. } => {
+                Err(self.unsupported("this kind of constant"))
+            }
         }
     }
 
     /// Works out how a bit array expression segment is written: its
-    /// compile-time size, type, and endianness. Anything dynamic or not
-    /// byte-aligned is unsupported for now.
+    /// compile-time size, type, and endianness.
     fn bit_segment_kind(
         &self,
         segment: &crate::ast::TypedExprBitArraySegment,
+    ) -> Result<native_ir::BitSegmentKind, Error> {
+        self.bit_segment_kind_of(&segment.options, &segment.type_, &mut |value| {
+            self.expression(value)
+        })
+    }
+
+    /// [`bit_segment_kind`](Self::bit_segment_kind) generalized over the
+    /// segment's value representation, so expression and constant bit
+    /// arrays share the option handling; `lower` lowers a size option's
+    /// value.
+    fn bit_segment_kind_of<Value>(
+        &self,
+        options: &[crate::ast::BitArrayOption<Value>],
+        type_: &Type,
+        lower: &mut dyn FnMut(&Value) -> Result<native_ir::Expression, Error>,
     ) -> Result<native_ir::BitSegmentKind, Error> {
         use crate::ast::BitArrayOption;
         let mut size: Option<native_ir::Expression> = None;
@@ -933,7 +975,7 @@ impl Lowerer<'_> {
         let mut is_codepoint = false;
         let mut is_float = false;
         let mut is_splice = false;
-        for option in &segment.options {
+        for option in options {
             match option {
                 BitArrayOption::Int { .. } | BitArrayOption::Big { .. } => {}
                 BitArrayOption::Signed { .. } | BitArrayOption::Unsigned { .. } => {}
@@ -960,7 +1002,7 @@ impl Lowerer<'_> {
                     is_codepoint = true;
                 }
                 BitArrayOption::Bytes { .. } | BitArrayOption::Bits { .. } => is_splice = true,
-                BitArrayOption::Size { value, .. } => size = Some(self.expression(value)?),
+                BitArrayOption::Size { value, .. } => size = Some(lower(value)?),
                 BitArrayOption::Unit { value, .. } => unit = *value as u32,
             }
         }
@@ -973,13 +1015,13 @@ impl Lowerer<'_> {
         if let Some(encoding) = encoding {
             return Ok(native_ir::BitSegmentKind::String { encoding, endian });
         }
-        if segment.type_.is_string() {
+        if type_.is_string() {
             return Ok(native_ir::BitSegmentKind::String {
                 encoding: native_ir::StringEncoding::Utf8,
                 endian,
             });
         }
-        if is_splice || segment.type_.is_bit_array() {
+        if is_splice || type_.is_bit_array() {
             return Ok(native_ir::BitSegmentKind::BitArraySplice {
                 bits: match size {
                     Some(size) => Some(Box::new(Self::multiply(size, unit as u64))),
@@ -987,7 +1029,7 @@ impl Lowerer<'_> {
                 },
             });
         }
-        if is_float || segment.type_.is_float() {
+        if is_float || type_.is_float() {
             let bits = Self::multiply(
                 size.unwrap_or(native_ir::Expression::Int(64)),
                 unit as u64,
@@ -997,7 +1039,7 @@ impl Lowerer<'_> {
                 endian,
             });
         }
-        if !segment.type_.is_int() {
+        if !type_.is_int() {
             return Err(self.unsupported("this bit array segment"));
         }
         let bits = Self::multiply(

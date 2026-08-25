@@ -63,6 +63,9 @@ platform C convention.
   every other type (custom types, lists, tuples, generics) uses the
   runtime's structural deep equality, which walks heap object headers.
   Closures compare by identity
+- ✅ Unary negation in expression position: `!` on `Bool`, `-` on `Int`
+  (lowered as `0 - x`, sharing subtraction's overflow promotion at the
+  small-integer minimum)
 - ✅ `<>` string concatenation
 - ✅ `&&`, `||` with short-circuit evaluation (pure codegen: the right
   operand's evaluation sits in a conditionally-executed block)
@@ -141,7 +144,8 @@ platform C convention.
   constructors as function values; structural equality
 - ✅ Record updates (`Wibble(..old, name: "new")`): the type checker's
   desugaring lowers onto existing constructor and field access nodes,
-  including non-variable spread expressions
+  including non-variable spread expressions and module-qualified
+  constructors (`module.Wibble(..old, …)`)
 - ✅ Strings: UTF-8 heap objects with literals, concatenation, equality,
   and prefix patterns; plus the runtime external suite a standard library
   port binds to — grapheme-aware length/reverse/slice/pop_grapheme/
@@ -165,9 +169,10 @@ platform C convention.
   patterns are rejected at code generation — exactly as on the JavaScript
   target
 - ✅ Constants (`const x = …`): inlined at use sites like the Erlang
-  target, covering scalars, tuples, lists, records, references to other
-  constants and to functions, `<>`, and module-qualified constants in
-  guards
+  target, covering scalars, tuples, lists, records, bit arrays,
+  references to other constants, to functions, and to constructors (a
+  constructor with fields referenced by a constant is the constructor as
+  a function value), `<>`, and module-qualified constants in guards
 
 ## Runtime semantics and services
 

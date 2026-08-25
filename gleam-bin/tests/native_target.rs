@@ -1180,6 +1180,97 @@ stderr: {stderr}"
 }
 
 #[test]
+fn negation_and_constant_forms() {
+    // Expression-position negation (including big integer promotion at the
+    // small-integer minimum), module-qualified record updates, constant bit
+    // arrays, and constructors referenced by constants — locally and
+    // qualified — used as function values.
+    let project = TestProject::new(
+        "lowering",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+@external(native, "runtime", "print_bool")
+pub fn print_bool(value: Bool) -> Nil
+
+pub type Config {
+  Config(host: String, port: Int, secure: Bool)
+}
+
+pub const default = Config("localhost", 80, False)
+
+const data = <<1, 300:16-little, 2.5:32, "hé":utf8, 1:1, 0:3>>
+
+const wrap = Ok
+
+fn map(list: List(a), with: fn(a) -> b) -> List(b) {
+  case list {
+    [] -> []
+    [first, ..rest] -> [with(first), ..map(rest, with)]
+  }
+}
+
+pub fn main() -> Nil {
+  let yes = True
+  print_bool(!yes)
+  let n = 42
+  print_int(-n)
+  let min = -4611686018427387904
+  print_int(-min)
+
+  let config = Config(..default, port: 443, secure: !default.secure)
+  print_int(config.port)
+  print_bool(config.secure)
+
+  case data {
+    <<1, small:16-little, f:32-float, text:bytes-size(3), pad:4>> -> {
+      print_int(small)
+      print_bool(f == 2.5)
+      print_bool(text == <<"hé":utf8>>)
+      print_int(pad)
+    }
+    _ -> println("no match")
+  }
+
+  case map([1, 2], wrap) {
+    [Ok(a), Ok(b)] -> print_int(a + b)
+    _ -> println("no")
+  }
+}
+"#,
+    );
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gleam run failed.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = "False
+-42
+4611686018427387904
+443
+True
+300
+True
+True
+8
+3
+";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.
+stdout: {stdout}"
+    );
+}
+
+#[test]
 fn test_runner_passing_suite() {
     // `gleam test` discovers public zero-argument `*_test` functions in the
     // test directory and runs each; the test module imports the code under
@@ -1193,6 +1284,12 @@ pub type Shape {
   Point
 }
 
+pub type Config {
+  Config(host: String, port: Int)
+}
+
+pub const default = Config("localhost", 80)
+
 pub fn add(a: Int, b: Int) -> Int {
   a + b
 }
@@ -1201,6 +1298,12 @@ pub fn add(a: Int, b: Int) -> Int {
 
 pub fn add_test() {
   assert runner_pass.add(40, runner_pass.answer - 40) == 42
+}
+
+pub fn qualified_update_test() {
+  let config = runner_pass.Config(..runner_pass.default, port: 443)
+  assert config.port == 443
+  assert config.host == "localhost"
 }
 
 pub fn shapes_test() {
@@ -1237,7 +1340,7 @@ stderr: {}",
 stdout: {stdout}"
     );
     assert!(
-        stdout.contains("Ran 2 tests, 0 failures"),
+        stdout.contains("Ran 3 tests, 0 failures"),
         "helper, non-test, and private functions must not be discovered.
 stdout: {stdout}"
     );
