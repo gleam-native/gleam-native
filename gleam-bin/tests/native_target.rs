@@ -297,6 +297,539 @@ pub fn main() -> Nil {
 }
 
 #[test]
+fn custom_types() {
+    let project = TestProject::new(
+        "custom_types",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+@external(native, "runtime", "print_float")
+pub fn print_float(value: Float) -> Nil
+
+@external(native, "runtime", "print_bool")
+pub fn print_bool(value: Bool) -> Nil
+
+pub type Shape {
+  Circle(radius: Float)
+  Rect(width: Float, height: Float)
+  Point
+}
+
+pub type Person {
+  Person(name: String, age: Int)
+}
+
+fn area(shape: Shape) -> Float {
+  case shape {
+    Circle(radius) -> 3.0 *. radius *. radius
+    Rect(width, height) -> width *. height
+    Point -> 0.0
+  }
+}
+
+fn birthday(person: Person) -> Person {
+  Person(..person, age: person.age + 1)
+}
+
+fn safe_div(a: Int, b: Int) -> Result(Int, String) {
+  case b == 0 {
+    True -> Error("division by zero")
+    False -> Ok(a / b)
+  }
+}
+
+fn show(result: Result(Int, String)) -> Nil {
+  case result {
+    Ok(value) -> print_int(value)
+    Error(message) -> println(message)
+  }
+}
+
+pub fn main() -> Nil {
+  print_float(area(Circle(2.0)))
+  print_float(area(Rect(1.5, 2.0)))
+  print_float(area(Point))
+  let alice = Person("Alice", 30)
+  let older = birthday(alice)
+  println(older.name)
+  print_int(older.age)
+  // Records are immutable: the original is untouched.
+  print_int(alice.age)
+  show(safe_div(84, 2))
+  show(safe_div(1, 0))
+  // Deep structural equality.
+  print_bool(older == Person("Alice", 31))
+  print_bool(alice == older)
+}
+"#,
+    );
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gleam run failed.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = "12.0
+3.0
+0.0
+Alice
+31
+30
+42
+division by zero
+True
+False
+";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.
+stdout: {stdout}"
+    );
+}
+
+#[test]
+fn closures_and_pipes() {
+    let project = TestProject::new(
+        "closures",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+pub type Box {
+  Box(content: Int)
+}
+
+fn map(list: List(a), with: fn(a) -> b) -> List(b) {
+  case list {
+    [] -> []
+    [first, ..rest] -> [with(first), ..map(rest, with)]
+  }
+}
+
+fn fold(list: List(a), from: b, with: fn(b, a) -> b) -> b {
+  case list {
+    [] -> from
+    [first, ..rest] -> fold(rest, with(from, first), with)
+  }
+}
+
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+fn make_adder(amount: Int) -> fn(Int) -> Int {
+  fn(x) { x + amount }
+}
+
+fn twice(f: fn(Int) -> Int, x: Int) -> Int {
+  f(f(x))
+}
+
+fn with_label(label: String, callback: fn() -> Nil) -> Nil {
+  println(label)
+  callback()
+}
+
+pub fn main() -> Nil {
+  // A closure capturing a local, returned from a function.
+  let add_ten = make_adder(10)
+  print_int(add_ten(32))
+  // Module functions as values through generic higher-order functions.
+  let numbers = [1, 2, 3, 4]
+  print_int(fold(map(numbers, double), 0, add))
+  // A capturing lambda inside map.
+  let offset = 100
+  print_int(fold(map(numbers, fn(n) { n + offset }), 0, add))
+  // Function captures and pipes.
+  let add_five = add(5, _)
+  print_int(numbers |> fold(0, add) |> add_five)
+  // Passing a closure twice.
+  print_int(twice(add_ten, 1))
+  // A constructor as a function value.
+  case map([7], Box) {
+    [Box(content)] -> print_int(content)
+    _ -> println("no")
+  }
+  // use expressions desugar to callbacks.
+  use <- with_label("computing")
+  print_int(42)
+}
+"#,
+    );
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gleam run failed.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = "42
+20
+410
+15
+21
+7
+computing
+42
+";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.
+stdout: {stdout}"
+    );
+}
+
+#[test]
+fn case_matching_and_guards() {
+    let project = TestProject::new(
+        "case_matching",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+fn size(n: Int) -> String {
+  case n {
+    1 | 2 | 3 -> "small"
+    100 -> "big"
+    n if n < 0 -> "negative"
+    _ -> "medium"
+  }
+}
+
+fn same(a: Int, b: Int) -> String {
+  case a, b {
+    x, y if x == y -> "same"
+    x, y if !{ x < y } -> "descending"
+    _, _ -> "ascending"
+  }
+}
+
+fn describe(word: String) -> String {
+  case word {
+    "hi" -> "greeting"
+    "say " <> words -> words
+    _ -> "unknown"
+  }
+}
+
+fn floaty(f: Float) -> String {
+  case f {
+    1.5 -> "one and a half"
+    _ -> "other"
+  }
+}
+
+fn big(n: Int) -> String {
+  case n {
+    9223372036854775808 -> "big literal"
+    _ -> "not"
+  }
+}
+
+pub fn main() -> Nil {
+  println(size(2))
+  println(size(100))
+  println(size(-5))
+  println(size(50))
+  println(same(3, 3))
+  println(same(9, 4))
+  println(same(2, 8))
+  println(describe("hi"))
+  println(describe("say hello"))
+  println(describe("zap"))
+  println(floaty(1.5))
+  println(floaty(2.5))
+  println(big(9223372036854775808))
+  println(big(5))
+}
+"#,
+    );
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gleam run failed.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = "small
+big
+negative
+medium
+same
+descending
+ascending
+greeting
+hello
+unknown
+one and a half
+other
+big literal
+not
+";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.
+stdout: {stdout}"
+    );
+}
+
+#[test]
+fn constants_and_arithmetic() {
+    let project = TestProject::new(
+        "arith",
+        r#"@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+@external(native, "runtime", "print_float")
+pub fn print_float(value: Float) -> Nil
+
+@external(native, "runtime", "print_bool")
+pub fn print_bool(value: Bool) -> Nil
+
+const answer = 42
+
+const limits = #(1, 100)
+
+const defaults = [42, 7]
+
+fn sum(list: List(Int)) -> Int {
+  case list {
+    [] -> 0
+    [first, ..rest] -> first + sum(rest)
+  }
+}
+
+pub fn main() -> Nil {
+  print_int(answer)
+  print_int(limits.1 - limits.0)
+  print_int(sum(defaults))
+  // Big integer promotion and demotion.
+  print_int(4611686018427387903 * 4)
+  print_int(9223372036854775808 - 9223372036854775807)
+  // Truncating division, dividend-sign remainder, zero rules.
+  print_int(-7 / 2)
+  print_int(-7 % 2)
+  print_int(1 / 0)
+  print_float(0.1 +. 0.2)
+  print_float(1.0 /. 0.0)
+  print_bool(2 <= 2)
+  print_bool(9223372036854775808 > 5)
+  print_bool([1, 2] == [1, 2])
+  print_bool(#(1, "a") == #(1, "b"))
+  // echo reports on standard error and passes its value through.
+  print_int(echo 21 * 2)
+}
+"#,
+    );
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "gleam run failed.
+stdout: {stdout}
+stderr: {stderr}"
+    );
+    let expected = "42
+99
+49
+18446744073709551612
+1
+-3
+-1
+0
+0.30000000000000004
+0.0
+True
+True
+True
+False
+42
+";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.
+stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("arith:") && stderr.contains("42"),
+        "expected echo output on stderr.
+stderr: {stderr}"
+    );
+}
+
+#[test]
+fn destructuring_lets() {
+    let project = TestProject::new(
+        "destructuring",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+@external(native, "runtime", "print_int")
+pub fn print_int(value: Int) -> Nil
+
+pub type Config {
+  Config(host: String, port: Int)
+}
+
+fn found(value: Int) -> Result(Int, String) {
+  Ok(value)
+}
+
+pub fn main() -> Nil {
+  let #(a, b) = #(40, 2)
+  print_int(a + b)
+  let Config(host: host, port: port) = Config("localhost", 8080)
+  println(host)
+  print_int(port)
+  let assert [first, ..rest] = [1, 2, 3]
+  let assert [second, ..] = rest
+  print_int(first + second)
+  let assert Ok(value) = found(9000)
+  print_int(value)
+  let assert "gleam-" <> version = "gleam-1.18"
+  println(version)
+  let assert <<x:16>> = <<2, 1>>
+  print_int(x)
+}
+"#,
+    );
+
+    let output = project.run();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gleam run failed.
+stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = "42
+localhost
+8080
+3
+9000
+1.18
+513
+";
+    assert!(
+        stdout.contains(expected),
+        "unexpected output.
+stdout: {stdout}"
+    );
+}
+
+#[test]
+fn runtime_failures() {
+    // Each failure kind aborts with exit code 1 and a structured report on
+    // standard error, without running past the failure point.
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "failure_panic",
+            r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+pub fn main() -> Nil {
+  println("before")
+  panic as "boom"
+}
+"#,
+            &["runtime error: panic", "boom", "failure_panic.main:"],
+        ),
+        (
+            "failure_todo",
+            r#"pub fn main() -> Nil {
+  todo
+}
+"#,
+            &["runtime error: todo", "This has not yet been implemented"],
+        ),
+        (
+            "failure_let_assert",
+            r#"fn broken() -> Result(Int, String) {
+  Error("nope")
+}
+
+pub fn main() -> Nil {
+  let assert Ok(_) = broken() as "wanted a success"
+  Nil
+}
+"#,
+            &["runtime error: let assert", "wanted a success"],
+        ),
+        (
+            "failure_assert",
+            r#"pub fn main() -> Nil {
+  assert 1 == 2
+  Nil
+}
+"#,
+            &["runtime error: assert", "Assertion failed"],
+        ),
+    ];
+
+    for (name, source, expectations) in cases {
+        let project = TestProject::new(name, source);
+        let output = project.run();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name} should exit with code 1.
+stdout: {stdout}
+stderr: {stderr}"
+        );
+        for expectation in *expectations {
+            assert!(
+                stderr.contains(expectation),
+                "{name}: missing `{expectation}` on stderr.
+stderr: {stderr}"
+            );
+        }
+        assert!(
+            !stdout.contains("unreachable"),
+            "{name} ran past the failure point.
+stdout: {stdout}"
+        );
+    }
+
+    // The panic case still runs the code before the failure.
+    let project = TestProject::new(
+        "failure_panic",
+        r#"@external(native, "runtime", "println")
+pub fn println(text: String) -> Nil
+
+pub fn main() -> Nil {
+  println("before")
+  panic as "boom"
+}
+"#,
+    );
+    let output = project.run();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("before"));
+}
+
+#[test]
 fn fizzbuzz() {
     let project = TestProject::new(
         "fizzbuzz",
