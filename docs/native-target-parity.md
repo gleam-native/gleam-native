@@ -91,7 +91,9 @@ platform C convention.
   lowering). Not yet: field access and module constants in guards
 - ✅ `use` expressions (the type checker's desugared callback call is
   lowered directly)
-- ❌ `assert` (boolean assertion with structured failure information)
+- ✅ `assert` (with the optional `as` message, location metadata, exit
+  code 1; reporting the values of the failing expression's operands, as the
+  other targets do, needs more site metadata and is future work)
 
 ## Functions
 

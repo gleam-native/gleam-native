@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 21;
+pub const FORMAT_VERSION: u32 = 22;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -211,6 +211,7 @@ pub enum PanicKind {
     Panic,
     Todo,
     LetAssert,
+    Assert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

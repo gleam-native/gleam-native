@@ -157,7 +157,41 @@ impl Lowerer<'_> {
             Statement::Use(use_) => Ok(native_ir::Statement::Expression(
                 self.expression(&use_.call)?,
             )),
-            Statement::Assert(_) => Err(self.unsupported("assert")),
+            // `assert cond` becomes a boolean case: True continues with
+            // Nil, False panics with the assert report.
+            Statement::Assert(assert) => {
+                let message = match &assert.message {
+                    Some(message) => Some(Box::new(self.expression(message)?)),
+                    None => None,
+                };
+                let panic = native_ir::Expression::Panic {
+                    kind: native_ir::PanicKind::Assert,
+                    message,
+                    function: self.function_name.clone().into(),
+                    line: self.line_numbers.line_number(assert.location.start),
+                };
+                Ok(native_ir::Statement::Expression(native_ir::Expression::Case {
+                    subjects: vec![self.expression(&assert.value)?],
+                    subject_ids: vec![0],
+                    tree: native_ir::Decision::Switch {
+                        var: 0,
+                        choices: vec![(
+                            native_ir::Check::Immediate(tag_small_int(1)),
+                            native_ir::Decision::Run {
+                                bindings: vec![],
+                                body: vec![native_ir::Statement::Expression(
+                                    native_ir::Expression::Nil,
+                                )],
+                            },
+                        )],
+                        fallback: Box::new(native_ir::Decision::Run {
+                            bindings: vec![],
+                            body: vec![native_ir::Statement::Expression(panic)],
+                        }),
+                        fallback_fields: vec![],
+                    },
+                }))
+            }
         }
     }
 

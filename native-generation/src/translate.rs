@@ -982,6 +982,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     native_ir::PanicKind::Panic => 0,
                     native_ir::PanicKind::Todo => 1,
                     native_ir::PanicKind::LetAssert => 2,
+                    native_ir::PanicKind::Assert => 3,
                 };
                 let function = function.clone();
                 self.emit_panic(kind, message.as_deref(), &function, *line)

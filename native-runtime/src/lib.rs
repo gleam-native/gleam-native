@@ -436,7 +436,8 @@ pub unsafe extern "C" fn gleam_native_echo(
 /// Reports a `panic`, `todo`, or failed `let assert` and aborts the program
 /// with exit code 1.
 ///
-/// `kind` is 0 for `panic`, 1 for `todo`, and 2 for `let assert`. `message`
+/// `kind` is 0 for `panic`, 1 for `todo`, 2 for `let assert`, and 3 for
+/// `assert`. `message`
 /// is a string value or 0 when the source gave no message. The module and
 /// function names arrive as pointers into the compiled program's constant
 /// data. Declared as returning a value so generated code can treat it as an
@@ -471,6 +472,7 @@ pub unsafe extern "C" fn gleam_native_panic(
             "let assert",
             "Pattern match failed, no pattern matched the value",
         ),
+        3 => ("assert", "Assertion failed"),
         _ => ("panic", "`panic` expression evaluated"),
     };
     let message = if message == 0 {
