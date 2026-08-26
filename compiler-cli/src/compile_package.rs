@@ -49,6 +49,7 @@ pub fn command(options: CompilePackage) -> Result<()> {
                 .javascript_prelude
                 .ok_or_else(|| Error::JavaScriptPreludeRequired)?,
         },
+        Target::Native => TargetCodegenConfiguration::Native {},
     };
 
     tracing::info!("Compiling package");

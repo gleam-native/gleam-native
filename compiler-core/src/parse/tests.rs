@@ -892,6 +892,29 @@ pub fn one(x: Int) -> Int {
 }
 
 #[test]
+fn multiple_external_for_same_project_native() {
+    assert_module_error!(
+        r#"
+@external(native, "one", "two")
+@external(native, "three", "four")
+pub fn one(x: Int) -> Int {
+  todo
+}
+"#
+    );
+}
+
+#[test]
+fn function_with_native_external() {
+    assert_parse_module!(
+        r#"
+@external(native, "runtime", "add")
+pub fn add(x: Int, y: Int) -> Int
+"#
+    );
+}
+
+#[test]
 fn unknown_external_target() {
     assert_module_error!(
         r#"

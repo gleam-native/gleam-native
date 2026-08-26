@@ -1,0 +1,20 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+pub fn main() -> Nil {
+  todo
+}
+
+
+--- gleam run output ----------------
+[31;1mruntime error[39m: todo[0m
+
+`todo` expression evaluated. This code has not yet been implemented.
+
+stacktrace:
+  main.main[90m src/main.gleam:5[0m

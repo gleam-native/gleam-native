@@ -1,0 +1,82 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+fn size(n: Int) -> String {
+  case n {
+    1 | 2 | 3 -> "small"
+    100 -> "big"
+    n if n < 0 -> "negative"
+    _ -> "medium"
+  }
+}
+
+fn same(a: Int, b: Int) -> String {
+  case a, b {
+    x, y if x == y -> "same"
+    x, y if !{ x < y } -> "descending"
+    _, _ -> "ascending"
+  }
+}
+
+fn describe(word: String) -> String {
+  case word {
+    "hi" -> "greeting"
+    "say " <> words -> words
+    _ -> "unknown"
+  }
+}
+
+fn floaty(f: Float) -> String {
+  case f {
+    1.5 -> "one and a half"
+    _ -> "other"
+  }
+}
+
+pub fn main() -> Nil {
+  echo size(2)
+  echo size(100)
+  echo size(-5)
+  echo size(50)
+  echo same(3, 3)
+  echo same(9, 4)
+  echo same(2, 8)
+  echo describe("hi")
+  echo describe("say hello")
+  echo describe("zap")
+  echo floaty(1.5)
+  echo floaty(2.5)
+  Nil
+}
+
+
+--- gleam run output ----------------
+[90msrc/main.gleam:37[39m
+"small"
+[90msrc/main.gleam:38[39m
+"big"
+[90msrc/main.gleam:39[39m
+"negative"
+[90msrc/main.gleam:40[39m
+"medium"
+[90msrc/main.gleam:41[39m
+"same"
+[90msrc/main.gleam:42[39m
+"descending"
+[90msrc/main.gleam:43[39m
+"ascending"
+[90msrc/main.gleam:44[39m
+"greeting"
+[90msrc/main.gleam:45[39m
+"hello"
+[90msrc/main.gleam:46[39m
+"unknown"
+[90msrc/main.gleam:47[39m
+"one and a half"
+[90msrc/main.gleam:48[39m
+"other"

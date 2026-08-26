@@ -382,6 +382,7 @@ where
                 cached_module_names,
                 app_file.as_ref(),
             ),
+            TargetCodegenConfiguration::Native => self.perform_native_codegen(modules),
         }
     }
 
@@ -490,6 +491,19 @@ where
             }
         }
 
+        Ok(())
+    }
+
+    fn perform_native_codegen(&mut self, modules: &[Module]) -> Result<(), Error> {
+        // Cached modules keep the artifact written when they last compiled.
+        let artefact_dir = self.out.join(paths::ARTEFACT_DIRECTORY_NAME);
+        for module in modules {
+            let nir = crate::native::module(&module.ast, self.root, &module.code)?;
+            let bytes = native_ir::encode(&nir).expect("Failed to serialise native artifact");
+            let file_name = module.name.replace("/", "@");
+            let path = artefact_dir.join(format!("{file_name}.nir"));
+            self.io.write_bytes(&path, &bytes)?;
+        }
         Ok(())
     }
 

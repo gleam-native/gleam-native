@@ -167,6 +167,7 @@ fn compile_expression(src: &str) -> TypedStatement {
             has_body: true,
             has_erlang_external: false,
             has_javascript_external: false,
+            has_native_external: false,
         },
         &mut problems,
     )

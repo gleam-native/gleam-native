@@ -1,0 +1,28 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+fn broken() -> Result(Int, String) {
+  Error("nope")
+}
+
+pub fn main() -> Nil {
+  let assert Ok(_) = broken() as "wanted a success"
+  Nil
+}
+
+
+--- gleam run output ----------------
+[31;1mruntime error[39m: let assert[0m
+
+wanted a success
+
+unmatched value:
+  {error,<<"nope">>}
+
+stacktrace:
+  main.main[90m src/main.gleam:9[0m

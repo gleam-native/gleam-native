@@ -47,6 +47,9 @@ version = "1.0.0"
         "location": null
       }
     },
+    "native": {
+      "stack_size_megabytes": 1024
+    },
     "target": "erlang",
     "internal_modules": null
   }

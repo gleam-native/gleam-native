@@ -1,0 +1,170 @@
+---
+source: compiler-core/src/parse/tests.rs
+assertion_line: 909
+expression: "\n@external(native, \"runtime\", \"add\")\npub fn add(x: Int, y: Int) -> Int\n"
+---
+Parsed {
+    module: Module {
+        name: "",
+        documentation: [],
+        type_info: (),
+        definitions: [
+            TargetedDefinition {
+                definition: Function(
+                    Function {
+                        location: SrcSpan {
+                            start: 37,
+                            end: 63,
+                        },
+                        body_start: None,
+                        end_position: 63,
+                        name: Some(
+                            (
+                                SrcSpan {
+                                    start: 44,
+                                    end: 47,
+                                },
+                                "add",
+                            ),
+                        ),
+                        arguments: [
+                            Arg {
+                                names: Named {
+                                    name: "x",
+                                    location: SrcSpan {
+                                        start: 48,
+                                        end: 49,
+                                    },
+                                },
+                                location: SrcSpan {
+                                    start: 48,
+                                    end: 54,
+                                },
+                                annotation: Some(
+                                    Constructor(
+                                        TypeAstConstructor {
+                                            location: SrcSpan {
+                                                start: 51,
+                                                end: 54,
+                                            },
+                                            name: Unqualified {
+                                                name: "Int",
+                                                location: SrcSpan {
+                                                    start: 51,
+                                                    end: 54,
+                                                },
+                                            },
+                                            arguments: [],
+                                            start_parentheses: None,
+                                        },
+                                    ),
+                                ),
+                                type_: (),
+                            },
+                            Arg {
+                                names: Named {
+                                    name: "y",
+                                    location: SrcSpan {
+                                        start: 56,
+                                        end: 57,
+                                    },
+                                },
+                                location: SrcSpan {
+                                    start: 56,
+                                    end: 62,
+                                },
+                                annotation: Some(
+                                    Constructor(
+                                        TypeAstConstructor {
+                                            location: SrcSpan {
+                                                start: 59,
+                                                end: 62,
+                                            },
+                                            name: Unqualified {
+                                                name: "Int",
+                                                location: SrcSpan {
+                                                    start: 59,
+                                                    end: 62,
+                                                },
+                                            },
+                                            arguments: [],
+                                            start_parentheses: None,
+                                        },
+                                    ),
+                                ),
+                                type_: (),
+                            },
+                        ],
+                        body: [],
+                        publicity: Public,
+                        deprecation: NotDeprecated,
+                        return_annotation: Some(
+                            Constructor(
+                                TypeAstConstructor {
+                                    location: SrcSpan {
+                                        start: 67,
+                                        end: 70,
+                                    },
+                                    name: Unqualified {
+                                        name: "Int",
+                                        location: SrcSpan {
+                                            start: 67,
+                                            end: 70,
+                                        },
+                                    },
+                                    arguments: [],
+                                    start_parentheses: None,
+                                },
+                            ),
+                        ),
+                        return_type: (),
+                        documentation: None,
+                        external_erlang: None,
+                        external_javascript: None,
+                        external_native: Some(
+                            (
+                                "runtime",
+                                "add",
+                                SrcSpan {
+                                    start: 1,
+                                    end: 36,
+                                },
+                            ),
+                        ),
+                        implementations: Implementations {
+                            gleam: true,
+                            can_run_on_erlang: true,
+                            can_run_on_javascript: true,
+                            can_run_on_native: true,
+                            uses_erlang_externals: false,
+                            uses_javascript_externals: false,
+                            uses_native_externals: false,
+                        },
+                        purity: Pure,
+                    },
+                ),
+                target: None,
+            },
+        ],
+        names: Names {
+            local_types: {},
+            imported_modules: {},
+            type_variables: {},
+            local_value_constructors: {},
+            reexport_aliases: {},
+        },
+        unused_definition_positions: {},
+    },
+    extra: ModuleExtra {
+        module_comments: [],
+        doc_comments: [],
+        comments: [],
+        empty_lines: [],
+        new_lines: [
+            0,
+            36,
+            70,
+        ],
+        trailing_commas: [],
+    },
+}

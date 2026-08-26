@@ -3,13 +3,14 @@
 
 [package]
 name = "gleam"
-version = "1.18.0"
+version = "1.18.0-native"
 authors = ["Louis Pilfold <louis@lpil.uk>"]
 edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
 gleam-cli = { path = "../compiler-cli" }
+mimalloc.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 # For statically linking the VCRuntime on Windows when

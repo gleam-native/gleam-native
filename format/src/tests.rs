@@ -3561,6 +3561,26 @@ pub fn main(
 }
 
 #[test]
+fn native_external_fn() {
+    assert_format!(
+        "@external(native, \"runtime\", \"add\")
+pub fn add(x: Int, y: Int) -> Int
+"
+    );
+}
+
+#[test]
+fn external_fn_for_all_targets() {
+    assert_format!(
+        "@external(erlang, \"one\", \"two\")
+@external(javascript, \"three\", \"four\")
+@external(native, \"five\", \"six\")
+pub fn main() -> Int
+"
+    );
+}
+
+#[test]
 fn commented_binop() {
     assert_format!(
         "fn main() {

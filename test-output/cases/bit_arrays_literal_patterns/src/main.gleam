@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+// Literal float segments (at every size and endianness) and literal
+// integer segments whose size is only known at run time match by reading
+// the segment and comparing numerically. JavaScript is excluded not for
+// semantics but because its runtime throws on a float read whose dynamic
+// size is not 16, 32, or 64 bits, where this pattern must simply not
+// match.
+pub fn main() -> Nil {
+  // Constant-size literal floats, in case and let assert.
+  echo floats(<<1.5:float, 2.5:float-size(32)-little, 3.5:float-size(16)>>)
+  echo floats(<<1.5:float, 2.5:float-size(32)-little, 4.5:float-size(16)>>)
+  echo floats(<<0.0:float, 2.5:float-size(32)-little, 3.5:float-size(16)>>)
+  let assert <<1.5:float-little, _:bits>> = <<1.5:float-little, 9>>
+
+  // Literal ints matched at run-time sizes, unsigned and signed.
+  echo int_at(<<16, 5:size(16), 9>>)
+  echo int_at(<<16, 6:size(16), 9>>)
+  echo int_at(<<4, 5:size(4), 9>>)
+  echo int_at(<<0, 9>>)
+  echo signed_at(<<8, -3:size(8)>>)
+  echo signed_at(<<8, 3:size(8)>>)
+  echo signed_at(<<12, -3:size(12)>>)
+
+  // Literal floats matched at run-time sizes: 16, 32, and 64 bits can
+  // match, and any other size never does.
+  echo float_at(<<64, 1.5:float>>)
+  echo float_at(<<32, 1.5:float-size(32)>>)
+  echo float_at(<<16, 1.5:float-size(16)>>)
+  echo float_at(<<24, 0:size(24)>>)
+  echo float_at(<<64, 2.5:float>>)
+  Nil
+}
+
+fn floats(bits: BitArray) -> Int {
+  case bits {
+    <<1.5:float, 2.5:float-size(32)-little, 3.5:float-size(16)>> -> 1
+    <<_:float, 2.5:float-size(32)-little, 3.5:float-size(16)>> -> 2
+    _ -> 0
+  }
+}
+
+fn int_at(bits: BitArray) -> Int {
+  case bits {
+    <<len, 5:size(len), _:bits>> -> 1
+    _ -> 0
+  }
+}
+
+fn signed_at(bits: BitArray) -> Int {
+  case bits {
+    <<len, -3:signed-size(len)>> -> 1
+    _ -> 0
+  }
+}
+
+fn float_at(bits: BitArray) -> Int {
+  case bits {
+    <<len, 1.5:float-size(len)>> -> 1
+    _ -> 0
+  }
+}

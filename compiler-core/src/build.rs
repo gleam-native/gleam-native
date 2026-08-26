@@ -69,6 +69,10 @@ pub enum Target {
     #[serde(alias = "js")]
     #[clap(alias = "js")]
     JavaScript,
+    #[strum(serialize = "native")]
+    #[serde(alias = "native")]
+    #[clap(alias = "native")]
+    Native,
 }
 
 impl Target {
@@ -76,6 +80,7 @@ impl Target {
         match self {
             Target::Erlang => "Erlang",
             Target::JavaScript => "JavaScript",
+            Target::Native => "Native",
         }
     }
 
@@ -178,6 +183,7 @@ pub enum TargetCodegenConfiguration {
         app_file: Option<ErlangAppCodegenConfiguration>,
         output: ErlangOutput,
     },
+    Native,
 }
 
 /// Which Erlang format is used when compiling Gleam code for the
@@ -195,6 +201,7 @@ impl TargetCodegenConfiguration {
         match self {
             Self::JavaScript { .. } => Target::JavaScript,
             Self::Erlang { .. } => Target::Erlang,
+            Self::Native => Target::Native,
         }
     }
 }

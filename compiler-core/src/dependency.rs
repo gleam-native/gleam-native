@@ -440,6 +440,17 @@ where
     ) -> std::result::Result<Option<Self::V>, Self::Err> {
         self.ensure_package_fetched(package)?;
 
+        // A package may have an optional dependency on this package whose
+        // range was stored rather than returned to pubgrub. If this package's
+        // requirement was processed before that optional range was stored then
+        // the range is never merged into a requirement, so it must be applied
+        // here or it would be ignored entirely.
+        let optional_range = self
+            .optional_dependencies
+            .borrow()
+            .get(package.as_str())
+            .cloned();
+
         let exact_package = self.exact_only.get(package);
         let potential_versions = self
             .packages
@@ -458,7 +469,12 @@ where
                         _ => Some(release.version),
                     })
             })
-            .filter(|version| range.contains(version));
+            .filter(|version| range.contains(version))
+            .filter(|version| {
+                optional_range
+                    .as_ref()
+                    .is_none_or(|optional_range| optional_range.contains(version))
+            });
         match potential_versions
             .clone()
             .filter(|version| !version.is_pre())

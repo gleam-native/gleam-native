@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+[package]
+name = "native-generation"
+authors = ["Ivan Kachalkin <xikxp1@gmail.com>"]
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+native-ir = { path = "../native-ir" }
+native-runtime = { path = "../native-runtime" }
+native-runtime-stdlib = { path = "../native-runtime-stdlib" }
+cranelift-codegen = { version = "0.135.0", features = ["all-native-arch"] }
+cranelift-frontend = "0.135.0"
+cranelift-jit = "0.135.0"
+cranelift-module = "0.135.0"
+cranelift-native = "0.135.0"
+cranelift-object = "0.135.0"
+target-lexicon = "0.13.5"
+gimli = { version = "0.33", default-features = false, features = ["write", "std"] }

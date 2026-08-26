@@ -1,0 +1,26 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+pub fn main() -> Nil {
+  assert 1 == 2
+  Nil
+}
+
+
+--- exit status ---------------------
+1
+
+--- standard output -----------------
+
+--- standard error ------------------
+runtime error: assert
+
+Assertion failed
+
+stacktrace:
+  main.main[90m src/main.gleam:5[0m

@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+pub type Box {
+  Box(content: Int)
+}
+
+fn map(list: List(a), with: fn(a) -> b) -> List(b) {
+  case list {
+    [] -> []
+    [first, ..rest] -> [with(first), ..map(rest, with)]
+  }
+}
+
+fn fold(list: List(a), from: b, with: fn(b, a) -> b) -> b {
+  case list {
+    [] -> from
+    [first, ..rest] -> fold(rest, with(from, first), with)
+  }
+}
+
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+fn make_adder(amount: Int) -> fn(Int) -> Int {
+  fn(x) { x + amount }
+}
+
+fn twice(f: fn(Int) -> Int, x: Int) -> Int {
+  f(f(x))
+}
+
+fn with_label(label: String, callback: fn() -> Nil) -> Nil {
+  echo label
+  callback()
+}
+
+pub fn main() -> Nil {
+  // A closure capturing a local, returned from a function.
+  let add_ten = make_adder(10)
+  echo add_ten(32)
+  // Module functions as values through generic higher-order functions.
+  let numbers = [1, 2, 3, 4]
+  echo fold(map(numbers, double), 0, add)
+  // A capturing lambda inside map.
+  let offset = 100
+  echo fold(map(numbers, fn(n) { n + offset }), 0, add)
+  // Function captures and pipes.
+  let add_five = add(5, _)
+  let piped = numbers |> fold(0, add) |> add_five
+  echo piped
+  // Passing a closure twice.
+  echo twice(add_ten, 1)
+  // A constructor as a function value.
+  let boxed = case map([7], Box) {
+    [Box(content)] -> content
+    _ -> -1
+  }
+  echo boxed
+  // use expressions desugar to callbacks.
+  use <- with_label("computing")
+  echo 42
+  Nil
+}

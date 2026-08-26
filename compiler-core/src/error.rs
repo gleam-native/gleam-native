@@ -197,6 +197,9 @@ pub enum Error {
     #[error("{error}")]
     GitInitialization { error: String },
 
+    #[error("failed to generate native executable")]
+    NativeExecutableGeneration { error: String },
+
     #[error("io operation failed")]
     StandardIo {
         action: StandardIoAction,
@@ -436,6 +439,15 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
 
     #[error("could not create temp file: {error}")]
     CouldNotCreateTempFile { error: String },
+
+    #[error("module {module} uses a feature unsupported by the native target: {feature}")]
+    NativeUnsupportedFeature {
+        module: EcoString,
+        feature: EcoString,
+        path: Utf8PathBuf,
+        src: EcoString,
+        location: SrcSpan,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -1957,6 +1969,21 @@ with `gleam hex authenticate`."
                 }]
             }
 
+            Error::NativeExecutableGeneration { error } => {
+                let text = format!(
+                    "An error occurred while generating the native executable:
+
+    {error}"
+                );
+                vec![Diagnostic {
+                    title: "Failed to generate native executable".into(),
+                    text,
+                    hint: None,
+                    level: Level::Error,
+                    location: None,
+                }]
+            }
+
             Error::Type {
                 skipped_modules: _,
                 failed_modules,
@@ -2438,6 +2465,10 @@ satisfying {required_version} but you are using v{gleam_version}.",
                         "You can not set a runtime for Erlang. Did you mean to target JavaScript?"
                             .into(),
                     ),
+                    Target::Native => Some(
+                        "You can not set a runtime for Native. Did you mean to target JavaScript?"
+                            .into(),
+                    ),
                 };
 
                 vec![Diagnostic {
@@ -2521,6 +2552,31 @@ add `gleam add {name}` in this project."
                 ),
                 level: Level::Error,
                 location: None,
+                hint: None,
+            }],
+
+            Error::NativeUnsupportedFeature {
+                module,
+                feature,
+                path,
+                src,
+                location,
+            } => vec![Diagnostic {
+                title: "Unsupported feature for native target".into(),
+                text: wrap_format!(
+                    "The module `{module}` uses a feature that the native \
+target does not support yet: {feature}."
+                ),
+                level: Level::Error,
+                location: Some(Location {
+                    src: src.clone(),
+                    path: path.clone(),
+                    label: Label {
+                        text: Some("This is not supported on the native target".into()),
+                        span: *location,
+                    },
+                    extra_labels: vec![],
+                }),
                 hint: None,
             }],
         }
@@ -4469,6 +4525,7 @@ and there is no implementation for the {} target.",
                 match current_target {
                     Target::Erlang => "Erlang",
                     Target::JavaScript => "JavaScript",
+                    Target::Native => "Native",
                 }
             );
             let hint = wrap("Did you mean to build for a different target?");
@@ -4497,6 +4554,7 @@ and there is no implementation for the {} target.",
             let target = match target {
                 Target::Erlang => "Erlang",
                 Target::JavaScript => "JavaScript",
+                Target::Native => "Native",
             };
             let text = wrap_format!(
                 "The `{name}` function is public but doesn't have an \

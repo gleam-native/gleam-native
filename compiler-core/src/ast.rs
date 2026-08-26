@@ -871,6 +871,7 @@ pub struct Function<T, Expr> {
     pub documentation: Option<(u32, EcoString)>,
     pub external_erlang: Option<(EcoString, EcoString, SrcSpan)>,
     pub external_javascript: Option<(EcoString, EcoString, SrcSpan)>,
+    pub external_native: Option<(EcoString, EcoString, SrcSpan)>,
     pub implementations: Implementations,
     pub purity: Purity,
 }

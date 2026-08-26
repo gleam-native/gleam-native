@@ -19,11 +19,21 @@ members = [
   "format",
   "erlang-term-format",
   "erlang-generation",
+  "native-generation",
+  "native-ir",
+  "native-runtime",
+  "native-runtime-static",
+  "native-runtime-stdlib",
   "src-span",
+  "test-fuzz",
 ]
 
 # common dependencies
 [workspace.dependencies]
+# Fast general-purpose allocator: the default for the `gleam` binary (whose
+# JIT runs native-target programs in-process) and for ahead-of-time
+# compiled executables, where allocation-heavy Gleam code hits it hard
+mimalloc = { version = "0.1", default-features = false }
 # Command line interface
 clap = { version = "4", features = ["derive"] }
 # Immutable data structures

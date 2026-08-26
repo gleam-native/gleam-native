@@ -1,0 +1,44 @@
+---
+source: test-output/src/tests/output.rs
+expression: output
+---
+--- main.gleam ----------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+fn count(n: Int, limit: Int) -> Int {
+  case n >= limit {
+    True -> n
+    False -> count(n + 1, limit)
+  }
+}
+
+fn build(n: Int, acc: List(Int)) -> List(Int) {
+  case n {
+    0 -> acc
+    _ -> build(n - 1, [n, ..acc])
+  }
+}
+
+fn sum(list: List(Int), total: Int) -> Int {
+  case list {
+    [] -> total
+    [first, ..rest] -> sum(rest, total + first)
+  }
+}
+
+pub fn main() -> Nil {
+  echo count(0, 10_000_000)
+  echo sum(build(100_000, []), 0)
+  echo "done"
+  Nil
+}
+
+
+--- gleam run output ----------------
+[90msrc/main.gleam:26[39m
+10000000
+[90msrc/main.gleam:27[39m
+5000050000
+[90msrc/main.gleam:28[39m
+"done"

@@ -745,6 +745,7 @@ pub enum ValueConstructorVariant {
         implementations: Implementations,
         external_erlang: Option<(EcoString, EcoString)>,
         external_javascript: Option<(EcoString, EcoString)>,
+        external_native: Option<(EcoString, EcoString)>,
         purity: Purity,
     },
 
@@ -879,8 +880,10 @@ impl ValueConstructorVariant {
                 gleam: true,
                 can_run_on_erlang: true,
                 can_run_on_javascript: true,
+                can_run_on_native: true,
                 uses_javascript_externals: false,
                 uses_erlang_externals: false,
+                uses_native_externals: false,
             },
 
             ValueConstructorVariant::ModuleFn {

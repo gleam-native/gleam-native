@@ -119,6 +119,9 @@ allow_read = ["./database.sqlite"]
       "location": null
     }
   },
+  "native": {
+    "stack_size_megabytes": 1024
+  },
   "target": "erlang",
   "internal_modules": [
     "my_app/internal"

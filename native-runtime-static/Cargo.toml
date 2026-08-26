@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+[package]
+name = "native-runtime-static"
+authors = ["Ivan Kachalkin <xikxp1@gmail.com>"]
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["staticlib"]
+# This crate provides the C `main` for ahead-of-time compiled executables,
+# which clashes with the entry point of any Rust test or bench harness, so
+# those targets must never be built. The runtime's tests live in
+# `native-runtime`; end-to-end coverage is in `gleam-bin` and `test-output`.
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+native-runtime = { path = "../native-runtime" }
+native-runtime-stdlib = { path = "../native-runtime-stdlib" }
+mimalloc.workspace = true

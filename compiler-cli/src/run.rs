@@ -8,8 +8,8 @@ use ecow::EcoString;
 use gleam_core::{
     analyse::TargetSupport,
     build::{
-        Built, Codegen, Compile, ErlangOutput, Mode, NullTelemetry, Options, Runtime, Target,
-        Telemetry,
+        Built, Codegen, Compile, ErlangOutput, Mode, NullTelemetry, Options, Origin, Runtime,
+        Target, Telemetry,
     },
     config::{DenoFlag, PackageConfig},
     error::Error,
@@ -132,6 +132,27 @@ pub fn setup(
 
     let built = crate::build::main(paths, options, manifest)?;
 
+    // On the native target `gleam test` does not run `<package>_test.main`:
+    // the built-in runner discovers and runs the test functions itself,
+    // following gleeunit's convention (the library needs the standard
+    // library, which the native target does not support yet).
+    if target == Target::Native && matches!(which, Which::Test) {
+        if let Some(r) = runtime {
+            return Err(Error::InvalidRuntime {
+                target: Target::Native,
+                invalid_runtime: r,
+            });
+        }
+        let tests = native_test_functions(&built);
+        telemetry.running("the test suite");
+        return run_native_test_command(
+            paths,
+            tests,
+            arguments,
+            mod_config.native.stack_size_megabytes,
+        );
+    }
+
     // A module can not be run if it does not exist or does not have a public main function.
     let main_function = get_or_suggest_main_function(built, &module, target)?;
 
@@ -160,6 +181,19 @@ pub fn setup(
             Runtime::Bun => {
                 run_javascript_bun_command(paths, &main_function.package, &module, arguments)
             }
+        },
+        Target::Native => match runtime {
+            Some(r) => Err(Error::InvalidRuntime {
+                target: Target::Native,
+                invalid_runtime: r,
+            }),
+            _ => run_native_command(
+                paths,
+                &main_function.package,
+                &module,
+                arguments,
+                mod_config.native.stack_size_megabytes,
+            ),
         },
     }
 }
@@ -250,6 +284,122 @@ fn run_javascript_node_command(
         cwd: None,
         stdio: Stdio::Inherit,
     })
+}
+
+/// Unlike the other targets, which return a command for a runtime to be run
+/// as a subprocess, the native target JIT-compiles the build artifacts and
+/// runs `main` in this process, exiting with the outcome.
+fn run_native_command(
+    paths: &ProjectPaths,
+    _package: &str,
+    module: &str,
+    arguments: Vec<String>,
+    stack_size_megabytes: u64,
+) -> Result<Command, Error> {
+    fn fail(message: String) -> ! {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
+
+    let build_directory = paths.build_directory_for_target(Mode::Dev, Target::Native);
+    let modules = load_native_modules(&build_directory).unwrap_or_else(|error| fail(error));
+
+    match native_generation::jit::run(&modules, module, arguments, stack_size_megabytes) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => fail(error),
+    }
+}
+
+/// The tests the native runner executes: public zero-argument functions
+/// whose names end in `_test`, in the root package's modules from the
+/// `test` directory — the convention gleeunit uses on the other targets.
+/// Modules are visited in name order; functions in source order.
+fn native_test_functions(built: &Built) -> Vec<(String, String)> {
+    // Discovery reads the module interfaces rather than the compiled ASTs:
+    // modules already up to date in the build cache are not re-parsed, so
+    // they appear only as interfaces.
+    let root = &built.root_package.config.name;
+    let mut modules: Vec<_> = built
+        .module_interfaces
+        .values()
+        .filter(|module| &module.package == root && module.origin == Origin::Test)
+        .collect();
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut tests = vec![];
+    for module in modules {
+        let mut names: Vec<_> = module
+            .values
+            .iter()
+            .filter(|(name, value)| {
+                name.ends_with("_test")
+                    && value.publicity.is_public()
+                    && value.type_.fn_arity() == Some(0)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        for name in names {
+            tests.push((module.name.to_string(), name.to_string()));
+        }
+    }
+    tests
+}
+
+/// Like [`run_native_command`], but running the discovered test functions
+/// through the JIT test runner instead of a module's `main`. The runner
+/// reports each test and exits the process itself.
+fn run_native_test_command(
+    paths: &ProjectPaths,
+    tests: Vec<(String, String)>,
+    arguments: Vec<String>,
+    stack_size_megabytes: u64,
+) -> Result<Command, Error> {
+    fn fail(message: String) -> ! {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
+
+    let build_directory = paths.build_directory_for_target(Mode::Dev, Target::Native);
+    let modules = load_native_modules(&build_directory).unwrap_or_else(|error| fail(error));
+
+    match native_generation::jit::run_tests(&modules, &tests, arguments, stack_size_megabytes) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => fail(error),
+    }
+}
+
+/// Loads every native IR module from the package artefact directories of the
+/// given target build directory.
+pub(crate) fn load_native_modules(
+    build_directory: &Utf8PathBuf,
+) -> Result<Vec<native_ir::Module>, String> {
+    let mut modules = vec![];
+    let packages = std::fs::read_dir(build_directory)
+        .map_err(|error| format!("could not read {build_directory}: {error}"))?;
+    for package in packages {
+        let package =
+            package.map_err(|error| format!("could not read {build_directory}: {error}"))?;
+        let artefact_directory = package
+            .path()
+            .join(gleam_core::paths::ARTEFACT_DIRECTORY_NAME);
+        let Ok(artefacts) = std::fs::read_dir(&artefact_directory) else {
+            continue;
+        };
+        for artefact in artefacts {
+            let path = artefact
+                .map_err(|error| format!("could not read build artifacts: {error}"))?
+                .path();
+            if path.extension() != Some(std::ffi::OsStr::new("nir")) {
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            let module = native_ir::decode(&bytes)
+                .map_err(|error| format!("in {}: {error}", path.display()))?;
+            modules.push(module);
+        }
+    }
+    Ok(modules)
 }
 
 fn write_javascript_entrypoint(

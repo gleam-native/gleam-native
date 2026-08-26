@@ -120,8 +120,10 @@ pub fn compile_package(project_id: usize, target: &str) -> Result<(), String> {
     let target = match target.to_lowercase().as_str() {
         "erl" | "erlang" => Target::Erlang,
         "js" | "javascript" => Target::JavaScript,
+        "native" => Target::Native,
         _ => {
-            let msg = format!("Unknown target `{target}`, expected `erlang` or `javascript`");
+            let msg =
+                format!("Unknown target `{target}`, expected `erlang`, `javascript` or `native`");
             return Err(msg);
         }
     };
@@ -204,6 +206,7 @@ fn do_compile_package(project: Project, target: Target) -> Result<(), Error> {
             emit_source_maps: false,
             prelude_location: Utf8PathBuf::from("./gleam_prelude.mjs"),
         },
+        Target::Native => TargetCodegenConfiguration::Native {},
     };
 
     tracing::info!("Compiling package");
