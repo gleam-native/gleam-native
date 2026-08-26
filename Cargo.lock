@@ -3997,6 +3997,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-fuzz"
+version = "1.0.0"
+
+[[package]]
 name = "test-helpers-rs"
 version = "0.1.0"
 dependencies = [

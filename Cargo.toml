@@ -25,6 +25,7 @@ members = [
   "native-runtime-static",
   "native-runtime-stdlib",
   "src-span",
+  "test-fuzz",
 ]
 
 # common dependencies

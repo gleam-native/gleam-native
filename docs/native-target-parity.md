@@ -353,6 +353,13 @@ platform C convention.
   runtime string externals) and the stack-size cases remain native-only;
   `gleam-bin` keeps the tooling tests (arguments, test runner,
   export/cross-compilation, artifact hygiene)
+- ✅ Differential fuzzing: `cargo run -p test-fuzz` generates seeded,
+  type-directed, total Gleam programs (language features only) and runs
+  each on Erlang, the native JIT, and the native JIT under
+  `GLEAM_DEBUG_RC=1`, requiring identical output and exit codes;
+  mismatches are saved as seed-reproducible programs (see
+  `test-fuzz/README.md` for what is generated and which legitimate
+  per-target rendering differences are avoided)
 
 ## Ecosystem
 

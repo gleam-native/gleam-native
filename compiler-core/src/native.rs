@@ -99,6 +99,17 @@ pub fn module(
     })
 }
 
+/// Where a string-prefix pattern's rest variable lives: the base subject
+/// holding the whole string, the byte offset just past the accumulated
+/// prefix, and that prefix's text — kept so a decision-tree switch on the
+/// rest can be rewritten as a switch on the base subject with the prefix
+/// folded into its checks.
+struct PrefixRest {
+    subject: u32,
+    offset: u32,
+    prefix: String,
+}
+
 struct Lowerer<'a> {
     module_name: EcoString,
     function_name: EcoString,
@@ -1385,7 +1396,7 @@ impl Lowerer<'_> {
         &self,
         decision: &exhaustiveness::Decision,
         clauses: Option<&[TypedClause]>,
-        prefix_slices: &mut HashMap<usize, (u32, u32)>,
+        prefix_slices: &mut HashMap<usize, PrefixRest>,
     ) -> Result<native_ir::Decision, Error> {
         match decision {
             exhaustiveness::Decision::Run { body } => {
@@ -1429,12 +1440,20 @@ impl Lowerer<'_> {
                 fallback,
                 fallback_check,
             } => {
-                let subject = var.id as u32;
+                // A switch on a string-prefix pattern's rest has no
+                // materialized subject: switch on the base subject holding
+                // the whole string instead, folding the accumulated prefix
+                // into every check (`rest == "n"` after matching prefix
+                // `"r"` is exactly `subject == "rn"`).
+                let (subject, prefix) = match prefix_slices.get(&var.id) {
+                    Some(rest) => (rest.subject, rest.prefix.clone()),
+                    None => (var.id as u32, String::new()),
+                };
                 let choices = choices
                     .iter()
                     .map(|(check, decision)| {
                         let check =
-                            self.runtime_check(check, &var.type_, subject, prefix_slices)?;
+                            self.runtime_check(check, &var.type_, subject, prefix_slices, &prefix)?;
                         let decision = self.decision(decision, clauses, prefix_slices)?;
                         Ok((check, decision))
                     })
@@ -1444,7 +1463,13 @@ impl Lowerer<'_> {
                 // extracts must still be made available.
                 let fallback_fields = match fallback_check.as_ref() {
                     exhaustiveness::FallbackCheck::RuntimeCheck { check } => {
-                        match self.runtime_check(check, &var.type_, subject, prefix_slices)? {
+                        match self.runtime_check(
+                            check,
+                            &var.type_,
+                            subject,
+                            prefix_slices,
+                            &prefix,
+                        )? {
                             native_ir::Check::Variant { fields, .. }
                             | native_ir::Check::Always { fields } => fields,
                             native_ir::Check::NonEmptyList { first, rest } => vec![first, rest],
@@ -1478,7 +1503,11 @@ impl Lowerer<'_> {
         check: &exhaustiveness::RuntimeCheck,
         subject_type: &Type,
         subject: u32,
-        prefix_slices: &mut HashMap<usize, (u32, u32)>,
+        prefix_slices: &mut HashMap<usize, PrefixRest>,
+        // The accumulated prefix text under which this check applies, when
+        // the checked variable is a string-prefix pattern's rest (see the
+        // `Switch` lowering); empty otherwise.
+        prefix: &str,
     ) -> Result<native_ir::Check, Error> {
         match check {
             exhaustiveness::RuntimeCheck::Int { int_value } => Ok(
@@ -1491,9 +1520,10 @@ impl Lowerer<'_> {
             exhaustiveness::RuntimeCheck::Float { float_value } => {
                 Ok(native_ir::Check::Float(float_value.value()))
             }
-            exhaustiveness::RuntimeCheck::String { value } => Ok(native_ir::Check::String(
-                crate::strings::convert_string_escape_chars(value).into(),
-            )),
+            exhaustiveness::RuntimeCheck::String { value } => {
+                let value: String = crate::strings::convert_string_escape_chars(value).into();
+                Ok(native_ir::Check::String(format!("{prefix}{value}")))
+            }
             exhaustiveness::RuntimeCheck::Variant { index, fields, .. } => {
                 // Bool and Nil are immediate words (`True` is variant 0);
                 // every other custom type is a heap record with a variant
@@ -1509,12 +1539,23 @@ impl Lowerer<'_> {
                     })
                 }
             }
-            exhaustiveness::RuntimeCheck::StringPrefix { prefix, rest } => {
-                let prefix: String = crate::strings::convert_string_escape_chars(prefix).into();
+            exhaustiveness::RuntimeCheck::StringPrefix {
+                prefix: checked,
+                rest,
+            } => {
+                let checked: String = crate::strings::convert_string_escape_chars(checked).into();
+                let full = format!("{prefix}{checked}");
                 // The rest variable, when bound, becomes a slice of the
-                // subject past the prefix.
-                let _ = prefix_slices.insert(rest.id, (subject, prefix.len() as u32));
-                Ok(native_ir::Check::StringPrefix { prefix })
+                // subject past the whole accumulated prefix.
+                let _ = prefix_slices.insert(
+                    rest.id,
+                    PrefixRest {
+                        subject,
+                        offset: full.len() as u32,
+                        prefix: full.clone(),
+                    },
+                );
+                Ok(native_ir::Check::StringPrefix { prefix: full })
             }
             exhaustiveness::RuntimeCheck::Tuple { elements, .. } => Ok(native_ir::Check::Always {
                 fields: elements.iter().map(|element| element.id as u32).collect(),
@@ -1534,7 +1575,7 @@ impl Lowerer<'_> {
         &self,
         body: &exhaustiveness::Body,
         clauses: Option<&[TypedClause]>,
-        prefix_slices: &HashMap<usize, (u32, u32)>,
+        prefix_slices: &HashMap<usize, PrefixRest>,
     ) -> Result<native_ir::Decision, Error> {
         let bindings = self.bound_values(&body.bindings, prefix_slices)?;
         // Assignments have no clause bodies: only the bindings matter.
@@ -1555,16 +1596,16 @@ impl Lowerer<'_> {
     fn bound_values(
         &self,
         body_bindings: &[(EcoString, exhaustiveness::BoundValue)],
-        prefix_slices: &HashMap<usize, (u32, u32)>,
+        prefix_slices: &HashMap<usize, PrefixRest>,
     ) -> Result<Vec<(String, native_ir::Bound)>, Error> {
         let mut bindings = Vec::with_capacity(body_bindings.len());
         for (name, value) in body_bindings {
             let bound = match value {
                 exhaustiveness::BoundValue::Variable(variable) => {
                     match prefix_slices.get(&variable.id) {
-                        Some((subject, offset)) => native_ir::Bound::StringSlice {
-                            subject: *subject,
-                            offset: *offset,
+                        Some(rest) => native_ir::Bound::StringSlice {
+                            subject: rest.subject,
+                            offset: rest.offset,
                         },
                         None => native_ir::Bound::Variable(variable.id as u32),
                     }
