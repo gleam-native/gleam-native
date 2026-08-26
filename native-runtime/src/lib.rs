@@ -6,10 +6,15 @@
 //! Generated code represents every Gleam value as one 64-bit word:
 //!
 //! - low bit 1: a small integer, the value in the upper 63 bits (`(n << 1) | 1`)
-//! - low bit 0: a pointer to a heap allocation (8-byte aligned)
+//! - low three bits 000: a pointer to a heap allocation (8-byte aligned)
+//! - low three bits 010, 100, or 110: a special immediate constant —
+//!   `Nil` (2), `False` (4), `True` (6), and the empty list (10), each
+//!   distinct so runtime-polymorphic operations (`echo`, `inspect`,
+//!   `dynamic` classification) can tell them apart from integers
 //!
-//! `Nil`, `False`/`True`, and the empty list are the small integers 0, 0/1,
-//! and 0 respectively; Gleam's type system keeps them apart.
+//! `True` is `False | 2`, and bit 1 distinguishes them, so generated
+//! boolean tests mask bit 1 and negation flips it. No value encodes as 0:
+//! generated code and the runtime reserve 0 as a sentinel.
 //!
 //! Every heap object starts with a header word: the object kind in the low
 //! 16 bits, and for records the variant tag in bits 16..32 and the field
@@ -40,11 +45,26 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const NIL: u64 = 1;
+/// The special immediate constants: words whose low three bits are neither
+/// a small integer's (bit 0 set) nor a heap pointer's (all zero). `TRUE`
+/// must stay `FALSE | 2` — generated code tests booleans by masking bit 1
+/// and negates by flipping it.
+pub const NIL: u64 = 0b010;
+pub const FALSE: u64 = 0b100;
+pub const TRUE: u64 = 0b110;
+pub const EMPTY_LIST: u64 = 0b1010;
 
-/// `False` and `True` are the tagged small integers 0 and 1.
-pub const FALSE: u64 = 1;
-pub const TRUE: u64 = 3;
+/// Whether a value word is an immediate (small integer or special
+/// constant) rather than a heap pointer. Heap pointers are 8-byte aligned,
+/// so any set low bit marks an immediate; no value word is 0.
+pub fn is_immediate(value: u64) -> bool {
+    value & 0b111 != 0
+}
+
+/// Whether a value word is a tagged small integer.
+pub fn is_small_int(value: u64) -> bool {
+    value & 1 == 1
+}
 
 pub const SMALL_INT_MIN: i64 = i64::MIN >> 1;
 pub const SMALL_INT_MAX: i64 = i64::MAX >> 1;
@@ -159,7 +179,10 @@ fn free_payload<T>(value: u64) {
     unsafe {
         std::ptr::drop_in_place(&raw mut (*container::<T>(value)).value);
     }
-    free_words((value - 8) as *mut u64, std::mem::size_of::<HeapBox<T>>() / 8);
+    free_words(
+        (value - 8) as *mut u64,
+        std::mem::size_of::<HeapBox<T>>() / 8,
+    );
 }
 
 fn container<T>(value: u64) -> *mut HeapBox<T> {
@@ -226,10 +249,7 @@ pub fn box_string_slice(parent: u64, offset: usize, length: usize) -> u64 {
         StringPayload::Owned(_) => (parent, 0),
         StringPayload::View(view) => (view.parent, view.offset as usize),
     };
-    let (Ok(offset), Ok(length)) = (
-        u32::try_from(base + offset),
-        u32::try_from(length),
-    ) else {
+    let (Ok(offset), Ok(length)) = (u32::try_from(base + offset), u32::try_from(length)) else {
         return box_string(&string_value(parent)[offset..offset + length]);
     };
     box_heap(
@@ -408,7 +428,13 @@ fn append_int_bits(payload: &mut BitArrayPayload, value: &BigInt, bits: u64, lit
 
 /// Reads `bits` bits at `offset` as an integer, inverse of
 /// [`append_int_bits`].
-fn read_int_bits(payload: &BitArrayPayload, offset: u64, bits: u64, little: bool, signed: bool) -> BigInt {
+fn read_int_bits(
+    payload: &BitArrayPayload,
+    offset: u64,
+    bits: u64,
+    little: bool,
+    signed: bool,
+) -> BigInt {
     let bytes = extract_bits(payload, offset, bits);
     let stream_bit = |i: u64| -> BigInt {
         if bit_of(&bytes, i) {
@@ -731,7 +757,7 @@ pub fn make_error(value: u64) -> u64 {
 
 /// Builds a list (cons cells with tag 1) from already-owned values.
 pub fn make_list(values: Vec<u64>) -> u64 {
-    let mut list = NIL;
+    let mut list = EMPTY_LIST;
     for value in values.into_iter().rev() {
         let cell = gleam_native_record_new(1, 2, DISPLAY_LIST as u64);
         unsafe {
@@ -803,7 +829,12 @@ pub unsafe extern "C" fn gleam_native_string_lowercase(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_reverse(string: u64) -> u64 {
-    box_string(string_value(string).graphemes(true).rev().collect::<CompactString>())
+    box_string(
+        string_value(string)
+            .graphemes(true)
+            .rev()
+            .collect::<CompactString>(),
+    )
 }
 
 /// # Safety
@@ -835,7 +866,10 @@ pub unsafe extern "C" fn gleam_native_string_ends_with(string: u64, suffix: u64)
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim(string: u64) -> u64 {
-    slice_of(string, string_value(string).trim_matches(TRIMMED_WHITESPACE))
+    slice_of(
+        string,
+        string_value(string).trim_matches(TRIMMED_WHITESPACE),
+    )
 }
 
 /// The whitespace characters `string.trim` removes on every target: ASCII
@@ -850,7 +884,10 @@ const TRIMMED_WHITESPACE: &[char] = &[
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
-    slice_of(string, string_value(string).trim_start_matches(TRIMMED_WHITESPACE))
+    slice_of(
+        string,
+        string_value(string).trim_start_matches(TRIMMED_WHITESPACE),
+    )
 }
 
 /// # Safety
@@ -858,7 +895,10 @@ pub unsafe extern "C" fn gleam_native_string_trim_start(string: u64) -> u64 {
 /// See [`gleam_native_string_byte_size`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_trim_end(string: u64) -> u64 {
-    slice_of(string, string_value(string).trim_end_matches(TRIMMED_WHITESPACE))
+    slice_of(
+        string,
+        string_value(string).trim_end_matches(TRIMMED_WHITESPACE),
+    )
 }
 
 /// The `length` grapheme clusters starting at grapheme index `start`
@@ -905,11 +945,7 @@ pub unsafe extern "C" fn gleam_native_string_split(string: u64, on: u64) -> u64 
     if on.is_empty() {
         return make_list(vec![gleam_native_inc(string)]);
     }
-    make_list(
-        text.split(on)
-            .map(|part| slice_of(string, part))
-            .collect(),
-    )
+    make_list(text.split(on).map(|part| slice_of(string, part)).collect())
 }
 
 /// The first grapheme cluster and the rest: `Ok(#(head, rest))`, or
@@ -966,7 +1002,7 @@ pub unsafe extern "C" fn gleam_native_string_to_codepoints(string: u64) -> u64 {
 pub extern "C" fn gleam_native_string_from_codepoints(list: u64) -> u64 {
     let mut result = String::new();
     let mut current = list;
-    while current & 1 == 0 {
+    while !is_immediate(current) {
         let scalar = ((record_field(current, 0) as i64) >> 1) as u32;
         if let Some(character) = char::from_u32(scalar) {
             result.push(character);
@@ -981,7 +1017,6 @@ pub extern "C" fn gleam_native_string_from_codepoints(list: u64) -> u64 {
 pub extern "C" fn gleam_native_int_to_string(value: u64) -> u64 {
     box_string(untag(value).to_string())
 }
-
 
 /// Renders a float the way Gleam writes floats: always with a decimal
 /// point, keeping exponent notation, and naming the non-finite values.
@@ -1076,16 +1111,15 @@ pub fn call_closure(closure: u64, arguments: &[u64]) -> u64 {
     unsafe {
         match arguments {
             [] => std::mem::transmute::<usize, extern "C" fn(u64) -> u64>(pointer)(closure),
-            [a] => std::mem::transmute::<usize, extern "C" fn(u64, u64) -> u64>(pointer)(
-                closure, *a,
+            [a] => {
+                std::mem::transmute::<usize, extern "C" fn(u64, u64) -> u64>(pointer)(closure, *a)
+            }
+            [a, b] => std::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> u64>(pointer)(
+                closure, *a, *b,
             ),
-            [a, b] => std::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> u64>(
+            [a, b, c] => std::mem::transmute::<usize, extern "C" fn(u64, u64, u64, u64) -> u64>(
                 pointer,
-            )(closure, *a, *b),
-            [a, b, c] => std::mem::transmute::<
-                usize,
-                extern "C" fn(u64, u64, u64, u64) -> u64,
-            >(pointer)(closure, *a, *b, *c),
+            )(closure, *a, *b, *c),
             [a, b, c, d] => std::mem::transmute::<
                 usize,
                 extern "C" fn(u64, u64, u64, u64, u64) -> u64,
@@ -1278,12 +1312,7 @@ pub unsafe fn start(
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_start_arguments() -> u64 {
     let arguments = START_ARGUMENTS.get().cloned().unwrap_or_default();
-    make_list(
-        arguments
-            .into_iter()
-            .map(box_string)
-            .collect(),
-    )
+    make_list(arguments.into_iter().map(box_string).collect())
 }
 
 /// Ends the program immediately with the given exit code.
@@ -1445,7 +1474,11 @@ pub extern "C" fn gleam_native_bitarray_size_test(array: u64, bits: u64, exact: 
     }
     let bits = ((bits as i64) >> 1) as u64;
     let size = bitarray_value(array).bits;
-    let passed = if exact == 0 { size >= bits } else { size == bits };
+    let passed = if exact == 0 {
+        size >= bits
+    } else {
+        size == bits
+    };
     if passed { TRUE } else { FALSE }
 }
 
@@ -1467,8 +1500,7 @@ pub unsafe extern "C" fn gleam_native_bitarray_bytes_test(
     if offset + bit_length > payload.bits {
         return FALSE;
     }
-    let expected =
-        unsafe { std::slice::from_raw_parts(bytes, bit_length.div_ceil(8) as usize) };
+    let expected = unsafe { std::slice::from_raw_parts(bytes, bit_length.div_ceil(8) as usize) };
     let actual = extract_bits(payload, offset, bit_length);
     // Both sides are zero-padded except possibly the expected constant's
     // last byte; mask it.
@@ -1587,9 +1619,7 @@ pub extern "C" fn gleam_native_bitarray_slice(
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_record_new(tag: u64, arity: u64, display: u64) -> u64 {
     let value = allocate_words(1 + arity as usize);
-    unsafe {
-        *(value as *mut u64) = record_header(tag as u32, arity as u32) | (display << 48)
-    };
+    unsafe { *(value as *mut u64) = record_header(tag as u32, arity as u32) | (display << 48) };
     value
 }
 
@@ -1675,8 +1705,7 @@ const POOL_CLASS_CAPACITY: u64 = 4096;
 /// runtime's allocation call.
 #[unsafe(no_mangle)]
 #[allow(non_upper_case_globals)]
-pub static gleam_native_pool: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static gleam_native_pool: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The symbol generated code reads the program thread's pool through.
 pub const POOL_SYMBOL: &str = "gleam_native_pool";
@@ -1721,9 +1750,7 @@ fn rc_check(value: u64, operation: &str) {
     let count = unsafe { *((value - 8) as *const u64) };
     let header = heap_header(value);
     if header_kind(header) == POISON_KIND {
-        eprintln!(
-            "RC BUG: {operation} of freed (pooled) value {value:#x}, count word {count:#x}"
-        );
+        eprintln!("RC BUG: {operation} of freed (pooled) value {value:#x}, count word {count:#x}");
         std::process::abort();
     }
     if count == 0 || count > 1 << 40 {
@@ -1734,7 +1761,10 @@ fn rc_check(value: u64, operation: &str) {
     }
     let traced = RC_TRACE_KIND.load(std::sync::atomic::Ordering::Relaxed);
     if traced == header_kind(header) || traced == u64::MAX - 1 {
-        eprintln!("TRACE {operation} {value:#x} kind {} count {count}", header_kind(header));
+        eprintln!(
+            "TRACE {operation} {value:#x} kind {} count {count}",
+            header_kind(header)
+        );
     }
 }
 
@@ -1780,7 +1810,10 @@ fn arm_rc_debugging() {
         unsafe { libc::atexit(report_rc_stats) };
     }
     if let Some(kind) = std::env::var_os("GLEAM_TRACE_RC") {
-        let kind = kind.to_string_lossy().parse::<u64>().unwrap_or(u64::MAX - 1);
+        let kind = kind
+            .to_string_lossy()
+            .parse::<u64>()
+            .unwrap_or(u64::MAX - 1);
         RC_TRACE_KIND.store(kind, Ordering::Relaxed);
         flags |= RC_FLAG_DEBUG;
     }
@@ -1842,7 +1875,7 @@ fn free_words(base: *mut u64, total: usize) {
 /// Increments a value's reference count. A no-op for immediates.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
-    if value & 1 == 0 {
+    if !is_immediate(value) {
         if rc_debug() {
             rc_check(value, "inc");
         }
@@ -1856,7 +1889,7 @@ pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
 /// or a count that stays positive — touch nothing but the count word.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
-    if value & 1 == 1 {
+    if is_immediate(value) {
         return NIL;
     }
     if rc_debug() {
@@ -1908,7 +1941,7 @@ fn destroy(first: u64) {
     let mut worklist = WORKLIST.take();
     free_object(first, &mut worklist);
     while let Some(value) = worklist.pop() {
-        if value & 1 == 1 {
+        if is_immediate(value) {
             continue;
         }
         if rc_debug() {
@@ -1962,7 +1995,6 @@ fn free_object(value: u64, worklist: &mut Vec<u64>) {
         _ => {}
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Dicts and string trees
@@ -2074,8 +2106,14 @@ impl Eq for DictKeyRef {}
 /// iterate differently.
 fn hash_value(value: u64, state: &mut impl std::hash::Hasher) {
     use std::hash::Hash;
-    if value & 1 == 1 {
+    if is_small_int(value) {
         ((value as i64) >> 1).hash(state);
+        return;
+    }
+    if is_immediate(value) {
+        // Nil, booleans, and the empty list: distinct words, equal only to
+        // themselves, so the word is the hash.
+        value.hash(state);
         return;
     }
     let header = heap_header(value);
@@ -2123,17 +2161,27 @@ fn hash_value(value: u64, state: &mut impl std::hash::Hasher) {
 pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let rank = |value: u64| -> u8 {
-        if value & 1 == 1 {
+        if is_small_int(value) {
             return 0;
+        }
+        if is_immediate(value) {
+            return match value {
+                // Booleans order `False < True`, like Erlang's atoms.
+                FALSE | TRUE => 4,
+                NIL => 5,
+                // The empty list sorts before every non-empty list (a
+                // cons cell is a record, ranked higher).
+                _ => 6,
+            };
         }
         match header_kind(heap_header(value)) {
             KIND_BIGINT => 0,
             KIND_FLOAT => 1,
             KIND_STRING => 2,
             KIND_BITARRAY => 3,
-            KIND_RECORD => 4,
-            KIND_DICT => 5,
-            _ => 6,
+            KIND_RECORD => 7,
+            KIND_DICT => 8,
+            _ => 9,
         }
     };
     let left_rank = rank(left);
@@ -2144,7 +2192,7 @@ pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
     match left_rank {
         // Integers compare numerically whether small or big.
         0 => {
-            if left & 1 == 1 && right & 1 == 1 {
+            if is_small_int(left) && is_small_int(right) {
                 ((left as i64) >> 1).cmp(&((right as i64) >> 1))
             } else {
                 untag(left).cmp(&untag(right))
@@ -2153,7 +2201,8 @@ pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
         1 => {
             let left = float_value(left);
             let right = float_value(right);
-            left.partial_cmp(&right).unwrap_or_else(|| left.total_cmp(&right))
+            left.partial_cmp(&right)
+                .unwrap_or_else(|| left.total_cmp(&right))
         }
         2 => string_value(left).cmp(string_value(right)),
         3 => {
@@ -2161,7 +2210,11 @@ pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
             let right = bitarray_value(right);
             (left.bits, &left.bytes).cmp(&(right.bits, &right.bytes))
         }
-        4 => {
+        // Booleans compare by word (`FALSE < TRUE`); `Nil` and the empty
+        // list are single-valued ranks.
+        4 => left.cmp(&right),
+        5 | 6 => Ordering::Equal,
+        7 => {
             let left_header = heap_header(left) & HEADER_SEMANTIC_MASK;
             let right_header = heap_header(right) & HEADER_SEMANTIC_MASK;
             match left_header.cmp(&right_header) {
@@ -2176,7 +2229,7 @@ pub fn cmp_values(left: u64, right: u64) -> std::cmp::Ordering {
             }
             Ordering::Equal
         }
-        5 => {
+        8 => {
             let left = dict_payload(left);
             let right = dict_payload(right);
             match left.map.len().cmp(&right.map.len()) {
@@ -2245,7 +2298,7 @@ pub fn box_dict(payload: DictPayload) -> u64 {
 fn flatten_tree(tree: u64, buffer: &mut String) {
     let mut worklist = vec![tree];
     while let Some(value) = worklist.pop() {
-        if value & 1 == 1 {
+        if is_immediate(value) {
             // The empty list: nothing to add.
             continue;
         }
@@ -2288,7 +2341,7 @@ pub(crate) fn deep_eq(left: u64, right: u64) -> bool {
     }
     // Different immediates, or an immediate against a heap value, are never
     // equal: big integers never encode small-range values.
-    if left & 1 == 1 || right & 1 == 1 {
+    if is_immediate(left) || is_immediate(right) {
         return false;
     }
     let left_header = heap_header(left) & HEADER_SEMANTIC_MASK;
@@ -2338,10 +2391,6 @@ pub(crate) fn deep_eq(left: u64, right: u64) -> bool {
     }
 }
 
-/// Renders a value for `echo`. Scalars print exactly; records print
-/// structurally as `@tag(field, ...)` since constructor names do not exist
-/// at run time. Booleans and other immediates nested inside structures
-/// print as their integer encoding.
 /// Renders a string the way `echo` does on every target: the common
 /// escapes by name, other control characters (and the C1 range) as
 /// zero-padded uppercase `\u{XXXX}`, everything else literally.
@@ -2367,8 +2416,17 @@ fn inspect_string(string: &str) -> String {
 }
 
 pub fn inspect(value: u64) -> String {
-    if value & 1 == 1 {
+    if is_small_int(value) {
         return format!("{}", (value as i64) >> 1);
+    }
+    if is_immediate(value) {
+        return match value {
+            NIL => "Nil".to_string(),
+            FALSE => "False".to_string(),
+            TRUE => "True".to_string(),
+            EMPTY_LIST => "[]".to_string(),
+            other => format!("<unknown immediate {other}>"),
+        };
     }
     let header = heap_header(value);
     match header_kind(header) {
@@ -2417,10 +2475,10 @@ pub fn inspect(value: u64) -> String {
                     let mut items = Vec::new();
                     let mut chars = Some(String::new());
                     let mut current = value;
-                    while current & 1 == 0 {
+                    while !is_immediate(current) {
                         let element = record_field(current, 0);
                         if let Some(text) = &mut chars {
-                            let printable = element & 1 == 1
+                            let printable = is_small_int(element)
                                 && (32..=126).contains(&((element as i64) >> 1));
                             if printable {
                                 text.push((((element as i64) >> 1) as u8) as char);
@@ -2442,7 +2500,11 @@ pub fn inspect(value: u64) -> String {
                     Some(name) if record_arity(header) == 0 => name.to_string(),
                     Some(name) => format!("{name}({})", fields(value, header).join(", ")),
                     None => {
-                        format!("@{}({})", record_tag(header), fields(value, header).join(", "))
+                        format!(
+                            "@{}({})",
+                            record_tag(header),
+                            fields(value, header).join(", ")
+                        )
                     }
                 },
             }
@@ -2468,9 +2530,8 @@ pub fn inspect(value: u64) -> String {
 }
 
 /// The implementation of `echo`: prints the source location and the value
-/// to standard error, then returns the value. `kind` selects exact printing
-/// for values whose static type the compiler knew at the echo site:
-/// 0 structural, 1 int, 2 float, 3 string, 4 bool, 5 nil.
+/// to standard error, then returns the value. Rendering is structural:
+/// every value — immediates included — identifies itself at run time.
 ///
 /// # Safety
 ///
@@ -2478,7 +2539,6 @@ pub fn inspect(value: u64) -> String {
 /// [`gleam_native_panic`]; `message` is a string value or 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_echo(
-    kind: u64,
     value: u64,
     message: u64,
     path: *const u8,
@@ -2488,17 +2548,7 @@ pub unsafe extern "C" fn gleam_native_echo(
     let path = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(path, path_length as usize))
     };
-    let rendered = match kind {
-        1 => format!("{}", untag(value)),
-        2 => format_float(float_value(value)),
-        3 => inspect_string(string_value(value)),
-        4 => (if value == TRUE { "True" } else { "False" }).to_string(),
-        5 => "Nil".to_string(),
-        // A statically-known list: the empty list is a bare tagged integer
-        // that structural inspection cannot identify.
-        6 if value == NIL => "[]".to_string(),
-        _ => inspect(value),
-    };
+    let rendered = inspect(value);
     // The location is greyed with the same ANSI codes the other targets
     // use, matching their output exactly.
     eprint!("\u{1b}[90m{path}:{line}\u{1b}[39m");
@@ -2577,9 +2627,7 @@ pub unsafe extern "C" fn gleam_native_panic(
     eprintln!();
     eprintln!("    {module}.{function}:{line}");
     if let Some((run, _)) = failed_test {
-        let _ = run
-            .failed
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = run.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Resume with the next test instead of exiting; the failed test's
         // frames below this one are abandoned.
         continue_test_run();
@@ -2826,16 +2874,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("gleam_native_eq", gleam_native_eq as *const u8),
         ("gleam_native_inc", gleam_native_inc as *const u8),
         ("gleam_native_dec", gleam_native_dec as *const u8),
-        (
-            "gleam_native_destroy",
-            gleam_native_destroy as *const u8,
-        ),
+        ("gleam_native_destroy", gleam_native_destroy as *const u8),
         // A data symbol, not a function: generated code loads the program
         // thread's pool address through it for inline pooled allocation.
-        (
-            POOL_SYMBOL,
-            (&raw const gleam_native_pool) as *const u8,
-        ),
+        (POOL_SYMBOL, (&raw const gleam_native_pool) as *const u8),
         ("gleam_native_echo", gleam_native_echo as *const u8),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
@@ -2873,7 +2915,7 @@ mod tests {
         let _ = gleam_native_dec(record);
 
         // A long list must not overflow the stack when destroyed.
-        let mut list = NIL;
+        let mut list = EMPTY_LIST;
         for n in 0..200_000 {
             list = make_record(1, &[tag_small_int(n), list]);
         }
@@ -2947,10 +2989,8 @@ mod tests {
 
     #[test]
     fn overflowing_addition_makes_a_big_integer() {
-        let result = gleam_native_int_add_slow(
-            tag_small_int(SMALL_INT_MAX),
-            tag_small_int(SMALL_INT_MAX),
-        );
+        let result =
+            gleam_native_int_add_slow(tag_small_int(SMALL_INT_MAX), tag_small_int(SMALL_INT_MAX));
         assert_eq!(result & 1, 0);
         assert_eq!(untag(result), BigInt::from(SMALL_INT_MAX) * 2);
     }
@@ -2993,8 +3033,7 @@ mod tests {
         let array = gleam_native_bitarray_empty();
         let array = gleam_native_bitarray_append_int(array, tag_small_int(1), bits(8), 0);
         let array = gleam_native_bitarray_append_int(array, tag_small_int(258), bits(16), 0);
-        let array =
-            unsafe { gleam_native_bitarray_append_string(array, make_string("ok"), 0, 0) };
+        let array = unsafe { gleam_native_bitarray_append_string(array, make_string("ok"), 0, 0) };
         assert_eq!(bitarray_value(array).bytes, vec![1, 1, 2, b'o', b'k']);
 
         assert_eq!(gleam_native_bitarray_size_test(array, bits(40), 1), TRUE);
@@ -3053,7 +3092,10 @@ mod tests {
         let little_unaligned = gleam_native_bitarray_empty();
         let little_unaligned =
             gleam_native_bitarray_append_int(little_unaligned, tag_small_int(1000), bits(12), 1);
-        assert_eq!(bitarray_value(little_unaligned).bytes, vec![232, 0b0011_0000]);
+        assert_eq!(
+            bitarray_value(little_unaligned).bytes,
+            vec![232, 0b0011_0000]
+        );
         assert_eq!(
             gleam_native_bitarray_read_int(little_unaligned, bits(0), bits(12), 1, 0),
             tag_small_int(1000)
@@ -3091,15 +3133,30 @@ mod tests {
             )
         };
         assert_eq!(
-            float_value(gleam_native_bitarray_read_float(floats, bits(0), bits(16), 0)),
+            float_value(gleam_native_bitarray_read_float(
+                floats,
+                bits(0),
+                bits(16),
+                0
+            )),
             1.5
         );
         assert_eq!(
-            float_value(gleam_native_bitarray_read_float(floats, bits(16), bits(32), 1)),
+            float_value(gleam_native_bitarray_read_float(
+                floats,
+                bits(16),
+                bits(32),
+                1
+            )),
             2.5
         );
         assert_eq!(
-            float_value(gleam_native_bitarray_read_float(floats, bits(48), bits(64), 0)),
+            float_value(gleam_native_bitarray_read_float(
+                floats,
+                bits(48),
+                bits(64),
+                0
+            )),
             3.25
         );
         assert_eq!(
@@ -3113,10 +3170,7 @@ mod tests {
         let utf = unsafe { gleam_native_bitarray_append_string(utf, make_string("hi"), 1, 0) };
         assert_eq!(bitarray_value(utf).bytes, vec![0, 104, 0, 105]);
         let utf = gleam_native_bitarray_append_codepoint(utf, tag_small_int(0x1F600), 0, 0);
-        assert_eq!(
-            &bitarray_value(utf).bytes[4..],
-            "\u{1F600}".as_bytes()
-        );
+        assert_eq!(&bitarray_value(utf).bytes[4..], "\u{1F600}".as_bytes());
 
         let rest = gleam_native_bitarray_slice(array, bits(24), bits(0), 0);
         assert_eq!(bitarray_value(rest).bytes, vec![b'o', b'k']);
@@ -3236,9 +3290,7 @@ mod tests {
         );
         let wrong = "hello";
         assert_eq!(
-            unsafe {
-                gleam_native_string_starts_with(subject, wrong.as_ptr(), wrong.len() as u64)
-            },
+            unsafe { gleam_native_string_starts_with(subject, wrong.as_ptr(), wrong.len() as u64) },
             FALSE
         );
         let rest = unsafe { gleam_native_string_slice_from(subject, prefix.len() as u64) };
@@ -3268,8 +3320,8 @@ mod tests {
         assert_eq!(gleam_native_eq(a, d), FALSE);
 
         // Nested records (a cons list of records).
-        let list_a = make_record(1, &[a, NIL]);
-        let list_b = make_record(1, &[b, NIL]);
+        let list_a = make_record(1, &[a, EMPTY_LIST]);
+        let list_b = make_record(1, &[b, EMPTY_LIST]);
         assert_eq!(gleam_native_eq(list_a, list_b), TRUE);
 
         // Immediate against heap value.
@@ -3289,6 +3341,9 @@ mod tests {
         let record = make_record(1, &[tag_small_int(7), make_string("hi")]);
         assert_eq!(inspect(record), "@1(7, \"hi\")");
         assert_eq!(inspect(tag_small_int(-3)), "-3");
-        assert_eq!(inspect(gleam_native_float_from_bits(2.5_f64.to_bits())), "2.5");
+        assert_eq!(
+            inspect(gleam_native_float_from_bits(2.5_f64.to_bits())),
+            "2.5"
+        );
     }
 }

@@ -107,7 +107,14 @@ pub fn invoke_symbol(arity: usize) -> String {
 /// invoker table.
 pub const INVOKE_ARITIES: std::ops::RangeInclusive<usize> = 0..=6;
 
-const NIL: i64 = 1;
+/// The special immediate constant words, shared with the runtime. Heap
+/// pointers are 8-byte aligned, so any set low bit marks an immediate:
+/// generated immediate tests mask the low three bits.
+const NIL: i64 = native_runtime::NIL as i64;
+const FALSE: i64 = native_runtime::FALSE as i64;
+const TRUE: i64 = native_runtime::TRUE as i64;
+const EMPTY_LIST: i64 = native_runtime::EMPTY_LIST as i64;
+const IMMEDIATE_MASK: i64 = 0b111;
 
 pub fn mangle(module: &str, function: &str) -> String {
     format!("gleam${}${}", module.replace('/', "$"), function)
@@ -211,7 +218,7 @@ impl RuntimeFunctions {
             record_new: declare(RECORD_NEW, 3)?,
             closure_new: declare(CLOSURE_NEW, 2)?,
             deep_eq: declare(DEEP_EQ, 2)?,
-            echo: declare(ECHO, 6)?,
+            echo: declare(ECHO, 5)?,
             destroy: declare(DESTROY, 1)?,
             panic: declare(PANIC, 7)?,
             pool,
@@ -492,9 +499,7 @@ impl<'a, M: Module> Translator<'a, M> {
             let _ = function_translator.inc(value);
         }
         function_translator.dec(closure);
-        if let Some(result) =
-            function_translator.statements_scoped(body, 0, Some(Vec::new()))?
-        {
+        if let Some(result) = function_translator.statements_scoped(body, 0, Some(Vec::new()))? {
             builder.ins().return_(&[result]);
         }
         builder.finalize(self.module.target_config());
@@ -604,9 +609,7 @@ impl<'a, M: Module> Translator<'a, M> {
             reuse_token: None,
             branch_depth: 0,
         };
-        if let Some(result) =
-            function_translator.statements_scoped(body, 0, Some(Vec::new()))?
-        {
+        if let Some(result) = function_translator.statements_scoped(body, 0, Some(Vec::new()))? {
             builder.ins().return_(&[result]);
         }
         builder.finalize(self.module.target_config());
@@ -734,9 +737,7 @@ fn straight_line(expression: &native_ir::Expression) -> bool {
         | Expression::FloatBinary { left, right, .. }
         | Expression::FloatCompare { left, right, .. }
         | Expression::Equality { left, right, .. }
-        | Expression::StringConcat(left, right) => {
-            straight_line(left) && straight_line(right)
-        }
+        | Expression::StringConcat(left, right) => straight_line(left) && straight_line(right),
         Expression::BoolNot(inner) => straight_line(inner),
         Expression::FieldAccess { record, .. } => straight_line(record),
         Expression::BitArray(segments) => segments.iter().all(|segment| {
@@ -779,9 +780,11 @@ fn first_reuse_site(
             | native_ir::Statement::Expression {
                 expression: value, ..
             } => reuse_site_in(value, arity, conditional),
-            native_ir::Statement::Destructure { subject, .. } => reuse_site_in(subject, arity, conditional)
-                // The tree and failure message may construct behind checks.
-                .or(Some(false)),
+            native_ir::Statement::Destructure { subject, .. } => {
+                reuse_site_in(subject, arity, conditional)
+                    // The tree and failure message may construct behind checks.
+                    .or(Some(false))
+            }
         };
         if found.is_some() {
             return found;
@@ -922,7 +925,7 @@ fn debug_rc() -> bool {
 fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
     let heap = builder.create_block();
     let done = builder.create_block();
-    let immediate = builder.ins().band_imm_u(value, 1);
+    let immediate = builder.ins().band_imm_u(value, IMMEDIATE_MASK);
     builder.ins().brif(immediate, done, &[], heap, &[]);
     builder.seal_block(heap);
 
@@ -952,7 +955,7 @@ fn emit_dec<M: Module>(
     let heap = builder.create_block();
     let dead = builder.create_block();
     let done = builder.create_block();
-    let immediate = builder.ins().band_imm_u(value, 1);
+    let immediate = builder.ins().band_imm_u(value, IMMEDIATE_MASK);
     builder.ins().brif(immediate, done, &[], heap, &[]);
     builder.seal_block(heap);
 
@@ -1074,7 +1077,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             Ok(this.builder.inst_results(call)[0])
         })?;
 
-        let function_ref = self.module.declare_func_in_func(function, self.builder.func);
+        let function_ref = self
+            .module
+            .declare_func_in_func(function, self.builder.func);
         let pointer_type = self.module.target_config().pointer_type();
         let address = self.builder.ins().func_addr(pointer_type, function_ref);
         let _ = self
@@ -1166,7 +1171,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         constructor: FuncId,
     ) -> Result<Value, String> {
         let (pointer, length) = self.constant_bytes(bytes)?;
-        let constructor_ref = self.module.declare_func_in_func(constructor, self.builder.func);
+        let constructor_ref = self
+            .module
+            .declare_func_in_func(constructor, self.builder.func);
         let call = self.builder.ins().call(constructor_ref, &[pointer, length]);
         Ok(self.builder.inst_results(call)[0])
     }
@@ -1277,7 +1284,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let call_conv = self.module.isa().default_call_conv();
         let id = self
             .module
-            .declare_function(symbol, Linkage::Import, &c_signature(call_conv, arguments.len()))
+            .declare_function(
+                symbol,
+                Linkage::Import,
+                &c_signature(call_conv, arguments.len()),
+            )
             .expect("declare runtime function");
         let function_ref = self.module.declare_func_in_func(id, self.builder.func);
         let call = self.builder.ins().call(function_ref, arguments);
@@ -1306,12 +1317,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let slot_ref = self.module.declare_data_in_func(slot, self.builder.func);
         let pointer_type = self.module.target_config().pointer_type();
         let slot_address = self.builder.ins().symbol_value(pointer_type, slot_ref);
-        let cached = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::trusted(),
-            slot_address,
-            0,
-        );
+        let cached = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), slot_address, 0);
 
         let build_block = self.builder.create_block();
         let join = self.builder.create_block();
@@ -1366,10 +1375,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             .declare_data_in_func(self.runtime.pool, self.builder.func);
         let pointer_type = self.module.target_config().pointer_type();
         let pool_address = self.builder.ins().symbol_value(pointer_type, pool_ref);
-        let pool =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::trusted(), pool_address, 0);
+        let pool = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), pool_address, 0);
         self.builder.ins().brif(pool, check, &[], miss, &[]);
         self.builder.seal_block(check);
 
@@ -1407,7 +1416,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             .ins()
             .store(MemFlagsData::trusted(), blocks, pool, blocks_offset);
         let one = self.builder.ins().iconst(types::I64, 1);
-        let _ = self.builder.ins().store(MemFlagsData::trusted(), one, head, 0);
+        let _ = self
+            .builder
+            .ins()
+            .store(MemFlagsData::trusted(), one, head, 0);
         let header_value = self.builder.ins().iconst(types::I64, header as i64);
         let _ = self
             .builder
@@ -1481,9 +1493,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     fn body_transfers(&self, body: &[native_ir::Statement]) -> bool {
         match body.last() {
             Some(native_ir::Statement::Expression {
-                expression: native_ir::Expression::Call {
-                    module, function, ..
-                },
+                expression:
+                    native_ir::Expression::Call {
+                        module, function, ..
+                    },
                 ..
             }) => self
                 .functions
@@ -1512,12 +1525,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let claim = self.builder.create_block();
         let shared = self.builder.create_block();
         let done = self.builder.create_block();
-        let count = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::trusted(),
-            candidate.subject,
-            -8,
-        );
+        let count =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), candidate.subject, -8);
         let unique = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
         self.builder.ins().brif(unique, claim, &[], shared, &[]);
         self.builder.seal_block(claim);
@@ -1535,12 +1546,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
         self.builder.switch_to_block(shared);
         let decremented = self.builder.ins().iadd_imm_s(count, -1);
-        let _ = self.builder.ins().store(
-            MemFlagsData::trusted(),
-            decremented,
-            candidate.subject,
-            -8,
-        );
+        let _ =
+            self.builder
+                .ins()
+                .store(MemFlagsData::trusted(), decremented, candidate.subject, -8);
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder.def_var(token, zero);
         self.builder.ins().jump(done, &[]);
@@ -1601,10 +1610,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             if is_final {
                 // In tail position, a final call transfers control: hand it
                 // the values still owed a release.
-                if let (
-                    Some(outer),
-                    native_ir::Statement::Expression { expression, .. },
-                ) = (&tail, statement)
+                if let (Some(outer), native_ir::Statement::Expression { expression, .. }) =
+                    (&tail, statement)
                 {
                     let mut cleanups = outer.clone();
                     for (name, slot) in &self.scope_owned[scope_start..] {
@@ -1628,9 +1635,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             // unconditionally moves at that use instead.
             let armable = match statement {
                 native_ir::Statement::Let { value, .. } => straight_line(value),
-                native_ir::Statement::Expression { expression, .. } => {
-                    straight_line(expression)
-                }
+                native_ir::Statement::Expression { expression, .. } => straight_line(expression),
                 native_ir::Statement::Destructure { .. } => false,
             };
             if armable {
@@ -1848,10 +1853,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
     fn expression(&mut self, expression: &native_ir::Expression) -> Result<Value, String> {
         match expression {
-            native_ir::Expression::Int(value) => Ok(self
-                .builder
-                .ins()
-                .iconst(types::I64, (value << 1) | 1)),
+            native_ir::Expression::Int(value) => {
+                Ok(self.builder.ins().iconst(types::I64, (value << 1) | 1))
+            }
 
             native_ir::Expression::BigInt(bytes) => {
                 self.construct_from_constant_bytes(bytes, self.runtime.bigint_from_bytes)
@@ -1883,17 +1887,16 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
             native_ir::Expression::Nil => Ok(self.builder.ins().iconst(types::I64, NIL)),
 
-            // The empty list is the tagged small integer 0; cons cells are
+            // The empty list is a special immediate word; cons cells are
             // heap records, so any pointer-valued list is non-empty.
             native_ir::Expression::EmptyList => {
-                Ok(self.builder.ins().iconst(types::I64, NIL))
+                Ok(self.builder.ins().iconst(types::I64, EMPTY_LIST))
             }
 
-            // Tagged small integers 1 and 0.
             native_ir::Expression::Bool(value) => Ok(self
                 .builder
                 .ins()
-                .iconst(types::I64, if *value { 3 } else { 1 })),
+                .iconst(types::I64, if *value { TRUE } else { FALSE })),
 
             native_ir::Expression::Variable(name) => {
                 let variable = *self
@@ -2032,8 +2035,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let arity = values.len();
                 // The header is a compile-time constant, mirroring the
                 // runtime allocator's formula.
-                let header = native_runtime::record_header(*tag, arity as u32)
-                    | ((display as u64) << 48);
+                let header =
+                    native_runtime::record_header(*tag, arity as u32) | ((display as u64) << 48);
                 let slow = |this: &mut Self| {
                     let tag = this.builder.ins().iconst(types::I64, *tag as i64);
                     let arity = this.builder.ins().iconst(types::I64, arity as i64);
@@ -2076,8 +2079,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         self.builder.seal_block(fresh);
 
                         self.builder.switch_to_block(reused);
-                        let header_value =
-                            self.builder.ins().iconst(types::I64, header as i64);
+                        let header_value = self.builder.ins().iconst(types::I64, header as i64);
                         let _ = self.builder.ins().store(
                             MemFlagsData::trusted(),
                             header_value,
@@ -2124,8 +2126,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 // Captures: the lambda's free variables that are in scope
                 // here. A missed one fails loudly when the lifted body is
                 // defined; extras would be harmless.
-                let bound: std::collections::HashSet<String> =
-                    parameters.iter().cloned().collect();
+                let bound: std::collections::HashSet<String> = parameters.iter().cloned().collect();
                 let captures: Vec<String> = native_ir::free_variables(body, &bound)
                     .into_iter()
                     .filter(|name| self.environment.contains_key(name))
@@ -2199,9 +2200,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .builder
                     .ins()
                     .load(types::I64, MemFlagsData::trusted(), callee, 8);
-                let signature = self
-                    .builder
-                    .import_signature(gleam_signature(values.len()));
+                let signature = self.builder.import_signature(gleam_signature(values.len()));
                 let call = self.builder.ins().call_indirect(signature, code, &values);
                 let result = self.builder.inst_results(call)[0];
                 // The callee owns the closure and the arguments.
@@ -2303,38 +2302,24 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::Echo {
-                kind,
                 value,
                 message,
                 line,
             } => {
-                let kind = self.builder.ins().iconst(
-                    types::I64,
-                    match kind {
-                        native_ir::EchoKind::Structural => 0,
-                        native_ir::EchoKind::Int => 1,
-                        native_ir::EchoKind::Float => 2,
-                        native_ir::EchoKind::String => 3,
-                        native_ir::EchoKind::Bool => 4,
-                        native_ir::EchoKind::Nil => 5,
-                        native_ir::EchoKind::List => 6,
-                    },
-                );
                 let value = self.expression(value)?;
                 let (message, message_owned) = match message {
                     Some(message) => (self.expression(message)?, true),
                     None => (self.builder.ins().iconst(types::I64, 0), false),
                 };
                 let src_path = self.src_path.to_string();
-                let (module_pointer, module_length) =
-                    self.constant_bytes(src_path.as_bytes())?;
+                let (module_pointer, module_length) = self.constant_bytes(src_path.as_bytes())?;
                 let line = self.builder.ins().iconst(types::I64, *line as i64);
                 let echo_ref = self
                     .module
                     .declare_func_in_func(self.runtime.echo, self.builder.func);
                 let call = self.builder.ins().call(
                     echo_ref,
-                    &[kind, value, message, module_pointer, module_length, line],
+                    &[value, message, module_pointer, module_length, line],
                 );
                 let result = self.builder.inst_results(call)[0];
                 if message_owned {
@@ -2529,8 +2514,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     // the zero-divisor case selected in.
                     native_ir::FloatOperator::Divide => {
                         let zero = self.builder.ins().f64const(0.0);
-                        let divisor_is_zero =
-                            self.builder.ins().fcmp(FloatCC::Equal, right, zero);
+                        let divisor_is_zero = self.builder.ins().fcmp(FloatCC::Equal, right, zero);
                         let quotient = self.builder.ins().fdiv(left, right);
                         self.builder.ins().select(divisor_is_zero, zero, quotient)
                     }
@@ -2550,9 +2534,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     native_ir::CompareOperator::LessThan => FloatCC::LessThan,
                     native_ir::CompareOperator::LessThanOrEqual => FloatCC::LessThanOrEqual,
                     native_ir::CompareOperator::GreaterThan => FloatCC::GreaterThan,
-                    native_ir::CompareOperator::GreaterThanOrEqual => {
-                        FloatCC::GreaterThanOrEqual
-                    }
+                    native_ir::CompareOperator::GreaterThanOrEqual => FloatCC::GreaterThanOrEqual,
                 };
                 let (left_boxed, left_borrowed) = self.expression_read(left)?;
                 let (right_boxed, right_borrowed) = self.expression_read(right)?;
@@ -2709,8 +2691,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             && !debug_rc()
                             && self.reuse_token.is_none()
                             && let Some(chain) = &mut tail
-                            && first_reuse_site(body, candidate.fields.len(), false)
-                                == Some(true)
+                            && first_reuse_site(body, candidate.fields.len(), false) == Some(true)
                             && self.body_transfers(body)
                             && let Some(position) = chain.iter().rposition(|(name, value)| {
                                 name.is_none() && *value == candidate.subject
@@ -3006,10 +2987,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             );
                             // The display id in the header's top bits is not
                             // semantic.
-                            let actual = self.builder.ins().band_imm_u(
-                                actual,
-                                native_runtime::HEADER_SEMANTIC_MASK as i64,
-                            );
+                            let actual = self
+                                .builder
+                                .ins()
+                                .band_imm_u(actual, native_runtime::HEADER_SEMANTIC_MASK as i64);
                             let expected = self.builder.ins().iconst(
                                 types::I64,
                                 native_runtime::record_header(*tag, fields.len() as u32) as i64,
@@ -3017,13 +2998,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             self.builder.ins().icmp(IntCC::Equal, actual, expected)
                         }
                         // Tuples always match: the type system guarantees it.
-                        native_ir::Check::Always { .. } => {
-                            self.builder.ins().iconst(types::I64, 1)
-                        }
+                        native_ir::Check::Always { .. } => self.builder.ins().iconst(types::I64, 1),
                         // Any list value that is not the empty immediate is
                         // a cons cell.
                         native_ir::Check::NonEmptyList { .. } => {
-                            self.builder.ins().icmp_imm_s(IntCC::NotEqual, subject, NIL)
+                            self.builder
+                                .ins()
+                                .icmp_imm_s(IntCC::NotEqual, subject, EMPTY_LIST)
                         }
                         check => self.check(subject, check)?,
                     };
@@ -3113,8 +3094,19 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 let expected = self.builder.ins().iconst(types::I64, (value << 1) | 1);
                 Ok(self.builder.ins().icmp(IntCC::Equal, subject, expected))
             }
-            native_ir::Check::Immediate(word) => {
-                let expected = self.builder.ins().iconst(types::I64, *word);
+            native_ir::Check::Bool(value) => {
+                let expected = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, if *value { TRUE } else { FALSE });
+                Ok(self.builder.ins().icmp(IntCC::Equal, subject, expected))
+            }
+            native_ir::Check::Nil => {
+                let expected = self.builder.ins().iconst(types::I64, NIL);
+                Ok(self.builder.ins().icmp(IntCC::Equal, subject, expected))
+            }
+            native_ir::Check::EmptyList => {
+                let expected = self.builder.ins().iconst(types::I64, EMPTY_LIST);
                 Ok(self.builder.ins().icmp(IntCC::Equal, subject, expected))
             }
             native_ir::Check::BigInt(bytes) => {
@@ -3158,9 +3150,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     let _ = self.environment.insert(read.name.clone(), variable);
                 }
                 match test {
-                    native_ir::BitsTest::AlwaysTrue => {
-                        Ok(self.builder.ins().iconst(types::I64, 1))
-                    }
+                    native_ir::BitsTest::AlwaysTrue => Ok(self.builder.ins().iconst(types::I64, 1)),
                     native_ir::BitsTest::NonNegative { value } => {
                         let value = self.expression(value)?;
                         let zero = self.builder.ins().iconst(types::I64, 1);
@@ -3188,8 +3178,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     } => {
                         let offset = self.expression(offset)?;
                         let (pointer, _byte_length) = self.constant_bytes(bytes)?;
-                        let bit_length =
-                            self.builder.ins().iconst(types::I64, *bit_length as i64);
+                        let bit_length = self.builder.ins().iconst(types::I64, *bit_length as i64);
                         let test_ref = self.module.declare_func_in_func(
                             self.runtime.bitarray_bytes_test,
                             self.builder.func,
@@ -3237,8 +3226,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
             }
             native_ir::Check::String(value) => {
-                let literal = self
-                    .construct_from_constant_bytes(value.as_bytes(), self.runtime.string_from_bytes)?;
+                let literal = self.construct_from_constant_bytes(
+                    value.as_bytes(),
+                    self.runtime.string_from_bytes,
+                )?;
                 let eq_ref = self
                     .module
                     .declare_func_in_func(self.runtime.string_eq, self.builder.func);
@@ -3279,11 +3270,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         Ok(boxed)
     }
 
-    /// Turns an i8 comparison flag into a tagged boolean (1 or 3).
+    /// Turns an i8 comparison flag into a boolean word (`FALSE` or `TRUE`
+    /// = `FALSE | 2`).
     fn tag_boolean_flag(&mut self, flag: Value) -> Value {
         let extended = self.builder.ins().uextend(types::I64, flag);
         let shifted = self.builder.ins().ishl_imm_u(extended, 1);
-        self.builder.ins().bor_imm_u(shifted, 1)
+        self.builder.ins().bor_imm_u(shifted, FALSE)
     }
 
     /// Integer ordering comparison on tagged values. For two small integers
@@ -3350,7 +3342,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     native_ir::IntOperator::Divide => self.runtime.int_div,
                     _ => self.runtime.int_rem,
                 };
-                let function_ref = self.module.declare_func_in_func(function, self.builder.func);
+                let function_ref = self
+                    .module
+                    .declare_func_in_func(function, self.builder.func);
                 let call = self.builder.ins().call(function_ref, &[left, right]);
                 return Ok(self.builder.inst_results(call)[0]);
             }

@@ -46,7 +46,7 @@ fn bool_value(condition: bool) -> u64 {
 /// Walks a Gleam list, yielding each element (borrowed).
 fn list_elements(mut list: u64) -> Vec<u64> {
     let mut elements = Vec::new();
-    while list & 1 == 0 {
+    while !is_immediate(list) {
         elements.push(record_field(list, 0));
         list = record_field(list, 1);
     }
@@ -484,7 +484,9 @@ pub extern "C" fn gleam_native_string_char_slice(string: u64, from: u64, length:
     let Some(start) = boundaries.nth(from) else {
         return box_string("");
     };
-    let end = boundaries.nth(length.wrapping_sub(1)).unwrap_or(subject.len());
+    let end = boundaries
+        .nth(length.wrapping_sub(1))
+        .unwrap_or(subject.len());
     box_string_slice(string, start, end - start)
 }
 
@@ -497,7 +499,7 @@ pub extern "C" fn gleam_native_string_char_slice(string: u64, from: u64, length:
 /// Flattens a string tree into a single string.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_tree_to_string(tree: u64) -> u64 {
-    if tree & 1 == 0 && header_kind(heap_header(tree)) == KIND_STRING {
+    if !is_immediate(tree) && header_kind(heap_header(tree)) == KIND_STRING {
         return gleam_native_inc(tree);
     }
     box_string(tree_to_string(tree))
@@ -509,7 +511,7 @@ pub extern "C" fn gleam_native_tree_byte_size(tree: u64) -> u64 {
     let mut size = 0i64;
     let mut worklist = vec![tree];
     while let Some(value) = worklist.pop() {
-        if value & 1 == 1 {
+        if is_immediate(value) {
             continue;
         }
         let header = heap_header(value);
@@ -639,9 +641,7 @@ pub extern "C" fn gleam_native_bitarray_unsafe_to_string(array: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bitarray_is_utf8(array: u64) -> u64 {
     let payload = bitarray_value(array);
-    bool_value(
-        payload.bits.is_multiple_of(8) && std::str::from_utf8(&payload.bytes).is_ok(),
-    )
+    bool_value(payload.bits.is_multiple_of(8) && std::str::from_utf8(&payload.bytes).is_ok())
 }
 
 /// Joins a list of bit arrays into one.
@@ -860,9 +860,7 @@ pub extern "C" fn gleam_native_dict_to_list(dict: u64) -> u64 {
     make_list(
         pairs
             .into_iter()
-            .map(|(key, value)| {
-                make_tuple2(gleam_native_inc(key), gleam_native_inc(value))
-            })
+            .map(|(key, value)| make_tuple2(gleam_native_inc(key), gleam_native_inc(value)))
             .collect(),
     )
 }
@@ -922,7 +920,12 @@ pub extern "C" fn gleam_native_list_sort(list: u64, compare: u64) -> u64 {
         std::mem::swap(&mut current, &mut scratch);
         width *= 2;
     }
-    make_list(current.into_iter().map(|element| gleam_native_inc(element)).collect())
+    make_list(
+        current
+            .into_iter()
+            .map(|element| gleam_native_inc(element))
+            .collect(),
+    )
 }
 
 /// Folds over the entries sorted by key — the same deterministic order
@@ -952,10 +955,7 @@ pub extern "C" fn gleam_native_dict_fold(fun: u64, initial: u64, dict: u64) -> u
 pub extern "C" fn gleam_native_dict_map_values(fun: u64, dict: u64) -> u64 {
     let mut map = DictMap::default();
     for (key, value) in dict_payload(dict).map.iter() {
-        let mapped = call_closure(
-            fun,
-            &[gleam_native_inc(key.0), gleam_native_inc(value.0)],
-        );
+        let mapped = call_closure(fun, &[gleam_native_inc(key.0), gleam_native_inc(value.0)]);
         let _ = map.insert(DictKey(gleam_native_inc(key.0)), DictEntry(mapped));
     }
     box_dict(DictPayload { map })
@@ -971,7 +971,7 @@ pub extern "C" fn gleam_native_dict_group(key_fun: u64, list: u64) -> u64 {
         let key = call_closure(key_fun, &[gleam_native_inc(element)]);
         let existing = match map.get(&DictKeyRef(key)) {
             Some(entry) => gleam_native_inc(entry.0),
-            None => NIL,
+            None => EMPTY_LIST,
         };
         let group = cons(gleam_native_inc(element), existing);
         let _ = map.insert(DictKey(key), DictEntry(group));
@@ -1022,13 +1022,18 @@ pub extern "C" fn gleam_native_dict_transient_delete(key: u64, transient: u64) -
 // ---------------------------------------------------------------------------
 // gleam/dynamic and gleam/dynamic/decode
 
-/// Names a dynamic value's type as well as the representation allows.
-/// Booleans and `Nil` share the small-integer representation with `Int`,
-/// so they classify as `Int`.
+/// Names a dynamic value's type.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_classify(value: u64) -> u64 {
-    let name = if value & 1 == 1 {
+    let name = if is_small_int(value) {
         "Int"
+    } else if is_immediate(value) {
+        match value {
+            TRUE | FALSE => "Bool",
+            NIL => "Nil",
+            EMPTY_LIST => "List",
+            _ => "Unknown",
+        }
     } else {
         let header = heap_header(value);
         match header_kind(header) {
@@ -1065,10 +1070,10 @@ pub extern "C" fn gleam_native_list_to_tuple(list: u64) -> u64 {
 }
 
 /// `Ok(value)` when the dynamic value is an integer, `Error(0)` otherwise.
-/// Booleans and `Nil` share the integer representation and so also decode.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dynamic_int(value: u64) -> u64 {
-    if value & 1 == 1 || header_kind(heap_header(value)) == KIND_BIGINT {
+    if is_small_int(value) || !is_immediate(value) && header_kind(heap_header(value)) == KIND_BIGINT
+    {
         make_ok(gleam_native_inc(value))
     } else {
         make_error(tag_small_int(0))
@@ -1078,7 +1083,7 @@ pub extern "C" fn gleam_native_dynamic_int(value: u64) -> u64 {
 /// `Ok(value)` when the dynamic value is a float, `Error(0.0)` otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dynamic_float(value: u64) -> u64 {
-    if value & 1 == 0 && header_kind(heap_header(value)) == KIND_FLOAT {
+    if !is_immediate(value) && header_kind(heap_header(value)) == KIND_FLOAT {
         make_ok(gleam_native_inc(value))
     } else {
         make_error(box_float(0.0))
@@ -1089,7 +1094,7 @@ pub extern "C" fn gleam_native_dynamic_float(value: u64) -> u64 {
 /// UTF-8 bytes become the array), `Error(<<>>)` otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dynamic_bit_array(value: u64) -> u64 {
-    if value & 1 == 1 {
+    if is_immediate(value) {
         return make_error(box_bitarray(BitArrayPayload {
             bits: 0,
             bytes: Vec::new(),
@@ -1106,15 +1111,13 @@ pub extern "C" fn gleam_native_dynamic_bit_array(value: u64) -> u64 {
 }
 
 /// `Ok(elements)` when the dynamic value is a list (or a tuple, whose
-/// fields become the elements), `Error(Nil)` otherwise. The empty list
-/// shares the small-integer representation, so integer 0 also decodes as
-/// the empty list.
+/// fields become the elements), `Error(Nil)` otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dynamic_list(value: u64) -> u64 {
-    if value == NIL {
-        return make_ok(NIL);
+    if value == EMPTY_LIST {
+        return make_ok(EMPTY_LIST);
     }
-    if value & 1 == 1 {
+    if is_immediate(value) {
         return make_error(NIL);
     }
     let header = heap_header(value);
@@ -1136,7 +1139,7 @@ pub extern "C" fn gleam_native_dynamic_list(value: u64) -> u64 {
 /// `Ok(dict)` when the dynamic value is a dict, `Error(Nil)` otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_decode_dict(value: u64) -> u64 {
-    if value & 1 == 0 && header_kind(heap_header(value)) == KIND_DICT {
+    if !is_immediate(value) && header_kind(heap_header(value)) == KIND_DICT {
         make_ok(gleam_native_inc(value))
     } else {
         make_error(NIL)
@@ -1159,8 +1162,8 @@ fn make_none() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_bare_index(data: u64, key: u64) -> u64 {
     let key_is_int =
-        key & 1 == 1 || header_kind(heap_header(key)) == KIND_BIGINT;
-    if data & 1 == 0 {
+        is_small_int(key) || !is_immediate(key) && header_kind(heap_header(key)) == KIND_BIGINT;
+    if !is_immediate(data) {
         let header = heap_header(data);
         match header_kind(header) {
             KIND_DICT => {
@@ -1171,14 +1174,12 @@ pub extern "C" fn gleam_native_bare_index(data: u64, key: u64) -> u64 {
             }
             KIND_RECORD if record_display(header) == DISPLAY_LIST && key_is_int => {
                 let index = (key as i64) >> 1;
-                if key & 1 == 1 && (0..8).contains(&index) {
+                if is_small_int(key) && (0..8).contains(&index) {
                     let mut current = data;
                     let mut position = 0;
-                    while current & 1 == 0 {
+                    while !is_immediate(current) {
                         if position == index {
-                            return make_ok(make_some(gleam_native_inc(
-                                record_field(current, 0),
-                            )));
+                            return make_ok(make_some(gleam_native_inc(record_field(current, 0))));
                         }
                         position += 1;
                         current = record_field(current, 1);
@@ -1189,7 +1190,7 @@ pub extern "C" fn gleam_native_bare_index(data: u64, key: u64) -> u64 {
             KIND_RECORD if key_is_int => {
                 let arity = record_arity(header) as i64;
                 let index = (key as i64) >> 1;
-                if key & 1 == 1 && (0..arity).contains(&index) {
+                if is_small_int(key) && (0..arity).contains(&index) {
                     return make_ok(make_some(gleam_native_inc(record_field(
                         data,
                         index as u32,
@@ -1250,7 +1251,10 @@ pub extern "C" fn gleam_native_percent_encode(string: u64) -> u64 {
     let mut encoded = String::new();
     for byte in str_value(string).bytes() {
         let keep = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'!' | b'$' | b'\'' | b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'_' | b'~');
+            || matches!(
+                byte,
+                b'!' | b'$' | b'\'' | b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'_' | b'~'
+            );
         if keep {
             encoded.push(byte as char);
         } else {
@@ -1315,7 +1319,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_println_error",
             gleam_native_println_error as *const u8,
         ),
-        ("gleam_native_int_parse", gleam_native_int_parse as *const u8),
+        (
+            "gleam_native_int_parse",
+            gleam_native_int_parse as *const u8,
+        ),
         (
             "gleam_native_int_base_parse",
             gleam_native_int_base_parse as *const u8,
@@ -1384,7 +1391,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             "gleam_native_float_random",
             gleam_native_float_random as *const u8,
         ),
-        ("gleam_native_float_log", gleam_native_float_log as *const u8),
+        (
+            "gleam_native_float_log",
+            gleam_native_float_log as *const u8,
+        ),
         (
             "gleam_native_float_exponential",
             gleam_native_float_exponential as *const u8,
@@ -1510,14 +1520,26 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_bitarray_to_int_and_size as *const u8,
         ),
         ("gleam_native_dict_new", gleam_native_dict_new as *const u8),
-        ("gleam_native_dict_fold", gleam_native_dict_fold as *const u8),
+        (
+            "gleam_native_dict_fold",
+            gleam_native_dict_fold as *const u8,
+        ),
         (
             "gleam_native_dict_map_values",
             gleam_native_dict_map_values as *const u8,
         ),
-        ("gleam_native_dict_group", gleam_native_dict_group as *const u8),
-        ("gleam_native_list_sort", gleam_native_list_sort as *const u8),
-        ("gleam_native_dict_size", gleam_native_dict_size as *const u8),
+        (
+            "gleam_native_dict_group",
+            gleam_native_dict_group as *const u8,
+        ),
+        (
+            "gleam_native_list_sort",
+            gleam_native_list_sort as *const u8,
+        ),
+        (
+            "gleam_native_dict_size",
+            gleam_native_dict_size as *const u8,
+        ),
         ("gleam_native_dict_get", gleam_native_dict_get as *const u8),
         (
             "gleam_native_dict_has_key",

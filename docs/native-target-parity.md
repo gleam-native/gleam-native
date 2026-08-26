@@ -23,8 +23,12 @@ to the IR in the `native-ir` crate, serialized per module into
 Cranelift IR by the `native-generation` crate against the `native-runtime`
 crate — either JIT-executed in process (`gleam run`) or compiled to an
 object file and linked with the `native-runtime-static` library into a
-standalone executable (`gleam export native`). Values are tagged 64-bit words (low bit 1 = 63-bit
-small integer, low bit 0 = 8-byte-aligned heap pointer). Every heap object
+standalone executable (`gleam export native`). Values are tagged 64-bit
+words: low bit 1 = 63-bit small integer, low three bits 000 = 8-byte-aligned
+heap pointer, and the remaining low-bit patterns encode the special
+immediate constants `Nil` (2), `False` (4), `True` (6), and the empty
+list (10), each distinct so runtime-polymorphic operations can tell them
+apart from integers (no value encodes as 0). Every heap object
 starts with a header word (kind, and for records the variant tag and field
 count), enabling polymorphic deep equality and `echo`, and carries a
 reference count in the word before the pointer. Gleam functions use
@@ -40,8 +44,8 @@ platform C convention.
 - ✅ Float literals (boxed f64 heap objects)
 - ✅ String literals (immutable UTF-8 heap strings built from constant data;
   escape sequences processed at lowering time; `println` runtime external)
-- ✅ `True` / `False` (tagged small integers 1 and 0; `print_bool` runtime
-  external)
+- ✅ `True` / `False` (distinct immediate words, `True` = `False | 2`;
+  `print_bool` runtime external)
 - ✅ Number literal notations already accepted by the parser: `0x`, `0o`,
   `0b`, underscores, scientific notation for floats (parsed values arrive
   pre-decoded in the typed AST)
@@ -81,10 +85,9 @@ platform C convention.
   module/function/line metadata, exit code 1)
 - ✅ `case` expressions — lowered from the `CompiledCase` decision tree as
   planned: multi-subject matches, literal checks (small and big integers,
-  floats, strings), `Bool`/`Nil` variant checks (with the
-  variant-index-to-tagged-word mapping: `True` is variant 0 but encodes
-  as 1), variable and discard patterns, pattern bindings, alternative
-  patterns (`a | b`)
+  floats, strings), `Bool`/`Nil` variant checks (word comparisons against
+  the immediate constants), variable and discard patterns, pattern
+  bindings, alternative patterns (`a | b`)
 - ✅ Destructuring pattern kinds: constructors with fields, tuples, lists
   (`[x, ..rest]`, nested patterns), string prefixes (`"pre" <> rest`,
   including `as` bindings, in `case` and `let assert`), and bit arrays —
@@ -135,7 +138,7 @@ platform C convention.
 
 - ✅ Tuples (records with tag 0; construction, positional access
   `#(1, 2).0`, destructuring, tuple index in guards)
-- ✅ Lists (empty list is a tagged immediate, cons cells are two-field
+- ✅ Lists (empty list is its own immediate word, cons cells are two-field
   records; literals, spread construction `[x, ..rest]`, and patterns
   including nested ones like `[_, _]`)
 - ✅ Custom types: heap records (variant tag word + field words),
@@ -189,15 +192,14 @@ platform C convention.
   (non-empty all-printable-ASCII integer lists as
   `charlist.from_string("...")`), tuples as `#(...)`, `Ok`/`Error` by name,
   strings with the shared escape rules, and functions as
-  `//fn(a, b) { ... }` from the arity stored in the closure header. Scalars
-  and top-level empty lists use the static type at the echo site. One
-  representational limit remains: `Bool`, `Nil`, and the empty list are
-  bare tagged integers, so *nested* inside structures they print as their
-  integer encoding (tracked by `echo_tuple`'s native-specific conformance
-  snapshot)
+  `//fn(a, b) { ... }` from the arity stored in the closure header.
+  Rendering is purely structural: `Bool`, `Nil`, and the empty list have
+  distinct immediate words, so every value — nested or top-level —
+  identifies itself at run time with no static-type hints needed
+  (`echo_tuple` shares the all-target conformance snapshot)
 - ✅ Value formatting: the runtime's `inspect` renders constructor names
   and backs the `gleam/string.inspect` external in the standard library
-  fork (with the nested `Bool`/`Nil` representation limit noted above)
+  fork
 - ✅ Reference counting: a count word before every heap object, with
   mechanical local ownership rules inserted during code generation
   (expressions yield owned references, variable reads share, container
@@ -338,12 +340,11 @@ platform C convention.
   in the `native-runtime-stdlib` crate, and everything else falls back to
   the pure Gleam bodies — `list.map`/`fold` deliberately stay in Gleam,
   where the Perceus-compiled loops beat native implementations. The full
-  suite passes on native (1487 tests, also validated under
-  `GLEAM_DEBUG_RC`), with the Erlang and JavaScript suites unaffected.
-  Roughly 50 test functions stay target-guarded because on native
-  `True`/`False`/`Nil` share an integer representation, so
-  `string.inspect` and `dynamic.classify` cannot distinguish them — the
-  one remaining observable semantic divergence
+  suite passes on native (1514 tests, also validated under
+  `GLEAM_DEBUG_RC`), with the Erlang and JavaScript suites unaffected —
+  including the `string.inspect`, `dynamic.classify`, and decode tests
+  that were target-guarded before `True`/`False`/`Nil`/`[]` received
+  distinct immediate encodings
 - ❌ Upstreaming or publishing the stdlib fork — today it only works as a
   local path dependency on this compiler fork
 - ❌ The prelude types' runtime contract (`Result`, `Bool`, `Order`, …)

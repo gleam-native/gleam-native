@@ -185,9 +185,9 @@ macro_rules! assert_output {
         }
     };
 
-    // For cases every target but native runs: the native target cannot
-    // build the case (it needs the standard library) or its output is
-    // documented as divergent under a `Target::Native` row instead.
+    // For cases every target but native runs: conformance cases test the
+    // compiler and must not depend on the standard library, so cases that
+    // need it are excluded from the native row by design.
     (no_native: $project_name: expr) => {
         let snapshot_name = snapshot_name(None, None, $project_name);
         insta::allow_duplicates! {
@@ -367,10 +367,7 @@ fn echo_string() {
 
 #[test]
 fn echo_tuple() {
-    // Native prints booleans nested in structures as their integer
-    // encoding (they are bare tagged words), so it has its own snapshot.
-    assert_output!(no_native: "echo_tuple");
-    assert_output!(Target::Native, "echo_tuple");
+    assert_output!("echo_tuple");
 }
 
 #[test]

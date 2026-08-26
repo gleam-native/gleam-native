@@ -124,9 +124,7 @@ impl Lowerer<'_> {
     }
 
     fn statement(&self, statement: &TypedStatement) -> Result<native_ir::Statement, Error> {
-        let line = self
-            .line_numbers
-            .line_number(statement.location().start);
+        let line = self.line_numbers.line_number(statement.location().start);
         match statement {
             Statement::Expression(expression) => Ok(native_ir::Statement::Expression {
                 expression: self.expression(expression)?,
@@ -195,25 +193,25 @@ impl Lowerer<'_> {
                 };
                 Ok(native_ir::Statement::Expression {
                     expression: native_ir::Expression::Case {
-                    subjects: vec![self.expression(&assert.value)?],
-                    subject_ids: vec![0],
-                    tree: native_ir::Decision::Switch {
-                        var: 0,
-                        choices: vec![(
-                            native_ir::Check::Immediate(tag_small_int(1)),
-                            native_ir::Decision::Run {
+                        subjects: vec![self.expression(&assert.value)?],
+                        subject_ids: vec![0],
+                        tree: native_ir::Decision::Switch {
+                            var: 0,
+                            choices: vec![(
+                                native_ir::Check::Bool(true),
+                                native_ir::Decision::Run {
+                                    bindings: vec![],
+                                    body: vec![native_ir::Statement::expression(
+                                        native_ir::Expression::Nil,
+                                    )],
+                                },
+                            )],
+                            fallback: Box::new(native_ir::Decision::Run {
                                 bindings: vec![],
-                                body: vec![native_ir::Statement::expression(
-                                    native_ir::Expression::Nil,
-                                )],
-                            },
-                        )],
-                        fallback: Box::new(native_ir::Decision::Run {
-                            bindings: vec![],
-                            body: vec![native_ir::Statement::expression(panic)],
-                        }),
-                        fallback_fields: vec![],
-                    },
+                                body: vec![native_ir::Statement::expression(panic)],
+                            }),
+                            fallback_fields: vec![],
+                        },
                     },
                     line,
                 })
@@ -265,9 +263,7 @@ impl Lowerer<'_> {
                     function: name.clone().into(),
                     arity: *arity as u32,
                 }),
-                ValueConstructorVariant::ModuleConstant { literal, .. } => {
-                    self.constant(literal)
-                }
+                ValueConstructorVariant::ModuleConstant { literal, .. } => self.constant(literal),
             },
 
             // Module-qualified access, `module.name`: the same cases as
@@ -302,9 +298,7 @@ impl Lowerer<'_> {
                 )),
             },
 
-            TypedExpr::Call {
-                fun, arguments, ..
-            } => {
+            TypedExpr::Call { fun, arguments, .. } => {
                 let arguments = arguments
                     .iter()
                     .map(|argument| self.expression(&argument.value))
@@ -396,7 +390,7 @@ impl Lowerer<'_> {
                 ..
             } => {
                 let mut statements = Vec::with_capacity(assignments.len() + 2);
-                let mut latest: Option<(EcoString, std::sync::Arc<Type>)> = None;
+                let mut latest: Option<EcoString> = None;
                 let all_assignments =
                     std::iter::once(first_value).chain(assignments.iter().map(|(a, _)| a));
                 for assignment in all_assignments {
@@ -407,12 +401,11 @@ impl Lowerer<'_> {
                         ..
                     } = assignment.value.as_ref()
                     {
-                        let (name, type_) = latest
+                        let name = latest
                             .clone()
                             .expect("echo with no previous step in a pipe");
                         statements.push(native_ir::Statement::expression(self.echo(
                             native_ir::Expression::Variable(name.into()),
-                            &type_,
                             message.as_deref(),
                             location,
                         )?));
@@ -420,11 +413,9 @@ impl Lowerer<'_> {
                         statements.push(native_ir::Statement::Let {
                             name: assignment.name.clone().into(),
                             value: self.expression(&assignment.value)?,
-                            line: self
-                                .line_numbers
-                                .line_number(assignment.location.start),
+                            line: self.line_numbers.line_number(assignment.location.start),
                         });
-                        latest = Some((assignment.name.clone(), assignment.value.type_()));
+                        latest = Some(assignment.name.clone());
                     }
                 }
                 let finally = if let TypedExpr::Echo {
@@ -434,10 +425,9 @@ impl Lowerer<'_> {
                     ..
                 } = finally.as_ref()
                 {
-                    let (name, type_) = latest.expect("echo with no previous step in a pipe");
+                    let name = latest.expect("echo with no previous step in a pipe");
                     self.echo(
                         native_ir::Expression::Variable(name.into()),
-                        &type_,
                         message.as_deref(),
                         location,
                     )?
@@ -617,9 +607,8 @@ impl Lowerer<'_> {
                 let value = echo_expression
                     .as_ref()
                     .expect("bare echo outside a pipeline");
-                let type_ = value.type_();
                 let value = self.expression(value)?;
-                self.echo(value, &type_, message.as_deref(), location)
+                self.echo(value, message.as_deref(), location)
             }
 
             TypedExpr::Panic {
@@ -724,11 +713,7 @@ impl Lowerer<'_> {
             BinOp::MultFloat => Ok(float_binary(FloatOperator::Multiply, left, right)),
             BinOp::DivFloat => Ok(float_binary(FloatOperator::Divide, left, right)),
             BinOp::LtFloat => Ok(float_compare(CompareOperator::LessThan, left, right)),
-            BinOp::LtEqFloat => Ok(float_compare(
-                CompareOperator::LessThanOrEqual,
-                left,
-                right,
-            )),
+            BinOp::LtEqFloat => Ok(float_compare(CompareOperator::LessThanOrEqual, left, right)),
             BinOp::GtFloat => Ok(float_compare(CompareOperator::GreaterThan, left, right)),
             BinOp::GtEqFloat => Ok(float_compare(
                 CompareOperator::GreaterThanOrEqual,
@@ -903,12 +888,7 @@ impl Lowerer<'_> {
                 // A constructor with fields referenced without arguments is
                 // the constructor as a function value, not a record.
                 let Some(arguments) = arguments.as_deref() else {
-                    return Ok(Self::constructor_value(
-                        module,
-                        name,
-                        arity,
-                        tag as u16,
-                    ));
+                    return Ok(Self::constructor_value(module, name, arity, tag as u16));
                 };
                 let arguments = arguments
                     .iter()
@@ -994,11 +974,10 @@ impl Lowerer<'_> {
             Constant::BitArray { segments, .. } => {
                 let mut lowered = Vec::with_capacity(segments.len());
                 for segment in segments {
-                    let kind = self.bit_segment_kind_of(
-                        &segment.options,
-                        &segment.type_,
-                        &mut |value| self.constant(value),
-                    )?;
+                    let kind =
+                        self.bit_segment_kind_of(&segment.options, &segment.type_, &mut |value| {
+                            self.constant(value)
+                        })?;
                     lowered.push(native_ir::BitSegment {
                         value: Box::new(self.constant(&segment.value)?),
                         kind,
@@ -1051,12 +1030,8 @@ impl Lowerer<'_> {
                 BitArrayOption::Native { .. } => endian = native_ir::Endian::Native,
                 BitArrayOption::Float { .. } => is_float = true,
                 BitArrayOption::Utf8 { .. } => encoding = Some(native_ir::StringEncoding::Utf8),
-                BitArrayOption::Utf16 { .. } => {
-                    encoding = Some(native_ir::StringEncoding::Utf16)
-                }
-                BitArrayOption::Utf32 { .. } => {
-                    encoding = Some(native_ir::StringEncoding::Utf32)
-                }
+                BitArrayOption::Utf16 { .. } => encoding = Some(native_ir::StringEncoding::Utf16),
+                BitArrayOption::Utf32 { .. } => encoding = Some(native_ir::StringEncoding::Utf32),
                 BitArrayOption::Utf8Codepoint { .. } => {
                     encoding = Some(native_ir::StringEncoding::Utf8);
                     is_codepoint = true;
@@ -1095,10 +1070,7 @@ impl Lowerer<'_> {
             });
         }
         if is_float || type_.is_float() {
-            let bits = Self::multiply(
-                size.unwrap_or(native_ir::Expression::Int(64)),
-                unit as u64,
-            );
+            let bits = Self::multiply(size.unwrap_or(native_ir::Expression::Int(64)), unit as u64);
             return Ok(native_ir::BitSegmentKind::Float {
                 bits: Box::new(bits),
                 endian,
@@ -1107,10 +1079,7 @@ impl Lowerer<'_> {
         if !type_.is_int() {
             return Err(self.unsupported("this bit array segment"));
         }
-        let bits = Self::multiply(
-            size.unwrap_or(native_ir::Expression::Int(8)),
-            unit as u64,
-        );
+        let bits = Self::multiply(size.unwrap_or(native_ir::Expression::Int(8)), unit as u64);
         Ok(native_ir::BitSegmentKind::Int {
             bits: Box::new(bits),
             endian,
@@ -1175,10 +1144,7 @@ impl Lowerer<'_> {
         let mut variables: Vec<_> = offset.variables.iter().collect();
         variables.sort_by(|(one, _), (other, _)| one.name().cmp(other.name()));
         for (variable, times) in variables {
-            let term = Self::multiply(
-                Self::variable_usage_expression(variable),
-                *times as u64,
-            );
+            let term = Self::multiply(Self::variable_usage_expression(variable), *times as u64);
             sum = Self::add(sum, term);
         }
         for calculation in offset.calculations.iter() {
@@ -1284,11 +1250,9 @@ impl Lowerer<'_> {
                 bits: Box::new(self.offset_expression(&size_test.size)?),
                 exact: size_test.operator == SizeOperator::Equal,
             },
-            BitArrayTest::CatchAllIsBytes { size_so_far } => {
-                native_ir::BitsTest::RestIsBytes {
-                    offset: Box::new(self.offset_expression(size_so_far)?),
-                }
-            }
+            BitArrayTest::CatchAllIsBytes { size_so_far } => native_ir::BitsTest::RestIsBytes {
+                offset: Box::new(self.offset_expression(size_so_far)?),
+            },
             BitArrayTest::ReadSizeIsNotNegative { size } => {
                 let value = self
                     .read_size_expression(size)?
@@ -1308,9 +1272,7 @@ impl Lowerer<'_> {
                         // Pack MSB-first, zero-padding the last byte.
                         let mut bytes = vec![0u8; bits.len().div_ceil(8)];
                         for (index, bit) in bits.iter().enumerate() {
-                            if *bit
-                                && let Some(byte) = bytes.get_mut(index / 8)
-                            {
+                            if *bit && let Some(byte) = bytes.get_mut(index / 8) {
                                 *byte |= 1 << (7 - index % 8);
                             }
                         }
@@ -1373,8 +1335,8 @@ impl Lowerer<'_> {
                 if_true,
                 if_false,
             } => {
-                let clauses = clauses
-                    .ok_or_else(|| self.unsupported("guards outside case expressions"))?;
+                let clauses =
+                    clauses.ok_or_else(|| self.unsupported("guards outside case expressions"))?;
                 let guard_expression = clauses
                     .get(*guard)
                     .expect("guard clause index in range")
@@ -1428,7 +1390,9 @@ impl Lowerer<'_> {
                             | native_ir::Check::BigInt(_)
                             | native_ir::Check::Float(_)
                             | native_ir::Check::String(_)
-                            | native_ir::Check::Immediate(_)
+                            | native_ir::Check::Bool(_)
+                            | native_ir::Check::Nil
+                            | native_ir::Check::EmptyList
                             | native_ir::Check::StringPrefix { .. }
                             | native_ir::Check::BitArray { .. } => vec![],
                         }
@@ -1455,15 +1419,13 @@ impl Lowerer<'_> {
         prefix_slices: &mut HashMap<usize, (u32, u32)>,
     ) -> Result<native_ir::Check, Error> {
         match check {
-            exhaustiveness::RuntimeCheck::Int { int_value } => {
-                Ok(
-                    if let native_ir::Expression::Int(value) = lower_int(int_value) {
-                        native_ir::Check::Int(value)
-                    } else {
-                        native_ir::Check::BigInt(int_value.to_signed_bytes_le())
-                    },
-                )
-            }
+            exhaustiveness::RuntimeCheck::Int { int_value } => Ok(
+                if let native_ir::Expression::Int(value) = lower_int(int_value) {
+                    native_ir::Check::Int(value)
+                } else {
+                    native_ir::Check::BigInt(int_value.to_signed_bytes_le())
+                },
+            ),
             exhaustiveness::RuntimeCheck::Float { float_value } => {
                 Ok(native_ir::Check::Float(float_value.value()))
             }
@@ -1471,15 +1433,13 @@ impl Lowerer<'_> {
                 crate::strings::convert_string_escape_chars(value).into(),
             )),
             exhaustiveness::RuntimeCheck::Variant { index, fields, .. } => {
-                // Bool and Nil are tagged immediates (True is variant 0 but
-                // encodes as 1); every other custom type is a heap record
-                // with a variant tag word.
+                // Bool and Nil are immediate words (`True` is variant 0);
+                // every other custom type is a heap record with a variant
+                // tag word.
                 if subject_type.is_bool() {
-                    Ok(native_ir::Check::Immediate(tag_small_int(
-                        if *index == 0 { 1 } else { 0 },
-                    )))
+                    Ok(native_ir::Check::Bool(*index == 0))
                 } else if subject_type.is_nil() {
-                    Ok(native_ir::Check::Immediate(tag_small_int(0)))
+                    Ok(native_ir::Check::Nil)
                 } else {
                     Ok(native_ir::Check::Variant {
                         tag: *index as u32,
@@ -1494,15 +1454,11 @@ impl Lowerer<'_> {
                 let _ = prefix_slices.insert(rest.id, (subject, prefix.len() as u32));
                 Ok(native_ir::Check::StringPrefix { prefix })
             }
-            exhaustiveness::RuntimeCheck::Tuple { elements, .. } => {
-                Ok(native_ir::Check::Always {
-                    fields: elements.iter().map(|element| element.id as u32).collect(),
-                })
-            }
+            exhaustiveness::RuntimeCheck::Tuple { elements, .. } => Ok(native_ir::Check::Always {
+                fields: elements.iter().map(|element| element.id as u32).collect(),
+            }),
             exhaustiveness::RuntimeCheck::BitArray { test } => self.bit_array_test(test),
-            exhaustiveness::RuntimeCheck::EmptyList => {
-                Ok(native_ir::Check::Immediate(tag_small_int(0)))
-            }
+            exhaustiveness::RuntimeCheck::EmptyList => Ok(native_ir::Check::EmptyList),
             exhaustiveness::RuntimeCheck::NonEmptyList { first, rest } => {
                 Ok(native_ir::Check::NonEmptyList {
                     first: first.id as u32,
@@ -1595,8 +1551,7 @@ impl Lowerer<'_> {
                     }
                 }
                 exhaustiveness::BoundValue::StringSlice { subject, prefix } => {
-                    let prefix: String =
-                        crate::strings::convert_string_escape_chars(prefix).into();
+                    let prefix: String = crate::strings::convert_string_escape_chars(prefix).into();
                     native_ir::Bound::StringSlice {
                         subject: subject.id as u32,
                         offset: prefix.len() as u32,
@@ -1611,31 +1566,14 @@ impl Lowerer<'_> {
     fn echo(
         &self,
         value: native_ir::Expression,
-        type_: &Type,
         message: Option<&TypedExpr>,
         location: &src_span::SrcSpan,
     ) -> Result<native_ir::Expression, Error> {
-        let kind = if type_.is_int() {
-            native_ir::EchoKind::Int
-        } else if type_.is_float() {
-            native_ir::EchoKind::Float
-        } else if type_.is_string() {
-            native_ir::EchoKind::String
-        } else if type_.is_bool() {
-            native_ir::EchoKind::Bool
-        } else if type_.is_nil() {
-            native_ir::EchoKind::Nil
-        } else if type_.is_list() {
-            native_ir::EchoKind::List
-        } else {
-            native_ir::EchoKind::Structural
-        };
         let message = match message {
             Some(message) => Some(Box::new(self.expression(message)?)),
             None => None,
         };
         Ok(native_ir::Expression::Echo {
-            kind,
             value: Box::new(value),
             message,
             line: self.line_numbers.line_number(location.start),
@@ -1681,6 +1619,36 @@ mod tests {
         super::module(&module, camino::Utf8Path::new("/root")).expect("should lower")
     }
 
+    /// The statements with their debug source lines zeroed (recursively,
+    /// through nested bodies), so assertions stay independent of the test
+    /// source's exact layout. `Panic` and assignment-failure lines are
+    /// semantic — they reach the runtime's error reports — and are kept.
+    fn without_lines(statements: &[native_ir::Statement]) -> Vec<native_ir::Statement> {
+        fn zero_statement_lines(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, inner) in map.iter_mut() {
+                        if matches!(key.as_str(), "Let" | "Destructure" | "Expression") {
+                            if let serde_json::Value::Object(fields) = inner {
+                                if let Some(line) = fields.get_mut("line") {
+                                    *line = serde_json::Value::from(0);
+                                }
+                            }
+                        }
+                        zero_statement_lines(inner);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    values.iter_mut().for_each(zero_statement_lines)
+                }
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(statements).expect("statements to json");
+        zero_statement_lines(&mut value);
+        serde_json::from_value(value).expect("statements from json")
+    }
+
     #[test]
     fn integer_literals() {
         let module = lower(
@@ -1693,9 +1661,11 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "small".into(),
                 value: native_ir::Expression::Int(42),
             }
@@ -1703,6 +1673,7 @@ mod tests {
         assert_eq!(
             body[1],
             native_ir::Statement::Let {
+                line: 0,
                 name: "big".into(),
                 value: native_ir::Expression::BigInt(
                     BigInt::from(9223372036854775808_u64).to_signed_bytes_le(),
@@ -1723,9 +1694,11 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "x".into(),
                 value: native_ir::Expression::Float(1.5),
             }
@@ -1733,6 +1706,7 @@ mod tests {
         assert_eq!(
             body[1],
             native_ir::Statement::Let {
+                line: 0,
                 name: "y".into(),
                 value: native_ir::Expression::Float(-300.0),
             }
@@ -1750,9 +1724,11 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "x".into(),
                 value: native_ir::Expression::String("hello\n🌍".into()),
             }
@@ -1770,9 +1746,11 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "x".into(),
                 value: native_ir::Expression::StringConcat(
                     Box::new(native_ir::Expression::String("Hello, ".into())),
@@ -1794,6 +1772,7 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::expression(native_ir::Expression::IntBinary {
@@ -1836,6 +1815,7 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::expression(native_ir::Expression::FloatBinary {
@@ -1873,6 +1853,7 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::expression(native_ir::Expression::IntCompare {
@@ -1904,14 +1885,14 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         let kinds: Vec<_> = body
             .iter()
             .map(|statement| match statement {
-                native_ir::Statement::expression(native_ir::Expression::Equality {
-                    kind,
-                    negated,
+                native_ir::Statement::Expression {
+                    expression: native_ir::Expression::Equality { kind, negated, .. },
                     ..
-                }) => (*kind, *negated),
+                } => (*kind, *negated),
                 _ => panic!("expected an equality expression"),
             })
             .collect();
@@ -1936,6 +1917,7 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         // `&&` binds tighter than `||`.
         assert_eq!(
             body[0],
@@ -1963,9 +1945,11 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "yes".into(),
                 value: native_ir::Expression::Bool(true),
             }
@@ -1973,6 +1957,7 @@ mod tests {
         assert_eq!(
             body[1],
             native_ir::Statement::Let {
+                line: 0,
                 name: "no".into(),
                 value: native_ir::Expression::Bool(false),
             }
@@ -1992,6 +1977,7 @@ mod tests {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::expression(native_ir::Expression::Case {
@@ -2038,19 +2024,18 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "pair".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 0,
                     display: native_ir::ConstructorDisplay::Record {
                         name: "Pair".into()
                     },
-                    arguments: vec![
-                        native_ir::Expression::Int(1),
-                        native_ir::Expression::Int(2)
-                    ],
+                    arguments: vec![native_ir::Expression::Int(1), native_ir::Expression::Int(2)],
                 },
             }
         );
@@ -2073,9 +2058,10 @@ pub fn main() {
         assert!(choices.is_empty());
         assert_eq!(fallback_fields.len(), 2);
         // `pair.first` reads field 0.
-        let native_ir::Statement::expression(native_ir::Expression::IntBinary {
-            right, ..
-        }) = &body[2]
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::IntBinary { right, .. },
+            ..
+        } = &body[2]
         else {
             panic!("expected an addition");
         };
@@ -2099,9 +2085,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "pair".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 0,
@@ -2141,7 +2129,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let body = without_lines(body);
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::Case { tree, .. },
+            ..
+        } = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2172,7 +2164,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let body = without_lines(body);
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::Case { tree, .. },
+            ..
+        } = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2203,9 +2199,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "rest".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 1,
@@ -2244,7 +2242,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let body = without_lines(body);
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::Case { tree, .. },
+            ..
+        } = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2256,10 +2258,10 @@ pub fn main() {
         else {
             panic!("expected a switch");
         };
-        // The empty list is a tagged immediate; the cons case is the
+        // The empty list is an immediate word; the cons case is the
         // exhaustive fallback whose head and tail arrive untested.
         assert_eq!(choices.len(), 1);
-        assert_eq!(choices[0].0, native_ir::Check::Immediate(1));
+        assert_eq!(choices[0].0, native_ir::Check::EmptyList);
         assert_eq!(fallback_fields.len(), 2);
     }
 
@@ -2276,11 +2278,14 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::expression(native_ir::Expression::Case {
-            subject_ids,
-            tree,
+        let body = without_lines(body);
+        let native_ir::Statement::Expression {
+            expression:
+                native_ir::Expression::Case {
+                    subject_ids, tree, ..
+                },
             ..
-        }) = &body[0]
+        } = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2298,7 +2303,12 @@ pub fn main() {
         assert_eq!(subject_ids, &vec![*var]);
         fn has_non_subject_switch(decision: &native_ir::Decision, subject: u32) -> bool {
             match decision {
-                native_ir::Decision::Switch { var, choices, fallback, .. } => {
+                native_ir::Decision::Switch {
+                    var,
+                    choices,
+                    fallback,
+                    ..
+                } => {
                     *var != subject
                         || choices
                             .iter()
@@ -2331,6 +2341,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         // The unchanged field reads from the spread record; the updated one
         // uses the new value.
         assert_eq!(
@@ -2363,6 +2374,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         // Irrefutable tuple destructuring: no failure handler.
         let native_ir::Statement::Destructure {
             on_failure: None,
@@ -2413,9 +2425,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[1] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[1],
             native_ir::Statement::Let {
+                line: 0,
                 name: "adder".into(),
                 value: native_ir::Expression::Lambda {
                     parameters: vec!["x".into()],
@@ -2432,6 +2446,7 @@ pub fn main() {
         assert_eq!(
             body[2],
             native_ir::Statement::Let {
+                line: 0,
                 name: "doubler".into(),
                 value: native_ir::Expression::FunctionReference {
                     module: "test_module".into(),
@@ -2473,9 +2488,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "x".into(),
                 value: native_ir::Expression::Int(42),
             }
@@ -2484,6 +2501,7 @@ pub fn main() {
         assert_eq!(
             body[1],
             native_ir::Statement::Let {
+                line: 0,
                 name: "y".into(),
                 value: native_ir::Expression::StringConcat(
                     Box::new(native_ir::Expression::String("hello".into())),
@@ -2494,6 +2512,7 @@ pub fn main() {
         assert_eq!(
             body[2],
             native_ir::Statement::Let {
+                line: 0,
                 name: "z".into(),
                 value: native_ir::Expression::Constructor {
                     tag: 1,
@@ -2528,6 +2547,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         // Construction: five segments with the right kinds.
         let native_ir::Statement::Let { value, .. } = &body[0] else {
             panic!("expected a let");
@@ -2566,7 +2586,10 @@ pub fn main() {
         // The pattern produces bit array checks, and the dynamic
         // `bytes-size(length)` payload read refers to the materialized
         // `length` segment.
-        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[1]
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::Case { tree, .. },
+            ..
+        } = &body[1]
         else {
             panic!("expected a case");
         };
@@ -2574,9 +2597,9 @@ pub fn main() {
             match decision {
                 native_ir::Decision::Run { bindings, .. } => {
                     bindings.iter().any(|(_, bound)| match bound {
-                        native_ir::Bound::BitsSlice { bits: Some(bits), .. } => {
-                            format!("{bits:?}").contains("bit$length")
-                        }
+                        native_ir::Bound::BitsSlice {
+                            bits: Some(bits), ..
+                        } => format!("{bits:?}").contains("bit$length"),
                         _ => false,
                     })
                 }
@@ -2588,9 +2611,7 @@ pub fn main() {
                         .any(|(_, decision)| find_dynamic_read(decision))
                         || find_dynamic_read(fallback)
                 }
-                native_ir::Decision::Guard {
-                    if_false, ..
-                } => find_dynamic_read(if_false),
+                native_ir::Decision::Guard { if_false, .. } => find_dynamic_read(if_false),
                 native_ir::Decision::Fail => false,
             }
         }
@@ -2610,7 +2631,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let body = without_lines(body);
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::Case { tree, .. },
+            ..
+        } = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2662,7 +2687,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let body = without_lines(body);
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::Case { tree, .. },
+            ..
+        } = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2706,15 +2735,19 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let body = without_lines(body);
+        let native_ir::Statement::Expression {
+            expression: native_ir::Expression::Case { tree, .. },
+            ..
+        } = &body[0]
         else {
             panic!("expected a case expression");
         };
         let native_ir::Decision::Switch { choices, .. } = tree else {
             panic!("expected a switch");
         };
-        // The `True` pattern must check for the tagged word 3.
-        assert_eq!(choices[0].0, native_ir::Check::Immediate(3));
+        // The `True` pattern checks for the `True` immediate word.
+        assert_eq!(choices[0].0, native_ir::Check::Bool(true));
     }
 
     #[test]
@@ -2728,9 +2761,11 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
+        let body = without_lines(body);
         assert_eq!(
             body[0],
             native_ir::Statement::Let {
+                line: 0,
                 name: "x".into(),
                 value: native_ir::Expression::Panic {
                     kind: native_ir::PanicKind::Todo,

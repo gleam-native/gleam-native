@@ -87,7 +87,7 @@ mod tests {
             functions: vec![native_ir::Function::Defined {
                 name: "main".into(),
                 parameters: vec![],
-                body: vec![native_ir::Statement::Expression(
+                body: vec![native_ir::Statement::expression(
                     native_ir::Expression::IntBinary {
                         operator: native_ir::IntOperator::Add,
                         left: Box::new(native_ir::Expression::Int(40)),
@@ -138,7 +138,7 @@ mod tests {
                 native_ir::Function::Defined {
                     name: "add".into(),
                     parameters: vec!["x".into(), "y".into()],
-                    body: vec![native_ir::Statement::Expression(
+                    body: vec![native_ir::Statement::expression(
                         native_ir::Expression::IntBinary {
                             operator: native_ir::IntOperator::Add,
                             left: Box::new(native_ir::Expression::Variable("x".into())),
@@ -157,6 +157,7 @@ mod tests {
                 body: vec![
                     native_ir::Statement::Let {
                         name: "total".into(),
+                        line: 0,
                         value: native_ir::Expression::Call {
                             module: "wibble/wobble".into(),
                             function: "add".into(),
@@ -168,13 +169,14 @@ mod tests {
                     },
                     native_ir::Statement::Let {
                         name: "huge".into(),
+                        line: 0,
                         value: native_ir::Expression::IntBinary {
                             operator: native_ir::IntOperator::Add,
                             left: Box::new(native_ir::Expression::Int(i64::MAX >> 1)),
                             right: Box::new(native_ir::Expression::Variable("total".into())),
                         },
                     },
-                    native_ir::Statement::Expression(native_ir::Expression::Call {
+                    native_ir::Statement::expression(native_ir::Expression::Call {
                         module: "wibble/wobble".into(),
                         function: "print_int".into(),
                         arguments: vec![native_ir::Expression::Variable("huge".into())],
@@ -183,7 +185,13 @@ mod tests {
             }],
         };
 
-        crate::jit::run(&[dependency, root], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
+        crate::jit::run(
+            &[dependency, root],
+            "app",
+            Vec::new(),
+            crate::jit::DEFAULT_STACK_MEGABYTES,
+        )
+        .unwrap();
     }
 
     /// A big integer literal flows from the data section through the runtime
@@ -196,7 +204,7 @@ mod tests {
             functions: vec![native_ir::Function::Defined {
                 name: "main".into(),
                 parameters: vec![],
-                body: vec![native_ir::Statement::Expression(
+                body: vec![native_ir::Statement::expression(
                     native_ir::Expression::IntBinary {
                         operator: native_ir::IntOperator::Add,
                         // 2^70, as signed little-endian bytes.
@@ -208,7 +216,13 @@ mod tests {
                 )],
             }],
         };
-        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
+        crate::jit::run(
+            &[module],
+            "app",
+            Vec::new(),
+            crate::jit::DEFAULT_STACK_MEGABYTES,
+        )
+        .unwrap();
     }
 
     /// A float literal is boxed via the runtime constructor and can be
@@ -227,7 +241,7 @@ mod tests {
                 native_ir::Function::Defined {
                     name: "main".into(),
                     parameters: vec![],
-                    body: vec![native_ir::Statement::Expression(
+                    body: vec![native_ir::Statement::expression(
                         native_ir::Expression::Call {
                             module: "app".into(),
                             function: "print_float".into(),
@@ -237,7 +251,13 @@ mod tests {
                 },
             ],
         };
-        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
+        crate::jit::run(
+            &[module],
+            "app",
+            Vec::new(),
+            crate::jit::DEFAULT_STACK_MEGABYTES,
+        )
+        .unwrap();
     }
 
     /// A case expression's decision tree compiles and runs: a boolean switch
@@ -250,27 +270,24 @@ mod tests {
             functions: vec![native_ir::Function::Defined {
                 name: "main".into(),
                 parameters: vec![],
-                body: vec![native_ir::Statement::Expression(
+                body: vec![native_ir::Statement::expression(
                     native_ir::Expression::Case {
                         subjects: vec![native_ir::Expression::Bool(true)],
                         subject_ids: vec![0],
                         tree: native_ir::Decision::Switch {
                             var: 0,
                             choices: vec![(
-                                native_ir::Check::Immediate(3),
+                                native_ir::Check::Bool(true),
                                 native_ir::Decision::Run {
-                                    bindings: vec![(
-                                        "x".into(),
-                                        native_ir::Bound::Variable(0),
-                                    )],
-                                    body: vec![native_ir::Statement::Expression(
+                                    bindings: vec![("x".into(), native_ir::Bound::Variable(0))],
+                                    body: vec![native_ir::Statement::expression(
                                         native_ir::Expression::Variable("x".into()),
                                     )],
                                 },
                             )],
                             fallback: Box::new(native_ir::Decision::Run {
                                 bindings: vec![],
-                                body: vec![native_ir::Statement::Expression(
+                                body: vec![native_ir::Statement::expression(
                                     native_ir::Expression::Int(0),
                                 )],
                             }),
@@ -280,7 +297,13 @@ mod tests {
                 )],
             }],
         };
-        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
+        crate::jit::run(
+            &[module],
+            "app",
+            Vec::new(),
+            crate::jit::DEFAULT_STACK_MEGABYTES,
+        )
+        .unwrap();
     }
 
     /// A panic expression translates and compiles; `main` must not call it,
@@ -294,12 +317,10 @@ mod tests {
                 native_ir::Function::Defined {
                     name: "explode".into(),
                     parameters: vec![],
-                    body: vec![native_ir::Statement::Expression(
+                    body: vec![native_ir::Statement::expression(
                         native_ir::Expression::Panic {
                             kind: native_ir::PanicKind::Panic,
-                            message: Some(Box::new(native_ir::Expression::String(
-                                "boom".into(),
-                            ))),
+                            message: Some(Box::new(native_ir::Expression::String("boom".into()))),
                             function: "explode".into(),
                             line: 2,
                         },
@@ -308,11 +329,17 @@ mod tests {
                 native_ir::Function::Defined {
                     name: "main".into(),
                     parameters: vec![],
-                    body: vec![native_ir::Statement::Expression(native_ir::Expression::Nil)],
+                    body: vec![native_ir::Statement::expression(native_ir::Expression::Nil)],
                 },
             ],
         };
-        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
+        crate::jit::run(
+            &[module],
+            "app",
+            Vec::new(),
+            crate::jit::DEFAULT_STACK_MEGABYTES,
+        )
+        .unwrap();
     }
 
     /// A string literal is built from constant data and can be passed to the
@@ -331,23 +358,25 @@ mod tests {
                 native_ir::Function::Defined {
                     name: "main".into(),
                     parameters: vec![],
-                    body: vec![native_ir::Statement::Expression(
+                    body: vec![native_ir::Statement::expression(
                         native_ir::Expression::Call {
                             module: "app".into(),
                             function: "println".into(),
                             arguments: vec![native_ir::Expression::StringConcat(
-                                Box::new(native_ir::Expression::String(
-                                    "Hello from ".into(),
-                                )),
-                                Box::new(native_ir::Expression::String(
-                                    "the JIT! 🌍".into(),
-                                )),
+                                Box::new(native_ir::Expression::String("Hello from ".into())),
+                                Box::new(native_ir::Expression::String("the JIT! 🌍".into())),
                             )],
                         },
                     )],
                 },
             ],
         };
-        crate::jit::run(&[module], "app", Vec::new(), crate::jit::DEFAULT_STACK_MEGABYTES).unwrap();
+        crate::jit::run(
+            &[module],
+            "app",
+            Vec::new(),
+            crate::jit::DEFAULT_STACK_MEGABYTES,
+        )
+        .unwrap();
     }
 }

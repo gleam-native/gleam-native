@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 30;
+pub const FORMAT_VERSION: u32 = 31;
 
 /// Whether the bytes are an artifact of the current format version, from
 /// the four-byte little-endian version header alone. The build uses this to
@@ -124,7 +124,9 @@ pub enum Expression {
     /// an immutable UTF-8 heap string at run time.
     String(String),
     Nil,
-    /// `True` or `False`, represented as the tagged small integers 1 and 0.
+    /// `True` or `False`. Like `Nil` and the empty list, booleans are
+    /// special immediate words distinct from every integer; code
+    /// generation owns the exact encodings.
     Bool(bool),
     Variable(String),
     Block(Vec<Statement>),
@@ -202,7 +204,7 @@ pub enum Expression {
         record: Box<Expression>,
         index: u32,
     },
-    /// The empty list, a tagged immediate. Cons cells are two-field records
+    /// The empty list, a special immediate word. Cons cells are two-field records
     /// with tag 1, built with [`Expression::Constructor`].
     EmptyList,
     /// Bit array construction: segments appended in order onto an empty
@@ -229,9 +231,9 @@ pub enum Expression {
         arguments: Vec<Expression>,
     },
     /// An `echo` expression: prints the source location and the value to
-    /// standard error and evaluates to the value.
+    /// standard error and evaluates to the value. Rendering is structural:
+    /// every value identifies itself at run time.
     Echo {
-        kind: EchoKind,
         value: Box<Expression>,
         message: Option<Box<Expression>>,
         line: u32,
@@ -448,8 +450,13 @@ pub enum Check {
     Float(f64),
     /// The subject is a string with these contents.
     String(String),
-    /// The subject is exactly this tagged word (`Bool`/`Nil` variants).
-    Immediate(i64),
+    /// The subject is this boolean's immediate word.
+    Bool(bool),
+    /// The subject is `Nil`'s immediate word (always matches; `Nil` has
+    /// one variant).
+    Nil,
+    /// The subject is the empty list's immediate word.
+    EmptyList,
     /// The subject is a custom type record with this variant tag. On a
     /// match, the record's fields become the given decision variables.
     Variant { tag: u32, fields: Vec<u32> },
@@ -478,27 +485,12 @@ pub enum EqualityKind {
     Float,
     /// Strings compare by contents via the runtime.
     String,
-    /// Values that are always tagged immediates (`Bool`, `Nil`) compare as
+    /// Values that are always immediate words (`Bool`, `Nil`) compare as
     /// plain words.
     Immediate,
     /// Any other type: structural deep equality in the runtime, walking
     /// heap object headers.
     Deep,
-}
-
-/// How `echo` renders its value: exactly, when the compiler knew the static
-/// type at the echo site, or structurally otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum EchoKind {
-    Structural,
-    Int,
-    Float,
-    String,
-    Bool,
-    Nil,
-    /// The static type is a list: the empty list is a bare tagged integer,
-    /// so without this kind a top-level `echo []` would print `0`.
-    List,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -531,11 +523,9 @@ pub fn encode(module: &Module) -> Result<Vec<u8>, bitcode::Error> {
 
 pub fn decode(bytes: &[u8]) -> Result<Module, String> {
     if !artifact_is_current(bytes) {
-        return Err(
-            "outdated or corrupt native artifact. \
+        return Err("outdated or corrupt native artifact. \
 Delete the project's `build` directory and rebuild."
-                .into(),
-        );
+            .into());
     }
     bitcode::deserialize(&bytes[4..]).map_err(|error| {
         format!(
@@ -582,9 +572,14 @@ pub fn expression_mentions(expression: &Expression, counts: &mut HashMap<String,
 /// Adds a decision tree's free-variable mention counts into `counts`.
 pub fn decision_mentions(decision: &Decision, counts: &mut HashMap<String, usize>) {
     let mut bound = HashSet::new();
-    decision_free(decision, &mut bound, &mut |name| {
-        *counts.entry(name.to_string()).or_insert(0) += 1;
-    }, false);
+    decision_free(
+        decision,
+        &mut bound,
+        &mut |name| {
+            *counts.entry(name.to_string()).or_insert(0) += 1;
+        },
+        false,
+    );
 }
 
 fn statements_free(
@@ -598,7 +593,12 @@ fn statements_free(
                 expression_free(value, bound, sink);
                 let _ = bound.insert(name.clone());
             }
-            Statement::Destructure { subject, tree, on_failure, .. } => {
+            Statement::Destructure {
+                subject,
+                tree,
+                on_failure,
+                ..
+            } => {
                 expression_free(subject, bound, sink);
                 if let Some(failure) = on_failure
                     && let Some(message) = &failure.message
