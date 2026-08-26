@@ -1105,6 +1105,58 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         emit_dec(self.module, self.runtime.destroy, self.builder, value);
     }
 
+    /// Emits a per-site permanent cache: a writable data slot holds a
+    /// value built at most once (cold path), and every evaluation takes
+    /// its own reference. The slot's own reference is never released, so
+    /// only immutable values whose sharing is unobservable belong here —
+    /// string literals and zero-arity constructors.
+    fn interned(
+        &mut self,
+        build: impl FnOnce(&mut Self) -> Result<Value, String>,
+    ) -> Result<Value, String> {
+        let slot = self
+            .module
+            .declare_anonymous_data(true, false)
+            .map_err(|error| error.to_string())?;
+        let mut description = DataDescription::new();
+        description.define_zeroinit(8);
+        description.set_align(8);
+        self.module
+            .define_data(slot, &description)
+            .map_err(|error| error.to_string())?;
+        let slot_ref = self.module.declare_data_in_func(slot, self.builder.func);
+        let pointer_type = self.module.target_config().pointer_type();
+        let slot_address = self.builder.ins().symbol_value(pointer_type, slot_ref);
+        let cached = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            slot_address,
+            0,
+        );
+
+        let build_block = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        self.builder
+            .ins()
+            .brif(cached, join, &[cached.into()], build_block, &[]);
+        self.builder.seal_block(build_block);
+        self.builder.set_cold_block(build_block);
+
+        self.builder.switch_to_block(build_block);
+        let built = build(self)?;
+        let _ = self
+            .builder
+            .ins()
+            .store(MemFlagsData::trusted(), built, slot_address, 0);
+        self.builder.ins().jump(join, &[built.into()]);
+        self.builder.seal_block(join);
+
+        self.builder.switch_to_block(join);
+        let value = self.builder.block_params(join)[0];
+        Ok(self.inc(value))
+    }
+
     /// Emits an inline pooled allocation of `object_words` words (header
     /// included) with the given constant header word, popping the program
     /// thread's free list for the size class. `slow` emits the fallback
@@ -1609,56 +1661,15 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::String(string) => {
-                // A literal builds its heap string once: a writable data
-                // slot per site caches the value, holding one permanent
-                // reference, and every evaluation takes its own. Loops
-                // re-running a literal stop allocating for it.
-                let slot = self
-                    .module
-                    .declare_anonymous_data(true, false)
-                    .map_err(|error| error.to_string())?;
-                let mut description = DataDescription::new();
-                description.define_zeroinit(8);
-                description.set_align(8);
-                self.module
-                    .define_data(slot, &description)
-                    .map_err(|error| error.to_string())?;
-                let slot_ref = self.module.declare_data_in_func(slot, self.builder.func);
-                let pointer_type = self.module.target_config().pointer_type();
-                let slot_address = self.builder.ins().symbol_value(pointer_type, slot_ref);
-                let cached = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::trusted(),
-                    slot_address,
-                    0,
-                );
-
-                let build = self.builder.create_block();
-                let join = self.builder.create_block();
-                self.builder.append_block_param(join, types::I64);
-                self.builder
-                    .ins()
-                    .brif(cached, join, &[cached.into()], build, &[]);
-                self.builder.seal_block(build);
-                self.builder.set_cold_block(build);
-
-                self.builder.switch_to_block(build);
-                let built = self.construct_from_constant_bytes(
-                    string.as_bytes(),
-                    self.runtime.string_from_bytes,
-                )?;
-                let _ = self.builder.ins().store(
-                    MemFlagsData::trusted(),
-                    built,
-                    slot_address,
-                    0,
-                );
-                self.builder.ins().jump(join, &[built.into()]);
-                self.builder.seal_block(join);
-
-                self.builder.switch_to_block(join);
-                let value = self.builder.block_params(join)[0];
-                Ok(self.inc(value))
+                // A literal builds its heap string once per site; every
+                // evaluation takes its own reference. Loops re-running a
+                // literal stop allocating for it.
+                self.interned(|this| {
+                    this.construct_from_constant_bytes(
+                        string.as_bytes(),
+                        this.runtime.string_from_bytes,
+                    )
+                })
             }
 
             native_ir::Expression::Float(value) => {
@@ -1834,6 +1845,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         .call(record_new_ref, &[tag, arity, display]);
                     Ok(this.builder.inst_results(call)[0])
                 };
+                if arity == 0 {
+                    // A zero-arity constructor is immutable and content-equal
+                    // to every other instance of its variant: one shared
+                    // instance per site, like a string literal.
+                    return self.interned(slow);
+                }
                 let reusable = match self.reuse_token {
                     Some((token, fields)) if fields == arity => {
                         self.reuse_token = None;
