@@ -118,7 +118,7 @@ pub fn header_kind(header: u64) -> u64 {
     header & 0xFFFF
 }
 
-pub(crate) fn record_tag(header: u64) -> u32 {
+pub fn record_tag(header: u64) -> u32 {
     ((header >> 16) & 0xFFFF) as u32
 }
 

@@ -867,6 +867,64 @@ pub extern "C" fn gleam_native_dict_to_list(dict: u64) -> u64 {
     )
 }
 
+/// A cons cell holding an (owned) head and tail.
+fn cons(head: u64, tail: u64) -> u64 {
+    let cell = gleam_native_record_new(1, 2, DISPLAY_LIST as u64);
+    unsafe {
+        *((cell as *mut u64).add(1)) = head;
+        *((cell as *mut u64).add(2)) = tail;
+    }
+    cell
+}
+
+/// Whether the comparator orders `a` at or before `b`: `Lt` and `Eq`
+/// keep the pair's order, which is what makes the merge below stable.
+fn ordered(compare: u64, a: u64, b: u64) -> bool {
+    let order = call_closure(compare, &[gleam_native_inc(a), gleam_native_inc(b)]);
+    // `Order`'s variants Lt, Eq, Gt carry tags 0, 1, 2.
+    let tag = record_tag(heap_header(order));
+    let _ = gleam_native_dec(order);
+    tag <= 1
+}
+
+/// A stable bottom-up merge sort calling a Gleam comparator, replacing
+/// the standard library's Gleam merge machinery. Unlike a library sort it
+/// tolerates an inconsistent comparator (garbage order, never a crash),
+/// matching the other targets.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_list_sort(list: u64, compare: u64) -> u64 {
+    let mut current = list_elements(list);
+    if current.len() < 2 {
+        return gleam_native_inc(list);
+    }
+    let mut scratch: Vec<u64> = Vec::with_capacity(current.len());
+    let mut width = 1;
+    while width < current.len() {
+        scratch.clear();
+        let mut start = 0;
+        while start < current.len() {
+            let middle = (start + width).min(current.len());
+            let end = (start + 2 * width).min(current.len());
+            let (mut left, mut right) = (start, middle);
+            while left < middle && right < end {
+                if ordered(compare, current[left], current[right]) {
+                    scratch.push(current[left]);
+                    left += 1;
+                } else {
+                    scratch.push(current[right]);
+                    right += 1;
+                }
+            }
+            scratch.extend_from_slice(&current[left..middle]);
+            scratch.extend_from_slice(&current[right..end]);
+            start = end;
+        }
+        std::mem::swap(&mut current, &mut scratch);
+        width *= 2;
+    }
+    make_list(current.into_iter().map(|element| gleam_native_inc(element)).collect())
+}
+
 /// Folds over the entries sorted by key — the same deterministic order
 /// `to_list` produces — calling the Gleam callback as `fun(key, value,
 /// acc)` without materializing the entry list.
@@ -886,6 +944,39 @@ pub extern "C" fn gleam_native_dict_fold(fun: u64, initial: u64, dict: u64) -> u
         );
     }
     accumulator
+}
+
+/// A new dict with every value passed through the Gleam callback, built
+/// by walking the entries directly.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_dict_map_values(fun: u64, dict: u64) -> u64 {
+    let mut map = DictMap::default();
+    for (key, value) in dict_payload(dict).map.iter() {
+        let mapped = call_closure(
+            fun,
+            &[gleam_native_inc(key.0), gleam_native_inc(value.0)],
+        );
+        let _ = map.insert(DictKey(gleam_native_inc(key.0)), DictEntry(mapped));
+    }
+    box_dict(DictPayload { map })
+}
+
+/// Groups a list's elements by the Gleam key callback. Each group's list
+/// is built by prepending, matching the Gleam implementation: elements
+/// appear in reverse encounter order.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_dict_group(key_fun: u64, list: u64) -> u64 {
+    let mut map = DictMap::default();
+    for element in list_elements(list) {
+        let key = call_closure(key_fun, &[gleam_native_inc(element)]);
+        let existing = match map.get(&DictKeyRef(key)) {
+            Some(entry) => gleam_native_inc(entry.0),
+            None => NIL,
+        };
+        let group = cons(gleam_native_inc(element), existing);
+        let _ = map.insert(DictKey(key), DictEntry(group));
+    }
+    box_dict(DictPayload { map })
 }
 
 /// A mutable copy of the dict: an O(1) clone sharing the original's tree,
@@ -1420,6 +1511,12 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ),
         ("gleam_native_dict_new", gleam_native_dict_new as *const u8),
         ("gleam_native_dict_fold", gleam_native_dict_fold as *const u8),
+        (
+            "gleam_native_dict_map_values",
+            gleam_native_dict_map_values as *const u8,
+        ),
+        ("gleam_native_dict_group", gleam_native_dict_group as *const u8),
+        ("gleam_native_list_sort", gleam_native_list_sort as *const u8),
         ("gleam_native_dict_size", gleam_native_dict_size as *const u8),
         ("gleam_native_dict_get", gleam_native_dict_get as *const u8),
         (
