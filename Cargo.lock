@@ -2474,6 +2474,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "gimli",
  "native-ir",
  "native-runtime",
  "native-runtime-stdlib",

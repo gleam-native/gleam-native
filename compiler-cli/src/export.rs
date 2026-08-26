@@ -608,6 +608,15 @@ fn link_executable(
             ),
         });
     }
+    // On macOS the linker leaves DWARF in the object file, referenced by a
+    // debug map; bundling it as a dSYM gives debuggers and profilers
+    // source lines directly. Best-effort: a missing dsymutil just means
+    // symbol-only debugging.
+    if platform.is_none() && cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("dsymutil")
+            .arg(executable)
+            .output();
+    }
     Ok(())
 }
 

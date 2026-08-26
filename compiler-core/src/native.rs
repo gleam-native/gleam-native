@@ -124,10 +124,14 @@ impl Lowerer<'_> {
     }
 
     fn statement(&self, statement: &TypedStatement) -> Result<native_ir::Statement, Error> {
+        let line = self
+            .line_numbers
+            .line_number(statement.location().start);
         match statement {
-            Statement::Expression(expression) => Ok(native_ir::Statement::Expression(
-                self.expression(expression)?,
-            )),
+            Statement::Expression(expression) => Ok(native_ir::Statement::Expression {
+                expression: self.expression(expression)?,
+                line,
+            }),
 
             Statement::Assignment(assignment) => {
                 // A plain variable pattern is irrefutable and binds directly.
@@ -135,6 +139,7 @@ impl Lowerer<'_> {
                     return Ok(native_ir::Statement::Let {
                         name: name.clone().into(),
                         value: self.expression(&assignment.value)?,
+                        line,
                     });
                 }
 
@@ -165,14 +170,16 @@ impl Lowerer<'_> {
                     subject_id,
                     tree,
                     on_failure,
+                    line,
                 })
             }
 
             // The type checker has already desugared `use` into a call with
             // a callback function.
-            Statement::Use(use_) => Ok(native_ir::Statement::Expression(
-                self.expression(&use_.call)?,
-            )),
+            Statement::Use(use_) => Ok(native_ir::Statement::Expression {
+                expression: self.expression(&use_.call)?,
+                line,
+            }),
             // `assert cond` becomes a boolean case: True continues with
             // Nil, False panics with the assert report.
             Statement::Assert(assert) => {
@@ -186,7 +193,8 @@ impl Lowerer<'_> {
                     function: self.function_name.clone().into(),
                     line: self.line_numbers.line_number(assert.location.start),
                 };
-                Ok(native_ir::Statement::Expression(native_ir::Expression::Case {
+                Ok(native_ir::Statement::Expression {
+                    expression: native_ir::Expression::Case {
                     subjects: vec![self.expression(&assert.value)?],
                     subject_ids: vec![0],
                     tree: native_ir::Decision::Switch {
@@ -195,18 +203,20 @@ impl Lowerer<'_> {
                             native_ir::Check::Immediate(tag_small_int(1)),
                             native_ir::Decision::Run {
                                 bindings: vec![],
-                                body: vec![native_ir::Statement::Expression(
+                                body: vec![native_ir::Statement::expression(
                                     native_ir::Expression::Nil,
                                 )],
                             },
                         )],
                         fallback: Box::new(native_ir::Decision::Run {
                             bindings: vec![],
-                            body: vec![native_ir::Statement::Expression(panic)],
+                            body: vec![native_ir::Statement::expression(panic)],
                         }),
                         fallback_fields: vec![],
                     },
-                }))
+                    },
+                    line,
+                })
             }
         }
     }
@@ -400,7 +410,7 @@ impl Lowerer<'_> {
                         let (name, type_) = latest
                             .clone()
                             .expect("echo with no previous step in a pipe");
-                        statements.push(native_ir::Statement::Expression(self.echo(
+                        statements.push(native_ir::Statement::expression(self.echo(
                             native_ir::Expression::Variable(name.into()),
                             &type_,
                             message.as_deref(),
@@ -410,6 +420,9 @@ impl Lowerer<'_> {
                         statements.push(native_ir::Statement::Let {
                             name: assignment.name.clone().into(),
                             value: self.expression(&assignment.value)?,
+                            line: self
+                                .line_numbers
+                                .line_number(assignment.location.start),
                         });
                         latest = Some((assignment.name.clone(), assignment.value.type_()));
                     }
@@ -431,7 +444,7 @@ impl Lowerer<'_> {
                 } else {
                     self.expression(finally)?
                 };
-                statements.push(native_ir::Statement::Expression(finally));
+                statements.push(native_ir::Statement::expression(finally));
                 Ok(native_ir::Expression::Block(statements))
             }
 
@@ -531,8 +544,9 @@ impl Lowerer<'_> {
                         native_ir::Statement::Let {
                             name: name.clone().into(),
                             value: self.expression(updated_record)?,
+                            line: 0,
                         },
-                        native_ir::Statement::Expression(construct),
+                        native_ir::Statement::expression(construct),
                     ])),
                     None => Ok(construct),
                 }
@@ -837,7 +851,7 @@ impl Lowerer<'_> {
             .collect();
         native_ir::Expression::Lambda {
             parameters,
-            body: vec![native_ir::Statement::Expression(
+            body: vec![native_ir::Statement::expression(
                 native_ir::Expression::Constructor {
                     tag: variant_index as u32,
                     display: native_ir::ConstructorDisplay::Record {
@@ -1371,7 +1385,7 @@ impl Lowerer<'_> {
                 let clause = clauses
                     .get(if_true.clause_index)
                     .expect("decision tree clause index in range");
-                let body = vec![native_ir::Statement::Expression(
+                let body = vec![native_ir::Statement::expression(
                     self.expression(&clause.then)?,
                 )];
                 let if_false = self.decision(if_false, Some(clauses), prefix_slices)?;
@@ -1511,7 +1525,7 @@ impl Lowerer<'_> {
                 let clause = clauses
                     .get(body.clause_index)
                     .expect("decision tree clause index in range");
-                vec![native_ir::Statement::Expression(
+                vec![native_ir::Statement::expression(
                     self.expression(&clause.then)?,
                 )]
             }
@@ -1782,7 +1796,7 @@ mod tests {
         };
         assert_eq!(
             body[0],
-            native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+            native_ir::Statement::expression(native_ir::Expression::IntBinary {
                 operator: native_ir::IntOperator::Subtract,
                 left: Box::new(native_ir::Expression::Int(40)),
                 right: Box::new(native_ir::Expression::IntBinary {
@@ -1794,7 +1808,7 @@ mod tests {
         );
         assert_eq!(
             body[1],
-            native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+            native_ir::Statement::expression(native_ir::Expression::IntBinary {
                 operator: native_ir::IntOperator::Divide,
                 left: Box::new(native_ir::Expression::Int(84)),
                 right: Box::new(native_ir::Expression::Int(2)),
@@ -1802,7 +1816,7 @@ mod tests {
         );
         assert_eq!(
             body[2],
-            native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+            native_ir::Statement::expression(native_ir::Expression::IntBinary {
                 operator: native_ir::IntOperator::Remainder,
                 left: Box::new(native_ir::Expression::Int(85)),
                 right: Box::new(native_ir::Expression::Int(43)),
@@ -1824,7 +1838,7 @@ mod tests {
         };
         assert_eq!(
             body[0],
-            native_ir::Statement::Expression(native_ir::Expression::FloatBinary {
+            native_ir::Statement::expression(native_ir::Expression::FloatBinary {
                 operator: native_ir::FloatOperator::Add,
                 left: Box::new(native_ir::Expression::Float(1.5)),
                 right: Box::new(native_ir::Expression::Float(2.0)),
@@ -1832,7 +1846,7 @@ mod tests {
         );
         assert_eq!(
             body[1],
-            native_ir::Statement::Expression(native_ir::Expression::FloatBinary {
+            native_ir::Statement::expression(native_ir::Expression::FloatBinary {
                 operator: native_ir::FloatOperator::Divide,
                 left: Box::new(native_ir::Expression::Float(10.0)),
                 right: Box::new(native_ir::Expression::Float(4.0)),
@@ -1840,7 +1854,7 @@ mod tests {
         );
         assert_eq!(
             body[2],
-            native_ir::Statement::Expression(native_ir::Expression::FloatCompare {
+            native_ir::Statement::expression(native_ir::Expression::FloatCompare {
                 operator: native_ir::CompareOperator::LessThan,
                 left: Box::new(native_ir::Expression::Float(1.5)),
                 right: Box::new(native_ir::Expression::Float(2.5)),
@@ -1861,7 +1875,7 @@ mod tests {
         };
         assert_eq!(
             body[0],
-            native_ir::Statement::Expression(native_ir::Expression::IntCompare {
+            native_ir::Statement::expression(native_ir::Expression::IntCompare {
                 operator: native_ir::CompareOperator::LessThan,
                 left: Box::new(native_ir::Expression::Int(1)),
                 right: Box::new(native_ir::Expression::Int(2)),
@@ -1869,7 +1883,7 @@ mod tests {
         );
         assert_eq!(
             body[1],
-            native_ir::Statement::Expression(native_ir::Expression::IntCompare {
+            native_ir::Statement::expression(native_ir::Expression::IntCompare {
                 operator: native_ir::CompareOperator::GreaterThanOrEqual,
                 left: Box::new(native_ir::Expression::Int(3)),
                 right: Box::new(native_ir::Expression::Int(4)),
@@ -1893,7 +1907,7 @@ mod tests {
         let kinds: Vec<_> = body
             .iter()
             .map(|statement| match statement {
-                native_ir::Statement::Expression(native_ir::Expression::Equality {
+                native_ir::Statement::expression(native_ir::Expression::Equality {
                     kind,
                     negated,
                     ..
@@ -1925,7 +1939,7 @@ mod tests {
         // `&&` binds tighter than `||`.
         assert_eq!(
             body[0],
-            native_ir::Statement::Expression(native_ir::Expression::BoolBinary {
+            native_ir::Statement::expression(native_ir::Expression::BoolBinary {
                 operator: native_ir::BoolOperator::Or,
                 left: Box::new(native_ir::Expression::BoolBinary {
                     operator: native_ir::BoolOperator::And,
@@ -1980,7 +1994,7 @@ mod tests {
         };
         assert_eq!(
             body[0],
-            native_ir::Statement::Expression(native_ir::Expression::Case {
+            native_ir::Statement::expression(native_ir::Expression::Case {
                 subjects: vec![native_ir::Expression::Int(5)],
                 subject_ids: vec![0],
                 tree: native_ir::Decision::Switch {
@@ -1989,14 +2003,14 @@ mod tests {
                         native_ir::Check::Int(1),
                         native_ir::Decision::Run {
                             bindings: vec![],
-                            body: vec![native_ir::Statement::Expression(
+                            body: vec![native_ir::Statement::expression(
                                 native_ir::Expression::Int(10)
                             )],
                         },
                     )],
                     fallback: Box::new(native_ir::Decision::Run {
                         bindings: vec![("n".into(), native_ir::Bound::Variable(0))],
-                        body: vec![native_ir::Statement::Expression(
+                        body: vec![native_ir::Statement::expression(
                             native_ir::Expression::Variable("n".into())
                         )],
                     }),
@@ -2059,7 +2073,7 @@ pub fn main() {
         assert!(choices.is_empty());
         assert_eq!(fallback_fields.len(), 2);
         // `pair.first` reads field 0.
-        let native_ir::Statement::Expression(native_ir::Expression::IntBinary {
+        let native_ir::Statement::expression(native_ir::Expression::IntBinary {
             right, ..
         }) = &body[2]
         else {
@@ -2108,7 +2122,7 @@ pub fn main() {
         );
         assert_eq!(
             body[1],
-            native_ir::Statement::Expression(native_ir::Expression::FieldAccess {
+            native_ir::Statement::expression(native_ir::Expression::FieldAccess {
                 record: Box::new(native_ir::Expression::Variable("pair".into())),
                 index: 0,
             })
@@ -2127,7 +2141,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2158,7 +2172,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2206,7 +2220,7 @@ pub fn main() {
         // The spread tail is used directly rather than rebuilt.
         assert_eq!(
             body[1],
-            native_ir::Statement::Expression(native_ir::Expression::Constructor {
+            native_ir::Statement::expression(native_ir::Expression::Constructor {
                 tag: 1,
                 display: native_ir::ConstructorDisplay::List,
                 arguments: vec![
@@ -2230,7 +2244,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2262,7 +2276,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::Expression(native_ir::Expression::Case {
+        let native_ir::Statement::expression(native_ir::Expression::Case {
             subject_ids,
             tree,
             ..
@@ -2321,7 +2335,7 @@ pub fn main() {
         // uses the new value.
         assert_eq!(
             body[1],
-            native_ir::Statement::Expression(native_ir::Expression::Constructor {
+            native_ir::Statement::expression(native_ir::Expression::Constructor {
                 tag: 0,
                 display: native_ir::ConstructorDisplay::Record {
                     name: "Person".into()
@@ -2405,7 +2419,7 @@ pub fn main() {
                 name: "adder".into(),
                 value: native_ir::Expression::Lambda {
                     parameters: vec!["x".into()],
-                    body: vec![native_ir::Statement::Expression(
+                    body: vec![native_ir::Statement::expression(
                         native_ir::Expression::IntBinary {
                             operator: native_ir::IntOperator::Add,
                             left: Box::new(native_ir::Expression::Variable("x".into())),
@@ -2428,7 +2442,7 @@ pub fn main() {
         );
         assert_eq!(
             body[3],
-            native_ir::Statement::Expression(native_ir::Expression::CallValue {
+            native_ir::Statement::expression(native_ir::Expression::CallValue {
                 callee: Box::new(native_ir::Expression::Variable("adder".into())),
                 arguments: vec![native_ir::Expression::CallValue {
                     callee: Box::new(native_ir::Expression::Variable("doubler".into())),
@@ -2552,7 +2566,7 @@ pub fn main() {
         // The pattern produces bit array checks, and the dynamic
         // `bytes-size(length)` payload read refers to the materialized
         // `length` segment.
-        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[1]
+        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[1]
         else {
             panic!("expected a case");
         };
@@ -2596,7 +2610,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2618,12 +2632,12 @@ pub fn main() {
                         right: Box::new(native_ir::Expression::Int(4)),
                     }),
                 }),
-                if_true: vec![native_ir::Statement::Expression(
+                if_true: vec![native_ir::Statement::expression(
                     native_ir::Expression::Variable("n".into())
                 )],
                 if_false: Box::new(native_ir::Decision::Run {
                     bindings: vec![],
-                    body: vec![native_ir::Statement::Expression(
+                    body: vec![native_ir::Statement::expression(
                         native_ir::Expression::Int(0)
                     )],
                 }),
@@ -2648,7 +2662,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2692,7 +2706,7 @@ pub fn main() {
         let native_ir::Function::Defined { body, .. } = &module.functions[0] else {
             panic!("expected a defined function");
         };
-        let native_ir::Statement::Expression(native_ir::Expression::Case { tree, .. }) = &body[0]
+        let native_ir::Statement::expression(native_ir::Expression::Case { tree, .. }) = &body[0]
         else {
             panic!("expected a case expression");
         };
@@ -2728,7 +2742,7 @@ pub fn main() {
         );
         assert_eq!(
             body[1],
-            native_ir::Statement::Expression(native_ir::Expression::Panic {
+            native_ir::Statement::expression(native_ir::Expression::Panic {
                 kind: native_ir::PanicKind::Panic,
                 message: Some(Box::new(native_ir::Expression::String("boom".into()))),
                 function: "main".into(),

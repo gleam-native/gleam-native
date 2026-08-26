@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 29;
+pub const FORMAT_VERSION: u32 = 30;
 
 /// Whether the bytes are an artifact of the current format version, from
 /// the four-byte little-endian version header alone. The build uses this to
@@ -60,6 +60,9 @@ pub enum Statement {
     Let {
         name: String,
         value: Expression,
+        /// The 1-based source line, or zero for synthesized statements;
+        /// carried into the generated code's debug line information.
+        line: u32,
     },
     /// A `let` with a non-trivial pattern, or a `let assert`. The subject is
     /// bound as decision variable `subject_id` and the tree's bindings
@@ -70,8 +73,34 @@ pub enum Statement {
         subject_id: u32,
         tree: Decision,
         on_failure: Option<AssignmentFailure>,
+        /// The source line, zero when synthesized; see [`Statement::Let`].
+        line: u32,
     },
-    Expression(Expression),
+    Expression {
+        expression: Expression,
+        /// The source line, zero when synthesized; see [`Statement::Let`].
+        line: u32,
+    },
+}
+
+impl Statement {
+    /// An expression statement with no source line: for statements the
+    /// lowering synthesizes rather than reads from source.
+    pub fn expression(expression: Expression) -> Statement {
+        Statement::Expression {
+            expression,
+            line: 0,
+        }
+    }
+
+    /// The statement's source line, zero when synthesized.
+    pub fn line(&self) -> u32 {
+        match self {
+            Statement::Let { line, .. }
+            | Statement::Destructure { line, .. }
+            | Statement::Expression { line, .. } => *line,
+        }
+    }
 }
 
 /// How a failed `let assert` reports itself.
@@ -565,7 +594,7 @@ fn statements_free(
 ) {
     for statement in statements {
         match statement {
-            Statement::Let { name, value } => {
+            Statement::Let { name, value, .. } => {
                 expression_free(value, bound, sink);
                 let _ = bound.insert(name.clone());
             }
@@ -579,7 +608,7 @@ fn statements_free(
                 // Assignment bindings persist for the following statements.
                 decision_free(tree, bound, sink, true);
             }
-            Statement::Expression(expression) => expression_free(expression, bound, sink),
+            Statement::Expression { expression, .. } => expression_free(expression, bound, sink),
         }
     }
 }
@@ -739,8 +768,9 @@ mod tests {
                     left: Box::new(Expression::Variable("x".into())),
                     right: Box::new(Expression::Variable("outer".into())),
                 },
+                line: 0,
             },
-            Statement::Expression(Expression::Case {
+            Statement::expression(Expression::Case {
                 subjects: vec![Expression::Variable("z".into())],
                 subject_ids: vec![0],
                 tree: Decision::Switch {
@@ -748,7 +778,7 @@ mod tests {
                     choices: vec![],
                     fallback: Box::new(Decision::Run {
                         bindings: vec![("n".into(), Bound::Variable(0))],
-                        body: vec![Statement::Expression(Expression::IntBinary {
+                        body: vec![Statement::expression(Expression::IntBinary {
                             operator: IntOperator::Add,
                             left: Box::new(Expression::Variable("n".into())),
                             right: Box::new(Expression::Variable("y".into())),
@@ -768,9 +798,9 @@ mod tests {
     #[test]
     fn nested_lambdas_compose_scopes() {
         // fn(a) { fn(b) { a + b + c } }
-        let body = vec![Statement::Expression(Expression::Lambda {
+        let body = vec![Statement::expression(Expression::Lambda {
             parameters: vec!["b".into()],
-            body: vec![Statement::Expression(Expression::IntBinary {
+            body: vec![Statement::expression(Expression::IntBinary {
                 operator: IntOperator::Add,
                 left: Box::new(Expression::IntBinary {
                     operator: IntOperator::Add,

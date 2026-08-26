@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, Block, InstBuilder, MemFlagsData, Signature, TrapCode, Value, types,
+    AbiParam, Block, InstBuilder, MemFlagsData, Signature, SourceLoc, TrapCode, Value, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -227,6 +227,21 @@ enum PendingFunction {
     },
 }
 
+/// Per-function debug data collected as functions are defined, consumed
+/// by the object backend's DWARF emission. The JIT collects and ignores
+/// it.
+pub struct DebugFunction {
+    pub id: FuncId,
+    /// The `module.function` display name.
+    pub name: String,
+    /// The function's module source path, package-root relative.
+    pub src_path: String,
+    pub code_length: u32,
+    /// Sorted (code offset, source line) pairs: where each source line's
+    /// machine code begins.
+    pub rows: Vec<(u32, u32)>,
+}
+
 pub struct Translator<'a, M: Module> {
     module: &'a mut M,
     /// Gleam (module, function) to declared Cranelift function and whether
@@ -241,6 +256,7 @@ pub struct Translator<'a, M: Module> {
     /// `native_runtime::FIRST_INTERNED_DISPLAY`.
     display_names: Vec<String>,
     display_ids: HashMap<String, u16>,
+    debug_functions: Vec<DebugFunction>,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -255,7 +271,42 @@ impl<'a, M: Module> Translator<'a, M> {
             generated_counter: 0,
             display_names: Vec::new(),
             display_ids: HashMap::new(),
+            debug_functions: Vec::new(),
         })
+    }
+
+    /// The debug data collected so far, leaving the translator empty.
+    pub fn take_debug_functions(&mut self) -> Vec<DebugFunction> {
+        std::mem::take(&mut self.debug_functions)
+    }
+
+    /// Records a defined function's source line table from its compiled
+    /// code; called after `define_function`, before the context is
+    /// cleared.
+    fn record_debug(
+        &mut self,
+        id: FuncId,
+        src_path: &str,
+        name: &str,
+        context: &cranelift_codegen::Context,
+    ) {
+        let Some(compiled) = context.compiled_code() else {
+            return;
+        };
+        let rows: Vec<(u32, u32)> = compiled
+            .buffer
+            .get_srclocs_sorted()
+            .iter()
+            .filter(|location| !location.loc.is_default())
+            .map(|location| (location.start, location.loc.bits()))
+            .collect();
+        self.debug_functions.push(DebugFunction {
+            id,
+            name: name.to_string(),
+            src_path: src_path.to_string(),
+            code_length: compiled.buffer.data().len() as u32,
+            rows,
+        });
     }
 
     /// The interned constructor names collected during translation, for
@@ -327,7 +378,7 @@ impl<'a, M: Module> Translator<'a, M> {
             let id = self
                 .function_id(&module.name, name)
                 .expect("declared in first pass");
-            self.define_function(id, &module.name, &module.src_path, parameters, body)?;
+            self.define_function(id, &module.name, &module.src_path, name, parameters, body)?;
             self.define_pending()?;
         }
         Ok(())
@@ -440,6 +491,7 @@ impl<'a, M: Module> Translator<'a, M> {
         self.module
             .define_function(id, &mut context)
             .map_err(|error| error.to_string())?;
+        self.record_debug(id, src_path, "lambda", &context);
         self.module.clear_context(&mut context);
         Ok(())
     }
@@ -486,6 +538,7 @@ impl<'a, M: Module> Translator<'a, M> {
         self.module
             .define_function(id, &mut context)
             .map_err(|error| error.to_string())?;
+        // Wrappers have no source of their own; no debug rows.
         self.module.clear_context(&mut context);
         Ok(())
     }
@@ -495,6 +548,7 @@ impl<'a, M: Module> Translator<'a, M> {
         id: FuncId,
         module_name: &str,
         src_path: &str,
+        name: &str,
         parameters: &[String],
         body: &[native_ir::Statement],
     ) -> Result<(), String> {
@@ -549,6 +603,8 @@ impl<'a, M: Module> Translator<'a, M> {
         self.module
             .define_function(id, &mut context)
             .map_err(|error| error.to_string())?;
+        let display = format!("{module_name}.{name}");
+        self.record_debug(id, src_path, &display, &context);
         self.module.clear_context(&mut context);
         Ok(())
     }
@@ -665,7 +721,9 @@ fn first_reuse_site(
     for statement in statements {
         let found = match statement {
             native_ir::Statement::Let { value, .. }
-            | native_ir::Statement::Expression(value) => reuse_site_in(value, arity, conditional),
+            | native_ir::Statement::Expression {
+                expression: value, ..
+            } => reuse_site_in(value, arity, conditional),
             native_ir::Statement::Destructure { subject, .. } => reuse_site_in(subject, arity, conditional)
                 // The tree and failure message may construct behind checks.
                 .or(Some(false)),
@@ -1336,17 +1394,19 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
     /// transfer, so its join path is unreachable.
     fn body_transfers(&self, body: &[native_ir::Statement]) -> bool {
         match body.last() {
-            Some(native_ir::Statement::Expression(native_ir::Expression::Call {
-                module,
-                function,
+            Some(native_ir::Statement::Expression {
+                expression: native_ir::Expression::Call {
+                    module, function, ..
+                },
                 ..
-            })) => self
+            }) => self
                 .functions
                 .get(&(module.clone(), function.clone()))
                 .is_some_and(|(_, external)| !external),
-            Some(native_ir::Statement::Expression(native_ir::Expression::CallValue {
+            Some(native_ir::Statement::Expression {
+                expression: native_ir::Expression::CallValue { .. },
                 ..
-            })) => true,
+            }) => true,
             _ => false,
         }
     }
@@ -1430,6 +1490,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let mut result = None;
         for (index, statement) in statements.iter().enumerate() {
             let is_final = index + 1 == statements.len();
+            // Stamp the statement's source line onto the instructions it
+            // produces, for the object backend's debug line information.
+            self.builder.set_srcloc(match statement.line() {
+                0 => SourceLoc::default(),
+                line => SourceLoc::new(line),
+            });
             // What this statement and the rest of the sequence mention.
             // Bindings mentioned by neither release now, so tail-recursive
             // loops release their garbage every iteration; a binding whose
@@ -1449,8 +1515,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             if is_final {
                 // In tail position, a final call transfers control: hand it
                 // the values still owed a release.
-                if let (Some(outer), native_ir::Statement::Expression(expression)) =
-                    (&tail, statement)
+                if let (
+                    Some(outer),
+                    native_ir::Statement::Expression { expression, .. },
+                ) = (&tail, statement)
                 {
                     let mut cleanups = outer.clone();
                     for (name, slot) in &self.scope_owned[scope_start..] {
@@ -1474,7 +1542,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             // unconditionally moves at that use instead.
             let armable = match statement {
                 native_ir::Statement::Let { value, .. } => straight_line(value),
-                native_ir::Statement::Expression(expression) => straight_line(expression),
+                native_ir::Statement::Expression { expression, .. } => {
+                    straight_line(expression)
+                }
                 native_ir::Statement::Destructure { .. } => false,
             };
             if armable {
@@ -1485,14 +1555,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
             }
             result = Some(match statement {
-                native_ir::Statement::Expression(expression) => {
+                native_ir::Statement::Expression { expression, .. } => {
                     let value = self.expression(expression)?;
                     if !is_final {
                         self.dec(value);
                     }
                     value
                 }
-                native_ir::Statement::Let { name, value } => {
+                native_ir::Statement::Let { name, value, .. } => {
                     let value = self.expression(value)?;
                     let variable = self.builder.declare_var(types::I64);
                     self.builder.def_var(variable, value);
@@ -1508,6 +1578,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     subject_id,
                     tree,
                     on_failure,
+                    ..
                 } => {
                     let value = self.expression(subject)?;
                     let mut variables = HashMap::new();
