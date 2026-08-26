@@ -1714,12 +1714,21 @@ mod tests {
         // immutable inserts must not copy the whole map each time, and
         // every version must stay intact. 1000 versions of a growing dict
         // would take ~500k entry copies with clone-on-write.
+        //
+        // Externals receive their arguments as owned temporaries: generated
+        // code increments a surviving binding before the call and releases
+        // the temporary afterwards. Modelling that here is what keeps the
+        // previous version's count above one, so the insert's
+        // uniqueness-steal (which recycles a count-of-one dict in place)
+        // correctly stays on the persistent path.
         let mut versions = vec![gleam_native_dict_new()];
         for n in 0..1000i64 {
             let key = tag_small_int(n);
             let value = tag_small_int(n * 2);
             let previous = *versions.last().expect("versions is never empty");
-            versions.push(gleam_native_dict_insert(key, value, previous));
+            let argument = gleam_native_inc(previous);
+            versions.push(gleam_native_dict_insert(key, value, argument));
+            let _ = gleam_native_dec(argument);
         }
         for (n, version) in versions.iter().enumerate() {
             assert_eq!(gleam_native_dict_size(*version), tag_small_int(n as i64));
