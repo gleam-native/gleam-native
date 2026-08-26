@@ -791,6 +791,19 @@ fn reuse_site_in(
     }
 }
 
+/// Whether `GLEAM_DEBUG_RC` was set when compiling: every inline count
+/// and allocation fast path is replaced by a call into the runtime, whose
+/// checked entry points validate counts, poison freed blocks, and count
+/// allocations. See the runtime's `arm_rc_debugging`.
+fn debug_rc() -> bool {
+    static DEBUG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("GLEAM_DEBUG_RC").is_some()
+            || std::env::var_os("GLEAM_RC_STATS").is_some()
+            || std::env::var_os("GLEAM_TRACE_RC").is_some()
+    });
+    *DEBUG
+}
+
 /// Emits an inline reference count increment: nothing for immediates, one
 /// added to the count word before the object for heap values.
 fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
@@ -1096,13 +1109,35 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
     /// Emits a reference count increment. Yields the value for chaining.
     fn inc(&mut self, value: Value) -> Value {
+        if debug_rc() {
+            let _ = self.runtime_call("gleam_native_inc", &[value]);
+            return value;
+        }
         emit_inc(self.builder, value);
         value
     }
 
     /// Emits a reference count decrement.
     fn dec(&mut self, value: Value) {
+        if debug_rc() {
+            let _ = self.runtime_call("gleam_native_dec", &[value]);
+            return;
+        }
         emit_dec(self.module, self.runtime.destroy, self.builder, value);
+    }
+
+    /// Emits a call to a named C-convention runtime function; used by the
+    /// debug paths, which trade the inline fast paths for the runtime's
+    /// checked ones.
+    fn runtime_call(&mut self, symbol: &str, arguments: &[Value]) -> Value {
+        let call_conv = self.module.isa().default_call_conv();
+        let id = self
+            .module
+            .declare_function(symbol, Linkage::Import, &c_signature(call_conv, arguments.len()))
+            .expect("declare runtime function");
+        let function_ref = self.module.declare_func_in_func(id, self.builder.func);
+        let call = self.builder.ins().call(function_ref, arguments);
+        self.builder.inst_results(call)[0]
     }
 
     /// Emits a per-site permanent cache: a writable data slot holds a
@@ -1170,9 +1205,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         slow: impl FnOnce(&mut Self) -> Result<Value, String>,
     ) -> Result<Value, String> {
         // The class index is the block's total size, count word included,
-        // mirroring the runtime's pool layout.
+        // mirroring the runtime's pool layout. Under `GLEAM_DEBUG_RC` the
+        // runtime allocates instead, so its counters see every object.
         let total = 1 + object_words;
-        if total >= native_runtime::POOL_CLASSES {
+        if total >= native_runtime::POOL_CLASSES || debug_rc() {
             return slow(self);
         }
         let check = self.builder.create_block();
@@ -2504,6 +2540,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         let mut tail = tail;
                         let mut claimed = false;
                         if let Some(candidate) = reuse
+                            && !debug_rc()
                             && self.reuse_token.is_none()
                             && let Some(chain) = &mut tail
                             && first_reuse_site(body, candidate.fields.len(), false)

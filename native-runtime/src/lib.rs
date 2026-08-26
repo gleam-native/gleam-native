@@ -1550,6 +1550,9 @@ pub extern "C" fn gleam_native_closure_new(captures: u64, arity: u64) -> u64 {
 /// Recycles a freed allocation of the same size from the pool when one is
 /// available, falling back to the system allocator.
 pub(crate) fn allocate_words(words: usize) -> u64 {
+    if rc_stats() {
+        let _ = RC_ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let total = 1 + words;
     if total < POOL_CLASSES {
         let recycled = POOL.with(|pool| {
@@ -1620,8 +1623,96 @@ pub static gleam_native_pool: std::sync::atomic::AtomicU64 =
 /// The symbol generated code reads the program thread's pool through.
 pub const POOL_SYMBOL: &str = "gleam_native_pool";
 
+/// Reference-count debugging, armed by environment variables read before
+/// the program thread starts (compiling with `GLEAM_DEBUG_RC=1` also
+/// routes generated code's inline count operations through the checked
+/// runtime entry points):
+///
+/// - `GLEAM_DEBUG_RC=1`: validate every count the runtime touches, abort
+///   with a diagnostic on a dead or garbage count, and poison freed pool
+///   blocks so use-after-free names itself.
+/// - `GLEAM_RC_STATS=1`: count allocations and frees, reporting them (and
+///   the objects still live) when the process exits. Interned literals
+///   and zero-arity constructors are expected to remain live.
+/// - `GLEAM_TRACE_RC=<kind|all>`: print every checked count operation on
+///   objects of the given kind.
+static RC_FLAGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RC_TRACE_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static RC_ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RC_FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const RC_FLAG_DEBUG: u64 = 1;
+const RC_FLAG_STATS: u64 = 2;
+
+/// The header written over a freed pooled block under `GLEAM_DEBUG_RC`,
+/// so a use-after-free reads as this kind instead of stale data.
+const POISON_KIND: u64 = 0xDEAD;
+
+#[inline]
+fn rc_debug() -> bool {
+    RC_FLAGS.load(std::sync::atomic::Ordering::Relaxed) & RC_FLAG_DEBUG != 0
+}
+
+#[inline]
+fn rc_stats() -> bool {
+    RC_FLAGS.load(std::sync::atomic::Ordering::Relaxed) & RC_FLAG_STATS != 0
+}
+
+/// Validates a heap value's count word before an operation on it.
+fn rc_check(value: u64, operation: &str) {
+    let count = unsafe { *((value - 8) as *const u64) };
+    let header = heap_header(value);
+    if header_kind(header) == POISON_KIND {
+        eprintln!(
+            "RC BUG: {operation} of freed (pooled) value {value:#x}, count word {count:#x}"
+        );
+        std::process::abort();
+    }
+    if count == 0 || count > 1 << 40 {
+        eprintln!(
+            "RC BUG: {operation} of dead/garbage value {value:#x}, count {count:#x}, header {header:#x}"
+        );
+        std::process::abort();
+    }
+    let traced = RC_TRACE_KIND.load(std::sync::atomic::Ordering::Relaxed);
+    if traced == header_kind(header) || traced == u64::MAX - 1 {
+        eprintln!("TRACE {operation} {value:#x} kind {} count {count}", header_kind(header));
+    }
+}
+
+extern "C" fn report_rc_stats() {
+    let allocations = RC_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let frees = RC_FREES.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "RC STATS: {allocations} allocations, {frees} frees, {} live at exit \
+         (interned literals and constructors are expected to remain)",
+        allocations - frees
+    );
+}
+
+/// Reads the debug environment; called once before the program thread
+/// runs Gleam code.
+fn arm_rc_debugging() {
+    use std::sync::atomic::Ordering;
+    let mut flags = 0;
+    if std::env::var_os("GLEAM_DEBUG_RC").is_some() {
+        flags |= RC_FLAG_DEBUG;
+    }
+    if std::env::var_os("GLEAM_RC_STATS").is_some() {
+        flags |= RC_FLAG_STATS;
+        unsafe { libc::atexit(report_rc_stats) };
+    }
+    if let Some(kind) = std::env::var_os("GLEAM_TRACE_RC") {
+        let kind = kind.to_string_lossy().parse::<u64>().unwrap_or(u64::MAX - 1);
+        RC_TRACE_KIND.store(kind, Ordering::Relaxed);
+        flags |= RC_FLAG_DEBUG;
+    }
+    RC_FLAGS.store(flags, Ordering::Relaxed);
+}
+
 /// Publishes the calling thread's pool for generated code.
 fn publish_pool() {
+    arm_rc_debugging();
     POOL.with(|pool| {
         gleam_native_pool.store(
             pool as *const Pool as u64,
@@ -1643,6 +1734,13 @@ thread_local! {
 /// pool when its size class has room, back to the system allocator
 /// otherwise.
 fn free_words(base: *mut u64, total: usize) {
+    if rc_stats() {
+        let _ = RC_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if rc_debug() {
+        // Poison the header so a stale reference reads as freed.
+        unsafe { *base.add(1) = POISON_KIND };
+    }
     let pooled = total < POOL_CLASSES
         && POOL.with(|pool| {
             let count = pool.counts[total].get();
@@ -1668,6 +1766,9 @@ fn free_words(base: *mut u64, total: usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
     if value & 1 == 0 {
+        if rc_debug() {
+            rc_check(value, "inc");
+        }
         unsafe { *((value - 8) as *mut u64) += 1 };
     }
     value
@@ -1680,6 +1781,9 @@ pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
 pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
     if value & 1 == 1 {
         return NIL;
+    }
+    if rc_debug() {
+        rc_check(value, "dec");
     }
     let count = (value - 8) as *mut u64;
     unsafe {
@@ -1729,6 +1833,9 @@ fn destroy(first: u64) {
     while let Some(value) = worklist.pop() {
         if value & 1 == 1 {
             continue;
+        }
+        if rc_debug() {
+            rc_check(value, "dec (destroy)");
         }
         let count = (value - 8) as *mut u64;
         unsafe {
