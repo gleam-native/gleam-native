@@ -632,6 +632,20 @@ pub unsafe extern "C" fn gleam_native_string_from_bytes(bytes: *const u8, length
 /// system upholds this for calls from generated code.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gleam_native_string_concat(left: u64, right: u64) -> u64 {
+    // A uniquely-referenced owned left operand — the accumulator in an
+    // `acc <> piece` fold — appends in place, making such folds amortized
+    // linear instead of quadratic. A count of one also rules out every
+    // alias: `s <> s` holds two references, a view of the left string
+    // holds a parent reference, and an interned literal is held by its
+    // cache slot. Views themselves are excluded — their buffer belongs to
+    // the parent.
+    if sole_reference(left)
+        && let StringPayload::Owned(string) =
+            (unsafe { &mut (*container::<StringPayload>(left)).value })
+    {
+        string.push_str(string_value(right));
+        return gleam_native_inc(left);
+    }
     let left = string_value(left);
     let right = string_value(right);
     let mut result = CompactString::with_capacity(left.len() + right.len());
