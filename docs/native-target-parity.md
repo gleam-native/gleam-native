@@ -307,9 +307,9 @@ platform C convention.
   all-target macro is enabled — native runs every shared case (compiled
   ahead of time and executed, its stderr byte-compared against the same
   snapshot Erlang and the three JavaScript runtimes produce) except
-  `echo_dict` (excluded when native could not yet build the standard
-  library; now that the stdlib fork exists it is a candidate to
-  re-enable). Cases whose output legitimately
+  `echo_dict` (excluded by design: conformance cases test the compiler
+  and must not depend on the standard library). Cases whose output
+  legitimately
   diverges (`echo_tuple`'s nested booleans, plus the per-target
   `echo_float`/`echo_custom_type`/`echo_bitarray`) have native-specific
   snapshots documenting their output. The language-semantics tests formerly
