@@ -1045,6 +1045,64 @@ The program recursed too deeply. Gleam tail calls run in constant stack space, b
     }
 }
 
+/// The closure-invocation thunks, registered before Gleam code runs: one
+/// C-convention entry per argument count, generated alongside the program
+/// (Gleam closures use a calling convention Rust cannot call directly).
+/// The JIT registers finalized pointers; ahead-of-time executables
+/// register the linked symbols from their C `main`.
+static INVOKERS: [std::sync::atomic::AtomicUsize; 7] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Registers the closure-invocation thunk for one argument count; called
+/// by the host before the program runs.
+pub fn set_invoker(arity: usize, pointer: *const u8) {
+    INVOKERS[arity].store(pointer as usize, std::sync::atomic::Ordering::Release);
+}
+
+/// Calls a Gleam closure. The closure is borrowed (a reference is taken
+/// for the call, which the callee releases); the arguments are consumed —
+/// the callee owns them. Returns an owned result.
+pub fn call_closure(closure: u64, arguments: &[u64]) -> u64 {
+    let pointer = INVOKERS[arguments.len()].load(std::sync::atomic::Ordering::Acquire);
+    assert!(pointer != 0, "closure invoker not registered");
+    let closure = gleam_native_inc(closure);
+    unsafe {
+        match arguments {
+            [] => std::mem::transmute::<usize, extern "C" fn(u64) -> u64>(pointer)(closure),
+            [a] => std::mem::transmute::<usize, extern "C" fn(u64, u64) -> u64>(pointer)(
+                closure, *a,
+            ),
+            [a, b] => std::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> u64>(
+                pointer,
+            )(closure, *a, *b),
+            [a, b, c] => std::mem::transmute::<
+                usize,
+                extern "C" fn(u64, u64, u64, u64) -> u64,
+            >(pointer)(closure, *a, *b, *c),
+            [a, b, c, d] => std::mem::transmute::<
+                usize,
+                extern "C" fn(u64, u64, u64, u64, u64) -> u64,
+            >(pointer)(closure, *a, *b, *c, *d),
+            [a, b, c, d, e] => std::mem::transmute::<
+                usize,
+                extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64,
+            >(pointer)(closure, *a, *b, *c, *d, *e),
+            [a, b, c, d, e, f] => std::mem::transmute::<
+                usize,
+                extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64,
+            >(pointer)(closure, *a, *b, *c, *d, *e, *f),
+            _ => unreachable!("unsupported closure arity"),
+        }
+    }
+}
+
 /// The command line arguments the host passes in before running `main`.
 static START_ARGUMENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 

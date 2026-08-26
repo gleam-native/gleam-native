@@ -25,6 +25,25 @@ use native_runtime_stdlib as _;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 unsafe extern "C" {
+    /// The closure-invocation thunks the object exports; registered with
+    /// the runtime before the program runs so externals can call Gleam
+    /// callbacks. Names from `native_generation`'s `invoke_symbol`.
+    safe fn gleam_native_invoke_0(closure: u64) -> u64;
+    safe fn gleam_native_invoke_1(closure: u64, a: u64) -> u64;
+    safe fn gleam_native_invoke_2(closure: u64, a: u64, b: u64) -> u64;
+    safe fn gleam_native_invoke_3(closure: u64, a: u64, b: u64, c: u64) -> u64;
+    safe fn gleam_native_invoke_4(closure: u64, a: u64, b: u64, c: u64, d: u64) -> u64;
+    safe fn gleam_native_invoke_5(closure: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> u64;
+    safe fn gleam_native_invoke_6(
+        closure: u64,
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+        e: u64,
+        f: u64,
+    ) -> u64;
+
     /// The C-convention wrapper around the program's `main` function; the
     /// symbol name is `native_generation::translate::ENTRY_SYMBOL`. Declared
     /// `safe` so it coerces to the plain function pointer
@@ -43,6 +62,13 @@ unsafe extern "C" {
 /// Called by the C startup code with the process's real `argc`/`argv`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const std::ffi::c_char) -> i32 {
+    native_runtime::set_invoker(0, gleam_native_invoke_0 as *const u8);
+    native_runtime::set_invoker(1, gleam_native_invoke_1 as *const u8);
+    native_runtime::set_invoker(2, gleam_native_invoke_2 as *const u8);
+    native_runtime::set_invoker(3, gleam_native_invoke_3 as *const u8);
+    native_runtime::set_invoker(4, gleam_native_invoke_4 as *const u8);
+    native_runtime::set_invoker(5, gleam_native_invoke_5 as *const u8);
+    native_runtime::set_invoker(6, gleam_native_invoke_6 as *const u8);
     unsafe {
         native_runtime::start(
             argc,

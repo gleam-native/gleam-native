@@ -65,11 +65,15 @@ pub fn run(
         format!("module `{main_module}` has no `main` function compiled for the native target")
     })?;
     let entry = translator.define_entry_wrapper(main)?;
+    let thunks = translator.define_invoke_thunks()?;
 
     jit_module
         .finalize_definitions()
         .map_err(|error| error.to_string())?;
 
+    for (arity, id) in thunks {
+        native_runtime::set_invoker(arity, jit_module.get_finalized_function(id));
+    }
     let pointer = jit_module.get_finalized_function(entry) as usize;
     let entry_function = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(pointer) };
     native_runtime::run_program_thread(stack_size_megabytes, entry_function)
@@ -109,10 +113,14 @@ pub fn run_tests(
     }
 
     native_runtime::set_constructor_names(translator.constructor_names());
+    let thunks = translator.define_invoke_thunks()?;
     jit_module
         .finalize_definitions()
         .map_err(|error| error.to_string())?;
 
+    for (arity, id) in thunks {
+        native_runtime::set_invoker(arity, jit_module.get_finalized_function(id));
+    }
     let tests: Vec<(String, extern "C" fn() -> u64)> = tests
         .iter()
         .zip(wrappers)

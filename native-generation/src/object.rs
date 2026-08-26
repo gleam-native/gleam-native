@@ -82,6 +82,8 @@ pub fn compile(
         format!("module `{main_module}` has no `main` function compiled for the native target")
     })?;
     let _ = translator.define_entry_wrapper(main)?;
+    // Exported so the static runtime's `main` can register them.
+    let _ = translator.define_invoke_thunks()?;
 
     let program_data = native_runtime::encode_program_data(
         stack_size_megabytes,

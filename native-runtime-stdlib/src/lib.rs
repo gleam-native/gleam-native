@@ -9,10 +9,10 @@
 //! caller — so a function returning one of its arguments unchanged must
 //! increment its reference count first.
 //!
-//! Functions that take Gleam callbacks cannot exist here: generated Gleam
-//! functions use Cranelift's tail calling convention, which Rust cannot
-//! call into. The standard library's Gleam sources give those functions
-//! native fallback bodies built from the closure-free primitives below.
+//! Functions taking Gleam callbacks call them through the runtime's
+//! `call_closure`, which dispatches to generated C-convention thunks
+//! (generated Gleam code itself uses Cranelift's tail calling convention,
+//! which Rust cannot call directly).
 
 use num_bigint::BigInt;
 use num_traits::FromPrimitive;
@@ -867,6 +867,27 @@ pub extern "C" fn gleam_native_dict_to_list(dict: u64) -> u64 {
     )
 }
 
+/// Folds over the entries sorted by key — the same deterministic order
+/// `to_list` produces — calling the Gleam callback as `fun(key, value,
+/// acc)` without materializing the entry list.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_dict_fold(fun: u64, initial: u64, dict: u64) -> u64 {
+    let mut entries: Vec<(u64, u64)> = dict_payload(dict)
+        .map
+        .iter()
+        .map(|(key, value)| (key.0, value.0))
+        .collect();
+    entries.sort_by(|(left, _), (right, _)| cmp_values(*left, *right));
+    let mut accumulator = gleam_native_inc(initial);
+    for (key, value) in entries {
+        accumulator = call_closure(
+            fun,
+            &[gleam_native_inc(key), gleam_native_inc(value), accumulator],
+        );
+    }
+    accumulator
+}
+
 /// A mutable copy of the dict: an O(1) clone sharing the original's tree,
 /// which in-place mutation path-copies as it touches nodes.
 #[unsafe(no_mangle)]
@@ -1398,6 +1419,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_bitarray_to_int_and_size as *const u8,
         ),
         ("gleam_native_dict_new", gleam_native_dict_new as *const u8),
+        ("gleam_native_dict_fold", gleam_native_dict_fold as *const u8),
         ("gleam_native_dict_size", gleam_native_dict_size as *const u8),
         ("gleam_native_dict_get", gleam_native_dict_get as *const u8),
         (

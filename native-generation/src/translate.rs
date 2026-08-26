@@ -96,6 +96,17 @@ pub const PANIC: &str = "gleam_native_panic";
 /// The symbol of the generated C-convention wrapper around `main`.
 pub const ENTRY_SYMBOL: &str = "gleam_native_main_wrapper";
 
+/// The symbol of the C-convention closure-invocation thunk for the given
+/// argument count: how the runtime calls Gleam closures (whose code uses
+/// the tail calling convention Rust cannot call directly).
+pub fn invoke_symbol(arity: usize) -> String {
+    format!("gleam_native_invoke_{arity}")
+}
+
+/// The argument counts thunks are generated for, matching the runtime's
+/// invoker table.
+pub const INVOKE_ARITIES: std::ops::RangeInclusive<usize> = 0..=6;
+
 const NIL: i64 = 1;
 
 pub fn mangle(module: &str, function: &str) -> String {
@@ -612,6 +623,50 @@ impl<'a, M: Module> Translator<'a, M> {
     /// Generates the C-convention wrapper the host uses to call `main`.
     pub fn define_entry_wrapper(&mut self, main: FuncId) -> Result<FuncId, String> {
         self.define_c_wrapper(ENTRY_SYMBOL, main)
+    }
+
+    /// Generates the closure-invocation thunks: one exported C-convention
+    /// function per supported argument count that loads a closure's code
+    /// pointer and calls it (a plain cross-convention call, like the entry
+    /// wrapper's). Through these the runtime can call Gleam callbacks.
+    /// Returns each arity's function id for the JIT to resolve.
+    pub fn define_invoke_thunks(&mut self) -> Result<Vec<(usize, FuncId)>, String> {
+        let call_conv = self.module.isa().default_call_conv();
+        let mut thunks = Vec::new();
+        for arity in INVOKE_ARITIES {
+            let signature = c_signature(call_conv, 1 + arity);
+            let id = self
+                .module
+                .declare_function(&invoke_symbol(arity), Linkage::Export, &signature)
+                .map_err(|error| error.to_string())?;
+
+            let mut context = self.module.make_context();
+            context.func.signature = signature;
+            let mut builder_context = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+
+            let values: Vec<Value> = builder.block_params(entry).to_vec();
+            let closure = values[0];
+            let code = builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), closure, 8);
+            let tail_signature = builder.import_signature(gleam_signature(1 + arity));
+            let call = builder.ins().call_indirect(tail_signature, code, &values);
+            let result = builder.inst_results(call)[0];
+            builder.ins().return_(&[result]);
+            builder.finalize(self.module.target_config());
+
+            self.module
+                .define_function(id, &mut context)
+                .map_err(|error| error.to_string())?;
+            self.module.clear_context(&mut context);
+            thunks.push((arity, id));
+        }
+        Ok(thunks)
     }
 
     /// Generates a C-convention, zero-argument wrapper around the given
