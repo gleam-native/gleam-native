@@ -83,7 +83,7 @@ pub fn run(
     set_frame_table(&jit_module, debug_functions);
     let pointer = jit_module.get_finalized_function(entry) as usize;
     let entry_function = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(pointer) };
-    native_runtime::run_program_thread(stack_size_megabytes, entry_function)
+    native_runtime::run_program_fiber(stack_size_megabytes, entry_function)
 }
 
 /// Registers the compiled functions' finalized code ranges with the
@@ -157,7 +157,7 @@ pub fn run_tests(
 
     // The runner exits the process when the run finishes, so this never
     // returns normally; the JIT module stays alive throughout.
-    native_runtime::run_program_thread_with(stack_size_megabytes, move || {
+    native_runtime::run_program_fiber_with(stack_size_megabytes, move || {
         native_runtime::run_tests(tests);
     })
 }

@@ -17,5 +17,7 @@ im-rc = "15"
 compact_str = "0.9"
 libc = "0.2.189"
 num-bigint.workspace = true
+tokio.workspace = true
+corosensei.workspace = true
 num-traits.workspace = true
 unicode-segmentation.workspace = true

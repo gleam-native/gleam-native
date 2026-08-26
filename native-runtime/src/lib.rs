@@ -1318,9 +1318,15 @@ fn write_stack_trace(mut frame_pointer: usize, write: &mut dyn FnMut(&[u8])) -> 
 /// frame pointers (read out of the signal context) for a trace of the
 /// runaway recursion.
 pub fn install_stack_overflow_handler() {
-    // Warm the pointer-authentication feature probe's cache, so the signal
-    // handler's stack walk performs no first-use system call.
-    let _ = strip_pointer_authentication(0);
+    install_signal_stack();
+    install_fault_handler();
+}
+
+/// Gives the calling thread an alternate signal stack, so the fault handler
+/// can run when the fault is the thread's own stack overflowing. Called on
+/// every thread that executes Gleam code: the program thread, or each
+/// scheduler worker under the fiber runner.
+pub fn install_signal_stack() {
     unsafe {
         let stack = libc::stack_t {
             ss_sp: std::alloc::alloc(
@@ -1330,7 +1336,17 @@ pub fn install_stack_overflow_handler() {
             ss_size: 64 * 1024,
         };
         let _ = libc::sigaltstack(&stack, std::ptr::null_mut());
+    }
+}
 
+/// Installs the process-wide SIGSEGV/SIGBUS action that reports fatal
+/// memory faults; the calling thread still needs [`install_signal_stack`]
+/// for the handler to survive that thread's own stack overflowing.
+fn install_fault_handler() {
+    // Warm the pointer-authentication feature probe's cache, so the signal
+    // handler's stack walk performs no first-use system call.
+    let _ = strip_pointer_authentication(0);
+    unsafe {
         /// The faulting thread's frame pointer register, from the signal's
         /// machine context.
         unsafe fn context_frame_pointer(context: *mut libc::c_void) -> usize {
@@ -1512,6 +1528,7 @@ pub fn run_program_thread_with(
                 &raw const marker as usize,
                 std::sync::atomic::Ordering::Release,
             );
+            arm_rc_debugging();
             publish_pool();
             install_stack_overflow_handler();
             body();
@@ -1520,6 +1537,98 @@ pub fn run_program_thread_with(
         .join()
         .map_err(|_| "the program crashed".to_string())?;
     Ok(())
+}
+
+/// Runs the program's entry wrapper on a fiber: a corosensei coroutine
+/// with its own guard-paged stack, wrapped in a future and executed on a
+/// tokio multi-thread runtime's worker threads. The substrate the process
+/// scheduler will build on; for now the whole program is one fiber that
+/// never suspends. `gleam run` and `gleam test` use this; ahead-of-time
+/// executables still use [`run_program_thread`] until they migrate.
+pub fn run_program_fiber(
+    stack_size_megabytes: u64,
+    entry: extern "C" fn() -> u64,
+) -> Result<(), String> {
+    run_program_fiber_with(stack_size_megabytes, move || {
+        let _ = entry();
+    })
+}
+
+/// [`run_program_fiber`] for an arbitrary body: used by the test runner.
+pub fn run_program_fiber_with(
+    stack_size_megabytes: u64,
+    body: impl FnOnce() + Send + 'static,
+) -> Result<(), String> {
+    let stack_size = usize::try_from(stack_size_megabytes.max(1))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(1024 * 1024);
+    arm_rc_debugging();
+    install_fault_handler();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("gleam-scheduler")
+        .on_thread_start(install_signal_stack)
+        .build()
+        .map_err(|error| format!("could not start the scheduler: {error}"))?;
+    // The stack is committed lazily by the OS, so a generous size reserves
+    // address space, not memory; the guard page below it turns overflow
+    // into a fault the handler reports.
+    let stack = corosensei::stack::DefaultStack::new(stack_size)
+        .map_err(|error| format!("could not allocate the program stack: {error}"))?;
+    let coroutine = corosensei::Coroutine::with_stack(stack, move |_yielder, ()| {
+        // The stack-trace walk's upper bound: a local's address is (within
+        // one frame) the top of this fiber's stack.
+        let marker = 0u8;
+        STACK_TOP.store(
+            &raw const marker as usize,
+            std::sync::atomic::Ordering::Release,
+        );
+        body();
+    });
+    match runtime.block_on(runtime.spawn(FiberFuture { coroutine })) {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(format!("the program crashed: {error}")),
+    }
+}
+
+/// A fiber hosting Gleam code, as a future the tokio runtime can poll.
+/// Each poll republishes the current worker's pool and resumes the fiber; a
+/// yield reschedules immediately (mailbox waits and sleeps will register
+/// real wakers here once processes exist), and the fiber returning
+/// completes the future.
+struct FiberFuture {
+    coroutine: corosensei::Coroutine<(), (), ()>,
+}
+
+/// SAFETY: a corosensei coroutine is not automatically `Send` because the
+/// data on its suspended stack could borrow thread state. Gleam fibers
+/// uphold the invariant wasmtime's async fibers rely on: the only
+/// suspension points are inside this runtime, which never holds a
+/// thread-local borrow across a suspend — the pool is republished for the
+/// new thread on every resume, and generated code reads it fresh per
+/// allocation. Externals run to completion within one resume, so they can
+/// never observe a migration.
+unsafe impl Send for FiberFuture {}
+
+impl std::future::Future for FiberFuture {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        // The coroutine handle owns its heap-allocated stack and is
+        // movable while suspended, so the future needs no pinning.
+        let this = self.get_mut();
+        publish_pool();
+        match this.coroutine.resume(()) {
+            corosensei::CoroutineResult::Yield(()) => {
+                context.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+            corosensei::CoroutineResult::Return(()) => std::task::Poll::Ready(()),
+        }
+    }
 }
 
 /// The state of a `gleam test` run: the discovered tests and the run's
@@ -2229,9 +2338,10 @@ fn arm_rc_debugging() {
     RC_FLAGS.store(flags, Ordering::Relaxed);
 }
 
-/// Publishes the calling thread's pool for generated code.
+/// Publishes the calling thread's pool for generated code. The fiber
+/// runner republishes on every resume, so the pool generated code pops is
+/// always the pool of the worker actually running it.
 fn publish_pool() {
-    arm_rc_debugging();
     POOL.with(|pool| {
         gleam_native_pool.store(
             pool as *const Pool as u64,
@@ -3314,6 +3424,65 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("print_float", print_float as *const u8),
         ("println", println as *const u8),
     ]
+}
+
+#[cfg(test)]
+mod fiber_tests {
+    use super::*;
+
+    /// The fiber runner executes a body to completion and returns.
+    #[test]
+    fn fiber_runs_body() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        run_program_fiber_with(1, move || {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .expect("the fiber program runs");
+        assert!(ran.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// A yielding fiber is rescheduled through the waker until it returns,
+    /// and every resume lands with a published pool — the scheduler
+    /// contract processes will rely on.
+    #[test]
+    fn fiber_yield_reschedules() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("runtime");
+        let coroutine = corosensei::Coroutine::new(|yielder, ()| {
+            for _ in 0..100 {
+                assert!(
+                    gleam_native_pool.load(std::sync::atomic::Ordering::Acquire) != 0,
+                    "every resume republishes the running worker's pool"
+                );
+                yielder.suspend(());
+            }
+        });
+        runtime
+            .block_on(runtime.spawn(FiberFuture { coroutine }))
+            .expect("the fiber completes");
+    }
+
+    /// Prints the round-trip suspend/resume cost; run with
+    /// `cargo test -p native-runtime fiber_switch_cost -- --nocapture`.
+    #[test]
+    fn fiber_switch_cost() {
+        const ROUND_TRIPS: u32 = 1_000_000;
+        let mut coroutine = corosensei::Coroutine::<(), (), ()>::new(|yielder, ()| {
+            for _ in 0..ROUND_TRIPS {
+                yielder.suspend(());
+            }
+        });
+        let started = std::time::Instant::now();
+        while let corosensei::CoroutineResult::Yield(()) = coroutine.resume(()) {}
+        let elapsed = started.elapsed();
+        println!(
+            "fiber round trip: {:.0} ns over {ROUND_TRIPS} suspend/resume pairs",
+            elapsed.as_nanos() as f64 / f64::from(ROUND_TRIPS)
+        );
+    }
 }
 
 #[cfg(test)]
