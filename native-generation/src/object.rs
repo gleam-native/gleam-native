@@ -85,6 +85,9 @@ pub fn compile(
     let _ = translator.define_entry_wrapper(main)?;
     // Exported so the static runtime's `main` can register them.
     let _ = translator.define_invoke_thunks()?;
+    // Exported so the static runtime's `main` can build the interned
+    // literals before the program runs.
+    let _ = translator.define_literal_init()?;
 
     let program_data =
         native_runtime::encode_program_data(stack_size_megabytes, &translator.constructor_names());

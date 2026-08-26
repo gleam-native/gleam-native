@@ -1143,11 +1143,6 @@ pub unsafe fn decode_frame_table(data: *const u8) -> Vec<FrameInfo> {
     table
 }
 
-/// The program thread's approximate stack top, recorded when the thread
-/// starts: the walk stops there, and never dereferences a frame pointer
-/// outside the thread's stack.
-static STACK_TOP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// The Gleam function containing an address, and the source line of the
 /// instruction before it (return addresses point after their call).
 fn resolve_frame(return_address: usize) -> Option<(&'static FrameInfo, u32)> {
@@ -1228,7 +1223,7 @@ const MAX_TRACE_STEPS: usize = 512;
 /// Performs no allocation, so the stack overflow signal handler can use it;
 /// every frame pointer is bounds-checked against the program thread's stack
 /// before it is dereferenced.
-fn write_stack_trace(mut frame_pointer: usize, write: &mut dyn FnMut(&[u8])) -> usize {
+fn write_stack_trace(mut frame_pointer: usize, top: usize, write: &mut dyn FnMut(&[u8])) -> usize {
     fn write_row(write: &mut dyn FnMut(&[u8]), frame: &FrameInfo, line: u32, repeats: usize) {
         let mut digits = [0u8; 20];
         write(b"  ");
@@ -1258,7 +1253,6 @@ fn write_stack_trace(mut frame_pointer: usize, write: &mut dyn FnMut(&[u8])) -> 
         &digits[index..]
     }
 
-    let top = STACK_TOP.load(std::sync::atomic::Ordering::Acquire);
     let mut pending: Option<(&FrameInfo, u32, usize)> = None;
     let mut rows = 0;
     let mut truncated = false;
@@ -1407,7 +1401,7 @@ The program recursed too deeply. Gleam tail calls run in constant stack space, b
             let frame_pointer = unsafe { context_frame_pointer(context) };
             if frame_pointer != 0 {
                 let mut wrote_header = false;
-                let _ = write_stack_trace(frame_pointer, &mut |bytes| {
+                let _ = write_stack_trace(frame_pointer, current_stack_top(), &mut |bytes| {
                     if !wrote_header {
                         wrote_header = true;
                         write_bytes(b"\nstacktrace:\n");
@@ -1524,12 +1518,15 @@ pub fn run_program_thread_with(
             // The stack-trace walk's upper bound: a local's address is
             // (within one frame) the top of this thread's stack.
             let marker = 0u8;
-            STACK_TOP.store(
-                &raw const marker as usize,
-                std::sync::atomic::Ordering::Release,
-            );
+            let top = &raw const marker as usize;
+            let mut context = ProcessContext {
+                pool: POOL.with(|pool| pool as *const Pool),
+                stack_low: top.saturating_sub(stack_size),
+                stack_high: top,
+                reductions: 0,
+            };
+            CURRENT_CONTEXT.with(|current| current.set(&raw mut context));
             arm_rc_debugging();
-            publish_pool();
             install_stack_overflow_handler();
             body();
         })
@@ -1574,17 +1571,20 @@ pub fn run_program_fiber_with(
     // into a fault the handler reports.
     let stack = corosensei::stack::DefaultStack::new(stack_size)
         .map_err(|error| format!("could not allocate the program stack: {error}"))?;
+    let (stack_high, stack_low) = {
+        use corosensei::stack::Stack;
+        (stack.base().get(), stack.limit().get())
+    };
+    let context = Box::new(ProcessContext {
+        pool: std::ptr::null(),
+        stack_low,
+        stack_high,
+        reductions: 0,
+    });
     let coroutine = corosensei::Coroutine::with_stack(stack, move |_yielder, ()| {
-        // The stack-trace walk's upper bound: a local's address is (within
-        // one frame) the top of this fiber's stack.
-        let marker = 0u8;
-        STACK_TOP.store(
-            &raw const marker as usize,
-            std::sync::atomic::Ordering::Release,
-        );
         body();
     });
-    match runtime.block_on(runtime.spawn(FiberFuture { coroutine })) {
+    match runtime.block_on(runtime.spawn(FiberFuture { coroutine, context })) {
         Ok(()) => Ok(()),
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => Err(format!("the program crashed: {error}")),
@@ -1592,22 +1592,24 @@ pub fn run_program_fiber_with(
 }
 
 /// A fiber hosting Gleam code, as a future the tokio runtime can poll.
-/// Each poll republishes the current worker's pool and resumes the fiber; a
-/// yield reschedules immediately (mailbox waits and sleeps will register
-/// real wakers here once processes exist), and the fiber returning
-/// completes the future.
+/// Each poll points the fiber's context at the current worker's pool, sets
+/// it as the thread's running context, and resumes the fiber; a yield
+/// reschedules immediately (mailbox waits and sleeps will register real
+/// wakers here once processes exist), and the fiber returning completes
+/// the future.
 struct FiberFuture {
     coroutine: corosensei::Coroutine<(), (), ()>,
+    context: Box<ProcessContext>,
 }
 
 /// SAFETY: a corosensei coroutine is not automatically `Send` because the
 /// data on its suspended stack could borrow thread state. Gleam fibers
 /// uphold the invariant wasmtime's async fibers rely on: the only
 /// suspension points are inside this runtime, which never holds a
-/// thread-local borrow across a suspend — the pool is republished for the
-/// new thread on every resume, and generated code reads it fresh per
-/// allocation. Externals run to completion within one resume, so they can
-/// never observe a migration.
+/// thread-local borrow across a suspend — the context's pool is rewritten
+/// to the new worker's pool on every resume, and generated code reads it
+/// fresh (through its `env` parameter) per allocation. Externals run to
+/// completion within one resume, so they can never observe a migration.
 unsafe impl Send for FiberFuture {}
 
 impl std::future::Future for FiberFuture {
@@ -1615,15 +1617,18 @@ impl std::future::Future for FiberFuture {
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
+        task: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         // The coroutine handle owns its heap-allocated stack and is
         // movable while suspended, so the future needs no pinning.
         let this = self.get_mut();
-        publish_pool();
-        match this.coroutine.resume(()) {
+        this.context.pool = POOL.with(|pool| pool as *const Pool);
+        CURRENT_CONTEXT.with(|current| current.set(&raw mut *this.context));
+        let result = this.coroutine.resume(());
+        CURRENT_CONTEXT.with(|current| current.set(std::ptr::null_mut()));
+        match result {
             corosensei::CoroutineResult::Yield(()) => {
-                context.waker().wake_by_ref();
+                task.waker().wake_by_ref();
                 std::task::Poll::Pending
             }
             corosensei::CoroutineResult::Return(()) => std::task::Poll::Ready(()),
@@ -1722,9 +1727,13 @@ pub unsafe fn start(
     argv: *const *const std::ffi::c_char,
     program_data: *const u8,
     frame_table: *const u8,
+    literal_init: extern "C" fn() -> u64,
     entry: extern "C" fn() -> u64,
 ) -> i32 {
     set_frame_table(unsafe { decode_frame_table(frame_table) });
+    // Build every interned literal (marked permanent) before any Gleam
+    // code runs; single-threaded, so the slots need no synchronization.
+    let _ = literal_init();
     let mut arguments = Vec::new();
     for index in 1..argc.max(0) {
         let argument = unsafe { std::ffi::CStr::from_ptr(*argv.add(index as usize)) };
@@ -2216,17 +2225,95 @@ pub const POOL_CLASSES: usize = 35;
 /// after a large working set shrinks.
 const POOL_CLASS_CAPACITY: u64 = 4096;
 
-/// The address of the program thread's [`Pool`], published by
-/// [`run_program_thread_with`] before any Gleam code runs so that generated
-/// code (which runs only on that thread) can pop pooled allocations inline.
-/// Zero until published; inline fast paths check and fall back to the
-/// runtime's allocation call.
-#[unsafe(no_mangle)]
-#[allow(non_upper_case_globals)]
-pub static gleam_native_pool: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The per-execution context generated code reaches through its hidden
+/// leading `env` parameter: every tail-convention function receives a
+/// pointer to the running program's (later: process's) context. The layout
+/// is part of the code generation contract — generated code loads `pool`
+/// at byte offset 0; the remaining fields are read by the runtime.
+#[repr(C)]
+pub struct ProcessContext {
+    /// The pool generated code pops inline allocations from: always the
+    /// pool of the worker thread currently running this context's code,
+    /// rewritten by the scheduler on every resume.
+    pub pool: *const Pool,
+    /// The bounds of the stack the context's code runs on (a fiber stack,
+    /// or the program thread's stack under the legacy runner): the
+    /// stack-trace walk stops at `stack_high` and never dereferences a
+    /// frame pointer outside them.
+    pub stack_low: usize,
+    pub stack_high: usize,
+    /// Reserved for cooperative preemption: a budget the generated code
+    /// will eventually decrement and yield on.
+    pub reductions: i64,
+}
 
-/// The symbol generated code reads the program thread's pool through.
-pub const POOL_SYMBOL: &str = "gleam_native_pool";
+thread_local! {
+    /// The context of the code currently running on this thread, set by
+    /// the runners before Gleam code executes. The C-convention entry
+    /// points generated code exposes (the entry wrapper, closure-invoke
+    /// thunks, test wrappers) read it through
+    /// [`gleam_native_current_context`] to pass as the hidden `env`
+    /// argument. Const-initialized so reads never allocate — the fault
+    /// handler reads it during a stack overflow.
+    static CURRENT_CONTEXT: Cell<*mut ProcessContext> =
+        const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// The running context's address, for the generated C-convention wrappers
+/// to pass as the hidden `env` argument when crossing into tail-convention
+/// code.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_current_context() -> u64 {
+    CURRENT_CONTEXT.with(|context| context.get()) as u64
+}
+
+/// The symbol of [`gleam_native_current_context`], imported by generated
+/// C-convention wrappers.
+pub const CURRENT_CONTEXT_SYMBOL: &str = "gleam_native_current_context";
+
+/// The stack top recorded in the running context, or zero when no context
+/// is set: the stack-trace walk's upper bound.
+fn current_stack_top() -> usize {
+    let context = CURRENT_CONTEXT.with(|context| context.get());
+    if context.is_null() {
+        0
+    } else {
+        unsafe { (*context).stack_high }
+    }
+}
+
+/// The sign bit of a count word marks a permanent object — an interned
+/// literal or zero-arity constructor, shared by every process for the
+/// program's whole life. Count operations (inline and runtime) test the
+/// bit and touch nothing when it is set, so permanent objects are safe to
+/// share across scheduler threads without atomics.
+pub const PERMANENT_COUNT: u64 = 1 << 63;
+
+/// Whether a heap value's count word marks it permanent.
+fn is_permanent(value: u64) -> bool {
+    unsafe { *((value - 8) as *const u64) & PERMANENT_COUNT != 0 }
+}
+
+/// Marks a heap value permanent: its count operations become no-ops and it
+/// is never freed. Called by the generated literal-init function on each
+/// interned literal before the program runs; returns the value. A no-op
+/// for immediates.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_make_permanent(value: u64) -> u64 {
+    if !is_immediate(value) {
+        unsafe { *((value - 8) as *mut u64) = PERMANENT_COUNT };
+    }
+    value
+}
+
+/// The symbol of [`gleam_native_make_permanent`], called by the generated
+/// literal-init function.
+pub const MAKE_PERMANENT_SYMBOL: &str = "gleam_native_make_permanent";
+
+/// The symbol of the generated literal-init function, which builds every
+/// interned literal into its slot (marked permanent) before the program
+/// runs; called by the host once, single-threaded.
+pub const LITERAL_INIT_SYMBOL: &str = "gleam_native_literal_init";
 
 /// Reference-count debugging, armed by environment variables read before
 /// the program thread starts (compiling with `GLEAM_DEBUG_RC=1` also
@@ -2264,8 +2351,13 @@ fn rc_stats() -> bool {
 }
 
 /// Validates a heap value's count word before an operation on it.
+/// Permanent objects are exempt: their count word is the permanent bit,
+/// not a live count.
 fn rc_check(value: u64, operation: &str) {
     let count = unsafe { *((value - 8) as *const u64) };
+    if count & PERMANENT_COUNT != 0 {
+        return;
+    }
     let header = heap_header(value);
     if header_kind(header) == POISON_KIND {
         eprintln!("RC BUG: {operation} of freed (pooled) value {value:#x}, count word {count:#x}");
@@ -2338,18 +2430,6 @@ fn arm_rc_debugging() {
     RC_FLAGS.store(flags, Ordering::Relaxed);
 }
 
-/// Publishes the calling thread's pool for generated code. The fiber
-/// runner republishes on every resume, so the pool generated code pops is
-/// always the pool of the worker actually running it.
-fn publish_pool() {
-    POOL.with(|pool| {
-        gleam_native_pool.store(
-            pool as *const Pool as u64,
-            std::sync::atomic::Ordering::Release,
-        )
-    });
-}
-
 thread_local! {
     static POOL: Pool = const {
         Pool {
@@ -2391,10 +2471,11 @@ fn free_words(base: *mut u64, total: usize) {
     }
 }
 
-/// Increments a value's reference count. A no-op for immediates.
+/// Increments a value's reference count. A no-op for immediates and
+/// permanent objects.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
-    if !is_immediate(value) {
+    if !is_immediate(value) && !is_permanent(value) {
         if rc_debug() {
             rc_check(value, "inc");
         }
@@ -2404,11 +2485,12 @@ pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
 }
 
 /// Decrements a value's reference count, destroying the object when it
-/// reaches zero. A no-op for immediates. The common cases — an immediate,
-/// or a count that stays positive — touch nothing but the count word.
+/// reaches zero. A no-op for immediates and permanent objects. The common
+/// cases — an immediate, or a count that stays positive — touch nothing
+/// but the count word.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
-    if is_immediate(value) {
+    if is_immediate(value) || is_permanent(value) {
         return NIL;
     }
     if rc_debug() {
@@ -2460,7 +2542,7 @@ fn destroy(first: u64) {
     let mut worklist = WORKLIST.take();
     free_object(first, &mut worklist);
     while let Some(value) = worklist.pop() {
-        if is_immediate(value) {
+        if is_immediate(value) || is_permanent(value) {
             continue;
         }
         if rc_debug() {
@@ -3148,7 +3230,7 @@ pub unsafe extern "C" fn gleam_native_panic(
     // walk resolves nothing (no frame table registered, or an unsupported
     // platform), fall back to the panic site metadata baked into the call.
     let mut trace = String::new();
-    let _ = write_stack_trace(current_frame_pointer(), &mut |bytes| {
+    let _ = write_stack_trace(current_frame_pointer(), current_stack_top(), &mut |bytes| {
         trace.push_str(std::str::from_utf8(bytes).expect("trace rows are UTF-8"));
     });
     eprintln!("stacktrace:");
@@ -3414,9 +3496,14 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("gleam_native_inc", gleam_native_inc as *const u8),
         ("gleam_native_dec", gleam_native_dec as *const u8),
         ("gleam_native_destroy", gleam_native_destroy as *const u8),
-        // A data symbol, not a function: generated code loads the program
-        // thread's pool address through it for inline pooled allocation.
-        (POOL_SYMBOL, (&raw const gleam_native_pool) as *const u8),
+        (
+            CURRENT_CONTEXT_SYMBOL,
+            gleam_native_current_context as *const u8,
+        ),
+        (
+            MAKE_PERMANENT_SYMBOL,
+            gleam_native_make_permanent as *const u8,
+        ),
         ("gleam_native_echo", gleam_native_echo as *const u8),
         ("gleam_native_panic", gleam_native_panic as *const u8),
         ("print_int", print_int as *const u8),
@@ -3443,8 +3530,9 @@ mod fiber_tests {
     }
 
     /// A yielding fiber is rescheduled through the waker until it returns,
-    /// and every resume lands with a published pool — the scheduler
-    /// contract processes will rely on.
+    /// and every resume lands with the running context set and its pool
+    /// pointing at the current worker's pool — the scheduler contract
+    /// processes will rely on.
     #[test]
     fn fiber_yield_reschedules() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3453,15 +3541,24 @@ mod fiber_tests {
             .expect("runtime");
         let coroutine = corosensei::Coroutine::new(|yielder, ()| {
             for _ in 0..100 {
+                let context = CURRENT_CONTEXT.with(|current| current.get());
+                assert!(!context.is_null(), "every resume sets the context");
+                let expected = POOL.with(|pool| pool as *const Pool);
                 assert!(
-                    gleam_native_pool.load(std::sync::atomic::Ordering::Acquire) != 0,
-                    "every resume republishes the running worker's pool"
+                    std::ptr::eq(unsafe { (*context).pool }, expected),
+                    "the context's pool is the running worker's pool"
                 );
                 yielder.suspend(());
             }
         });
+        let context = Box::new(ProcessContext {
+            pool: std::ptr::null(),
+            stack_low: 0,
+            stack_high: 0,
+            reductions: 0,
+        });
         runtime
-            .block_on(runtime.spawn(FiberFuture { coroutine }))
+            .block_on(runtime.spawn(FiberFuture { coroutine, context }))
             .expect("the fiber completes");
     }
 

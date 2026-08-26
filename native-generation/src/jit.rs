@@ -71,6 +71,7 @@ pub fn run(
     })?;
     let entry = translator.define_entry_wrapper(main)?;
     let thunks = translator.define_invoke_thunks()?;
+    let literal_init = translator.define_literal_init()?;
     let debug_functions = translator.take_debug_functions();
 
     jit_module
@@ -81,9 +82,19 @@ pub fn run(
         native_runtime::set_invoker(arity, jit_module.get_finalized_function(id));
     }
     set_frame_table(&jit_module, debug_functions);
+    call_literal_init(&jit_module, literal_init);
     let pointer = jit_module.get_finalized_function(entry) as usize;
     let entry_function = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(pointer) };
     native_runtime::run_program_fiber(stack_size_megabytes, entry_function)
+}
+
+/// Runs the generated literal-init function: builds every interned
+/// literal (marked permanent) before any Gleam code runs. Called on the
+/// compiler thread, single-threaded, so the slots need no synchronization.
+fn call_literal_init(jit_module: &JITModule, id: cranelift_module::FuncId) {
+    let pointer = jit_module.get_finalized_function(id) as usize;
+    let literal_init = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(pointer) };
+    let _ = literal_init();
 }
 
 /// Registers the compiled functions' finalized code ranges with the
@@ -135,6 +146,7 @@ pub fn run_tests(
 
     native_runtime::set_constructor_names(translator.constructor_names());
     let thunks = translator.define_invoke_thunks()?;
+    let literal_init = translator.define_literal_init()?;
     let debug_functions = translator.take_debug_functions();
     jit_module
         .finalize_definitions()
@@ -144,6 +156,7 @@ pub fn run_tests(
         native_runtime::set_invoker(arity, jit_module.get_finalized_function(id));
     }
     set_frame_table(&jit_module, debug_functions);
+    call_literal_init(&jit_module, literal_init);
     let tests: Vec<(String, extern "C" fn() -> u64)> = tests
         .iter()
         .zip(wrappers)

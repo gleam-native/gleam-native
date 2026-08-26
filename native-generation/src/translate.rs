@@ -88,9 +88,18 @@ pub const ECHO: &str = "gleam_native_echo";
 /// code emits inline.
 pub const DESTROY: &str = "gleam_native_destroy";
 
-/// The symbol of the runtime data word holding the program thread's
-/// allocation pool address, read by inline pooled allocations.
-pub const POOL: &str = "gleam_native_pool";
+/// The symbol of the runtime function returning the running context's
+/// address: how generated C-convention wrappers obtain the hidden `env`
+/// argument when crossing into tail-convention code.
+pub const CURRENT_CONTEXT: &str = "gleam_native_current_context";
+
+/// The symbol of the runtime function that marks a value permanent,
+/// called by the generated literal-init function on each interned literal.
+pub const MAKE_PERMANENT: &str = "gleam_native_make_permanent";
+
+/// The byte offset of the pool pointer inside the context, read by inline
+/// pooled allocations through `env`.
+const CONTEXT_POOL_OFFSET: i32 = 0;
 
 /// The symbol of the runtime's panic/todo report-and-abort function.
 pub const PANIC: &str = "gleam_native_panic";
@@ -122,11 +131,15 @@ pub fn mangle(module: &str, function: &str) -> String {
     format!("gleam${}${}", module.replace('/', "$"), function)
 }
 
+/// The signature of a Gleam function of the given arity: the hidden
+/// context parameter (`env`, always first), then the Gleam arguments.
+/// Every tail-convention function receives and forwards `env`; the arity
+/// counts only the Gleam arguments.
 fn gleam_signature(arity: usize) -> Signature {
     let mut signature = Signature::new(CallConv::Tail);
     signature
         .params
-        .extend(std::iter::repeat_n(AbiParam::new(types::I64), arity));
+        .extend(std::iter::repeat_n(AbiParam::new(types::I64), 1 + arity));
     signature.returns.push(AbiParam::new(types::I64));
     signature
 }
@@ -177,16 +190,17 @@ struct RuntimeFunctions {
     echo: FuncId,
     destroy: FuncId,
     panic: FuncId,
-    /// The pool-address data symbol, for inline pooled allocation.
-    pool: DataId,
+    /// The running context's address, called by C-convention wrappers to
+    /// obtain the hidden `env` argument.
+    current_context: FuncId,
+    /// Marks an interned literal permanent, called by the literal-init
+    /// function.
+    make_permanent: FuncId,
 }
 
 impl RuntimeFunctions {
     fn declare(module: &mut impl Module) -> Result<Self, String> {
         let call_conv = module.isa().default_call_conv();
-        let pool = module
-            .declare_data(POOL, Linkage::Import, true, false)
-            .map_err(|error| error.to_string())?;
         let mut declare = |symbol: &str, arity: usize| {
             module
                 .declare_function(symbol, Linkage::Import, &c_signature(call_conv, arity))
@@ -227,7 +241,8 @@ impl RuntimeFunctions {
             echo: declare(ECHO, 5)?,
             destroy: declare(DESTROY, 1)?,
             panic: declare(PANIC, 7)?,
-            pool,
+            current_context: declare(CURRENT_CONTEXT, 0)?,
+            make_permanent: declare(MAKE_PERMANENT, 1)?,
         })
     }
 }
@@ -249,6 +264,16 @@ enum PendingFunction {
         target_external: bool,
         arity: u32,
     },
+}
+
+/// An interned literal registered during translation: its writable slot
+/// (read by every evaluation site) and what to build into it. The
+/// generated literal-init function populates every slot — each value
+/// marked permanent — before the program runs, so sites are a plain load
+/// with no count traffic and no lazy-build race across scheduler threads.
+enum InternedLiteral {
+    String { slot: DataId, content: String },
+    Record { slot: DataId, tag: u32, display: u16 },
 }
 
 /// Per-function debug data collected as functions are defined, consumed
@@ -281,6 +306,9 @@ pub struct Translator<'a, M: Module> {
     display_names: Vec<String>,
     display_ids: HashMap<String, u16>,
     debug_functions: Vec<DebugFunction>,
+    /// The interned literals registered so far, built by the generated
+    /// literal-init function.
+    literals: Vec<InternedLiteral>,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -296,6 +324,7 @@ impl<'a, M: Module> Translator<'a, M> {
             display_names: Vec::new(),
             display_ids: HashMap::new(),
             debug_functions: Vec::new(),
+            literals: Vec::new(),
         })
     }
 
@@ -455,11 +484,12 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let closure = builder.block_params(entry)[0];
+        let env = builder.block_params(entry)[0];
+        let closure = builder.block_params(entry)[1];
         let mut environment = HashMap::new();
         let mut scope_owned = Vec::new();
         for (index, parameter) in parameters.iter().enumerate() {
-            let value = builder.block_params(entry)[1 + index];
+            let value = builder.block_params(entry)[2 + index];
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
             let _ = environment.insert(parameter.clone(), variable);
@@ -485,12 +515,14 @@ impl<'a, M: Module> Translator<'a, M> {
             src_path,
             module: self.module,
             builder: &mut builder,
+            env,
             environment,
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
+            literals: &mut self.literals,
             scope_owned,
             dying: HashSet::new(),
             consumed: Vec::new(),
@@ -537,11 +569,13 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let closure = builder.block_params(entry)[0];
-        let arguments: Vec<Value> = builder.block_params(entry)[1..].to_vec();
+        let env = builder.block_params(entry)[0];
+        let closure = builder.block_params(entry)[1];
+        let arguments: Vec<Value> = builder.block_params(entry)[2..].to_vec();
         let target_ref = self.module.declare_func_in_func(target, builder.func);
         if target_external {
-            // Externals borrow: call, then release what this wrapper owns.
+            // Externals borrow (and take no env): call, then release what
+            // this wrapper owns.
             let call = builder.ins().call(target_ref, &arguments);
             let result = builder.inst_results(call)[0];
             emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
@@ -551,9 +585,11 @@ impl<'a, M: Module> Translator<'a, M> {
             builder.ins().return_(&[result]);
         } else {
             // Gleam functions own their arguments: release the closure and
-            // transfer the rest with a genuine tail call.
+            // transfer the rest (with the env) as a genuine tail call.
             emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
-            builder.ins().return_call(target_ref, &arguments);
+            let mut values = vec![env];
+            values.extend(&arguments);
+            builder.ins().return_call(target_ref, &values);
         }
         builder.finalize(self.module.target_config());
 
@@ -584,10 +620,11 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
+        let env = builder.block_params(entry)[0];
         let mut environment = HashMap::new();
         let mut scope_owned = Vec::new();
         for (index, parameter) in parameters.iter().enumerate() {
-            let value = builder.block_params(entry)[index];
+            let value = builder.block_params(entry)[1 + index];
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
             let _ = environment.insert(parameter.clone(), variable);
@@ -603,12 +640,14 @@ impl<'a, M: Module> Translator<'a, M> {
             src_path,
             module: self.module,
             builder: &mut builder,
+            env,
             environment,
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
+            literals: &mut self.literals,
             scope_owned,
             dying: HashSet::new(),
             consumed: Vec::new(),
@@ -658,8 +697,18 @@ impl<'a, M: Module> Translator<'a, M> {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
 
-            let values: Vec<Value> = builder.block_params(entry).to_vec();
-            let closure = values[0];
+            let closure_and_arguments: Vec<Value> = builder.block_params(entry).to_vec();
+            let closure = closure_and_arguments[0];
+            // The hidden env argument comes from the runtime's thread-local
+            // running context: thunks are called from C code, which has no
+            // env of its own.
+            let context_ref = self
+                .module
+                .declare_func_in_func(self.runtime.current_context, builder.func);
+            let context_call = builder.ins().call(context_ref, &[]);
+            let env = builder.inst_results(context_call)[0];
+            let mut values = vec![env];
+            values.extend(closure_and_arguments);
             let code = builder
                 .ins()
                 .load(types::I64, MemFlagsData::trusted(), closure, 8);
@@ -697,10 +746,98 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
+        // The target is a tail-convention Gleam function: pass the running
+        // context from the runtime's thread-local as its env.
+        let context_ref = self
+            .module
+            .declare_func_in_func(self.runtime.current_context, builder.func);
+        let context_call = builder.ins().call(context_ref, &[]);
+        let env = builder.inst_results(context_call)[0];
         let target_ref = self.module.declare_func_in_func(target, builder.func);
-        let call = builder.ins().call(target_ref, &[]);
+        let call = builder.ins().call(target_ref, &[env]);
         let result = builder.inst_results(call)[0];
         builder.ins().return_(&[result]);
+        builder.finalize(self.module.target_config());
+
+        self.module
+            .define_function(id, &mut context)
+            .map_err(|error| error.to_string())?;
+        self.module.clear_context(&mut context);
+        Ok(id)
+    }
+
+    /// Generates the exported C-convention literal-init function: builds
+    /// every interned literal into its slot, marked permanent, so that
+    /// evaluation sites are a plain load. The host calls it once, before
+    /// any Gleam code runs. Must be called after every module is defined,
+    /// so all literals are registered.
+    pub fn define_literal_init(&mut self) -> Result<FuncId, String> {
+        let call_conv = self.module.isa().default_call_conv();
+        let signature = c_signature(call_conv, 0);
+        let id = self
+            .module
+            .declare_function(
+                native_runtime::LITERAL_INIT_SYMBOL,
+                Linkage::Export,
+                &signature,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let mut context = self.module.make_context();
+        context.func.signature = signature;
+        let mut builder_context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let pointer_type = self.module.target_config().pointer_type();
+        let literals = std::mem::take(&mut self.literals);
+        for literal in &literals {
+            let (slot, value) = match literal {
+                InternedLiteral::String { slot, content } => {
+                    let bytes = self
+                        .module
+                        .declare_anonymous_data(false, false)
+                        .map_err(|error| error.to_string())?;
+                    let mut description = DataDescription::new();
+                    description.define(content.as_bytes().to_vec().into_boxed_slice());
+                    self.module
+                        .define_data(bytes, &description)
+                        .map_err(|error| error.to_string())?;
+                    let bytes_ref = self.module.declare_data_in_func(bytes, builder.func);
+                    let pointer = builder.ins().symbol_value(pointer_type, bytes_ref);
+                    let length = builder.ins().iconst(types::I64, content.len() as i64);
+                    let constructor_ref = self
+                        .module
+                        .declare_func_in_func(self.runtime.string_from_bytes, builder.func);
+                    let call = builder.ins().call(constructor_ref, &[pointer, length]);
+                    (*slot, builder.inst_results(call)[0])
+                }
+                InternedLiteral::Record { slot, tag, display } => {
+                    let tag = builder.ins().iconst(types::I64, *tag as i64);
+                    let arity = builder.ins().iconst(types::I64, 0);
+                    let display = builder.ins().iconst(types::I64, *display as i64);
+                    let record_new_ref = self
+                        .module
+                        .declare_func_in_func(self.runtime.record_new, builder.func);
+                    let call = builder.ins().call(record_new_ref, &[tag, arity, display]);
+                    (*slot, builder.inst_results(call)[0])
+                }
+            };
+            let permanent_ref = self
+                .module
+                .declare_func_in_func(self.runtime.make_permanent, builder.func);
+            let call = builder.ins().call(permanent_ref, &[value]);
+            let permanent = builder.inst_results(call)[0];
+            let slot_ref = self.module.declare_data_in_func(slot, builder.func);
+            let slot_address = builder.ins().symbol_value(pointer_type, slot_ref);
+            let _ = builder
+                .ins()
+                .store(MemFlagsData::trusted(), permanent, slot_address, 0);
+        }
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().return_(&[zero]);
         builder.finalize(self.module.target_config());
 
         self.module
@@ -947,10 +1084,12 @@ fn debug_rc() -> bool {
     *DEBUG
 }
 
-/// Emits an inline reference count increment: nothing for immediates, one
-/// added to the count word before the object for heap values.
+/// Emits an inline reference count increment: nothing for immediates and
+/// permanent objects (count word sign bit set), one added to the count
+/// word before the object for ordinary heap values.
 fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
     let heap = builder.create_block();
+    let counted = builder.create_block();
     let done = builder.create_block();
     let immediate = builder.ins().band_imm_u(value, IMMEDIATE_MASK);
     builder.ins().brif(immediate, done, &[], heap, &[]);
@@ -960,6 +1099,13 @@ fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
     let count = builder
         .ins()
         .load(types::I64, MemFlagsData::trusted(), value, -8);
+    let permanent = builder
+        .ins()
+        .icmp_imm_s(IntCC::SignedLessThan, count, 0);
+    builder.ins().brif(permanent, done, &[], counted, &[]);
+    builder.seal_block(counted);
+
+    builder.switch_to_block(counted);
     let incremented = builder.ins().iadd_imm_s(count, 1);
     let _ = builder
         .ins()
@@ -970,9 +1116,10 @@ fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
     builder.switch_to_block(done);
 }
 
-/// Emits an inline reference count decrement: nothing for immediates, one
-/// subtracted from the count word for heap values, and a cold runtime
-/// destroy call when the count reaches zero.
+/// Emits an inline reference count decrement: nothing for immediates and
+/// permanent objects (count word sign bit set), one subtracted from the
+/// count word for ordinary heap values, and a cold runtime destroy call
+/// when the count reaches zero.
 fn emit_dec<M: Module>(
     module: &mut M,
     destroy: FuncId,
@@ -980,6 +1127,7 @@ fn emit_dec<M: Module>(
     value: Value,
 ) {
     let heap = builder.create_block();
+    let counted = builder.create_block();
     let dead = builder.create_block();
     let done = builder.create_block();
     let immediate = builder.ins().band_imm_u(value, IMMEDIATE_MASK);
@@ -990,6 +1138,13 @@ fn emit_dec<M: Module>(
     let count = builder
         .ins()
         .load(types::I64, MemFlagsData::trusted(), value, -8);
+    let permanent = builder
+        .ins()
+        .icmp_imm_s(IntCC::SignedLessThan, count, 0);
+    builder.ins().brif(permanent, done, &[], counted, &[]);
+    builder.seal_block(counted);
+
+    builder.switch_to_block(counted);
     let decremented = builder.ins().iadd_imm_s(count, -1);
     let _ = builder
         .ins()
@@ -1040,12 +1195,16 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     src_path: &'a str,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
+    /// The function's hidden context parameter, forwarded to every Gleam
+    /// call and read by inline pooled allocation.
+    env: Value,
     environment: HashMap<String, Variable>,
     pending: &'a mut Vec<PendingFunction>,
     wrappers: &'a mut HashMap<(String, String), FuncId>,
     generated_counter: &'a mut u32,
     display_names: &'a mut Vec<String>,
     display_ids: &'a mut HashMap<String, u16>,
+    literals: &'a mut Vec<InternedLiteral>,
     /// Named variable slots holding owned references, decremented when
     /// their scope's statement sequence finishes — or earlier, as soon as
     /// no remaining statement mentions them, so that tail-recursive loops
@@ -1329,15 +1488,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         self.builder.inst_results(call)[0]
     }
 
-    /// Emits a per-site permanent cache: a writable data slot holds a
-    /// value built at most once (cold path), and every evaluation takes
-    /// its own reference. The slot's own reference is never released, so
-    /// only immutable values whose sharing is unobservable belong here —
-    /// string literals and zero-arity constructors.
-    fn interned(
-        &mut self,
-        build: impl FnOnce(&mut Self) -> Result<Value, String>,
-    ) -> Result<Value, String> {
+    /// Emits an interned literal's evaluation: a plain load of its slot.
+    /// The generated literal-init function populates every slot with a
+    /// permanently-marked value before the program runs, so sites carry no
+    /// build check and no count traffic (count operations skip permanent
+    /// objects). Only immutable values whose sharing is unobservable
+    /// belong here — string literals and zero-arity constructors.
+    fn interned(&mut self, literal: impl FnOnce(DataId) -> InternedLiteral) -> Result<Value, String> {
         let slot = self
             .module
             .declare_anonymous_data(true, false)
@@ -1348,35 +1505,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         self.module
             .define_data(slot, &description)
             .map_err(|error| error.to_string())?;
+        self.literals.push(literal(slot));
         let slot_ref = self.module.declare_data_in_func(slot, self.builder.func);
         let pointer_type = self.module.target_config().pointer_type();
         let slot_address = self.builder.ins().symbol_value(pointer_type, slot_ref);
-        let cached = self
+        Ok(self
             .builder
             .ins()
-            .load(types::I64, MemFlagsData::trusted(), slot_address, 0);
-
-        let build_block = self.builder.create_block();
-        let join = self.builder.create_block();
-        self.builder.append_block_param(join, types::I64);
-        self.builder
-            .ins()
-            .brif(cached, join, &[cached.into()], build_block, &[]);
-        self.builder.seal_block(build_block);
-        self.builder.set_cold_block(build_block);
-
-        self.builder.switch_to_block(build_block);
-        let built = build(self)?;
-        let _ = self
-            .builder
-            .ins()
-            .store(MemFlagsData::trusted(), built, slot_address, 0);
-        self.builder.ins().jump(join, &[built.into()]);
-        self.builder.seal_block(join);
-
-        self.builder.switch_to_block(join);
-        let value = self.builder.block_params(join)[0];
-        Ok(self.inc(value))
+            .load(types::I64, MemFlagsData::trusted(), slot_address, 0))
     }
 
     /// Emits a call to the runtime's record allocator, which also writes
@@ -1478,25 +1614,19 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         if total >= native_runtime::POOL_CLASSES || debug_rc() {
             return slow(self);
         }
-        let check = self.builder.create_block();
         let hit = self.builder.create_block();
         let miss = self.builder.create_block();
         let join = self.builder.create_block();
         self.builder.append_block_param(join, types::I64);
 
-        let pool_ref = self
-            .module
-            .declare_data_in_func(self.runtime.pool, self.builder.func);
-        let pointer_type = self.module.target_config().pointer_type();
-        let pool_address = self.builder.ins().symbol_value(pointer_type, pool_ref);
-        let pool = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), pool_address, 0);
-        self.builder.ins().brif(pool, check, &[], miss, &[]);
-        self.builder.seal_block(check);
-
-        self.builder.switch_to_block(check);
+        // The running context always carries the current worker's pool, so
+        // there is no unpublished case to check for.
+        let pool = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            self.env,
+            CONTEXT_POOL_OFFSET,
+        );
         let head_offset = (8 * total) as i32;
         let head = self
             .builder
@@ -1851,7 +1981,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
                 let mentioned: Vec<&native_ir::Expression> = arguments.iter().collect();
                 self.arm_last_uses(&mentioned, &cleanups);
-                let mut values = Vec::with_capacity(arguments.len());
+                let mut values = vec![self.env];
                 for argument in arguments {
                     values.push(self.expression(argument)?);
                 }
@@ -1866,7 +1996,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 mentioned.extend(arguments.iter());
                 self.arm_last_uses(&mentioned, &cleanups);
                 let callee = self.expression(callee)?;
-                let mut values = Vec::with_capacity(1 + arguments.len());
+                let mut values = Vec::with_capacity(2 + arguments.len());
+                values.push(self.env);
                 values.push(callee);
                 for argument in arguments {
                     values.push(self.expression(argument)?);
@@ -1876,7 +2007,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .ins()
                     .load(types::I64, MemFlagsData::trusted(), callee, 8);
                 self.release_cleanups(cleanups);
-                let signature = self.builder.import_signature(gleam_signature(values.len()));
+                let signature = self
+                    .builder
+                    .import_signature(gleam_signature(values.len() - 1));
                 self.builder
                     .ins()
                     .return_call_indirect(signature, code, &values);
@@ -1976,14 +2109,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::String(string) => {
-                // A literal builds its heap string once per site; every
-                // evaluation takes its own reference. Loops re-running a
-                // literal stop allocating for it.
-                self.interned(|this| {
-                    this.construct_from_constant_bytes(
-                        string.as_bytes(),
-                        this.runtime.string_from_bytes,
-                    )
+                // A literal's heap string is built once, by the
+                // literal-init function; every evaluation is a plain load
+                // of the (permanent) shared instance.
+                self.interned(|slot| InternedLiteral::String {
+                    slot,
+                    content: string.clone(),
                 })
             }
 
@@ -2053,15 +2184,22 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     values.push(self.expression(argument)?);
                 }
                 let function_ref = self.module.declare_func_in_func(id, self.builder.func);
-                let call = self.builder.ins().call(function_ref, &values);
-                let result = self.builder.inst_results(call)[0];
-                // Gleam callees own their arguments; externals only borrow.
+                // Gleam callees take the env and own their arguments;
+                // externals take neither — they borrow, and are released
+                // here.
                 if external {
+                    let call = self.builder.ins().call(function_ref, &values);
+                    let result = self.builder.inst_results(call)[0];
                     for value in values {
                         self.dec(value);
                     }
+                    Ok(result)
+                } else {
+                    let mut values_with_env = vec![self.env];
+                    values_with_env.extend(values);
+                    let call = self.builder.ins().call(function_ref, &values_with_env);
+                    Ok(self.builder.inst_results(call)[0])
                 }
-                Ok(result)
             }
 
             native_ir::Expression::StringConcat(left, right) => {
@@ -2145,9 +2283,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 if arguments.is_empty() {
                     // A zero-arity constructor is immutable and content-equal
                     // to every other instance of its variant: one shared
-                    // instance per site, like a string literal.
+                    // (permanent) instance per site, like a string literal.
                     let tag = *tag;
-                    return self.interned(move |this| Ok(this.record_new(tag, 0, display)));
+                    return self.interned(move |slot| InternedLiteral::Record {
+                        slot,
+                        tag,
+                        display,
+                    });
                 }
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
@@ -2257,7 +2399,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
             native_ir::Expression::CallValue { callee, arguments } => {
                 let callee = self.expression(callee)?;
-                let mut values = Vec::with_capacity(1 + arguments.len());
+                let mut values = Vec::with_capacity(2 + arguments.len());
+                values.push(self.env);
                 values.push(callee);
                 for argument in arguments {
                     values.push(self.expression(argument)?);
@@ -2266,7 +2409,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .builder
                     .ins()
                     .load(types::I64, MemFlagsData::trusted(), callee, 8);
-                let signature = self.builder.import_signature(gleam_signature(values.len()));
+                let signature = self
+                    .builder
+                    .import_signature(gleam_signature(values.len() - 1));
                 let call = self.builder.ins().call_indirect(signature, code, &values);
                 let result = self.builder.inst_results(call)[0];
                 // The callee owns the closure and the arguments.
