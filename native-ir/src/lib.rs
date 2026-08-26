@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 32;
+pub const FORMAT_VERSION: u32 = 33;
 
 /// Whether the bytes are an artifact of the current format version, from
 /// the four-byte little-endian version header alone. The build uses this to
@@ -205,8 +205,18 @@ pub enum Expression {
         index: u32,
     },
     /// The empty list, a special immediate word. Cons cells are two-field records
-    /// with tag 1, built with [`Expression::Constructor`].
+    /// with tag 1, built with [`Expression::List`] (or, equivalently, an
+    /// [`Expression::Constructor`] with tag 1).
     EmptyList,
+    /// A list literal, kept flat: a nested cons chain would make the
+    /// expression tree — and every recursive walk over it, serialization
+    /// included — as deep as the list is long. Elements evaluate left to
+    /// right, then the tail (the empty list when absent), then the cells
+    /// are built from the tail outwards.
+    List {
+        elements: Vec<Expression>,
+        tail: Option<Box<Expression>>,
+    },
     /// Bit array construction: segments appended in order onto an empty
     /// array. Only byte-aligned, constant-sized segments are supported.
     BitArray(Vec<BitSegment>),
@@ -667,6 +677,14 @@ fn expression_free(
             expression_free(callee, bound, sink);
             for argument in arguments {
                 expression_free(argument, bound, sink);
+            }
+        }
+        Expression::List { elements, tail } => {
+            for element in elements {
+                expression_free(element, bound, sink);
+            }
+            if let Some(tail) = tail {
+                expression_free(tail, bound, sink);
             }
         }
         Expression::IntBinary { left, right, .. }

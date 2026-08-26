@@ -4,6 +4,12 @@
 import gleeunit
 import gleeunit/should
 
+@target(erlang)
+pub fn main() {
+  gleeunit.main()
+}
+
+@target(javascript)
 pub fn main() {
   gleeunit.main()
 }

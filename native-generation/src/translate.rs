@@ -746,6 +746,9 @@ fn straight_line(expression: &native_ir::Expression) -> bool {
         | Expression::StringConcat(left, right) => straight_line(left) && straight_line(right),
         Expression::BoolNot(inner) => straight_line(inner),
         Expression::FieldAccess { record, .. } => straight_line(record),
+        Expression::List { elements, tail } => {
+            elements.iter().all(straight_line) && tail.as_deref().is_none_or(straight_line)
+        }
         Expression::BitArray(segments) => segments.iter().all(|segment| {
             straight_line(&segment.value)
                 && match &segment.kind {
@@ -870,6 +873,24 @@ fn reuse_site_in(
         }
         Expression::BoolNot(inner) => reuse_site_in(inner, arity, conditional),
         Expression::FieldAccess { record, .. } => reuse_site_in(record, arity, conditional),
+        Expression::List { elements, tail } => {
+            for element in elements {
+                if let Some(found) = reuse_site_in(element, arity, conditional) {
+                    return Some(found);
+                }
+            }
+            if let Some(tail) = tail
+                && let Some(found) = reuse_site_in(tail, arity, conditional)
+            {
+                return Some(found);
+            }
+            // Cons cells are two-field records.
+            if !elements.is_empty() && arity == 2 {
+                Some(!conditional)
+            } else {
+                None
+            }
+        }
         Expression::BitArray(segments) => {
             for segment in segments {
                 if let Some(found) = reuse_site_in(&segment.value, arity, conditional) {
@@ -1356,6 +1377,86 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         self.builder.switch_to_block(join);
         let value = self.builder.block_params(join)[0];
         Ok(self.inc(value))
+    }
+
+    /// Emits a call to the runtime's record allocator, which also writes
+    /// the header word.
+    fn record_new(&mut self, tag: u32, arity: usize, display: u16) -> Value {
+        let tag = self.builder.ins().iconst(types::I64, tag as i64);
+        let arity = self.builder.ins().iconst(types::I64, arity as i64);
+        let display = self.builder.ins().iconst(types::I64, display as i64);
+        let record_new_ref = self
+            .module
+            .declare_func_in_func(self.runtime.record_new, self.builder.func);
+        let call = self.builder.ins().call(record_new_ref, &[tag, arity, display]);
+        self.builder.inst_results(call)[0]
+    }
+
+    /// Allocates a record and stores its already-evaluated field values:
+    /// the shared tail of constructor and list translation. Consumes a
+    /// pending drop-reuse token when its shape matches, otherwise takes the
+    /// pool fast path. `values` must be non-empty (zero-arity constructors
+    /// are interned per site instead).
+    fn allocate_record(
+        &mut self,
+        tag: u32,
+        display: u16,
+        values: Vec<Value>,
+    ) -> Result<Value, String> {
+        let arity = values.len();
+        // The header is a compile-time constant, mirroring the runtime
+        // allocator's formula.
+        let header = native_runtime::record_header(tag, arity as u32) | ((display as u64) << 48);
+        let slow = |this: &mut Self| Ok(this.record_new(tag, arity, display));
+        let reusable = match self.reuse_token {
+            Some((token, fields)) if fields == arity => {
+                self.reuse_token = None;
+                Some(token)
+            }
+            _ => None,
+        };
+        let record = match reusable {
+            // A drop-reuse token of this shape: when it captured a
+            // block (the deconstructed record was uniquely owned),
+            // write the new header over it — its count is already
+            // one — and skip allocation entirely.
+            Some(token_slot) => {
+                let token = self.builder.use_var(token_slot);
+                let reused = self.builder.create_block();
+                let fresh = self.builder.create_block();
+                let joined = self.builder.create_block();
+                self.builder.append_block_param(joined, types::I64);
+                self.builder.ins().brif(token, reused, &[], fresh, &[]);
+                self.builder.seal_block(reused);
+                self.builder.seal_block(fresh);
+
+                self.builder.switch_to_block(reused);
+                let header_value = self.builder.ins().iconst(types::I64, header as i64);
+                let _ = self
+                    .builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), header_value, token, 0);
+                self.builder.ins().jump(joined, &[token.into()]);
+
+                self.builder.switch_to_block(fresh);
+                let allocated = self.pool_alloc(1 + arity, header, slow)?;
+                self.builder.ins().jump(joined, &[allocated.into()]);
+                self.builder.seal_block(joined);
+
+                self.builder.switch_to_block(joined);
+                self.builder.block_params(joined)[0]
+            }
+            None => self.pool_alloc(1 + arity, header, slow)?,
+        };
+        for (index, value) in values.into_iter().enumerate() {
+            let _ = self.builder.ins().store(
+                MemFlagsData::trusted(),
+                value,
+                record,
+                8 + 8 * index as i32,
+            );
+        }
+        Ok(record)
     }
 
     /// Emits an inline pooled allocation of `object_words` words (header
@@ -2041,85 +2142,37 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         },
                     },
                 };
+                if arguments.is_empty() {
+                    // A zero-arity constructor is immutable and content-equal
+                    // to every other instance of its variant: one shared
+                    // instance per site, like a string literal.
+                    let tag = *tag;
+                    return self.interned(move |this| Ok(this.record_new(tag, 0, display)));
+                }
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
                     values.push(self.expression(argument)?);
                 }
-                let arity = values.len();
-                // The header is a compile-time constant, mirroring the
-                // runtime allocator's formula.
-                let header =
-                    native_runtime::record_header(*tag, arity as u32) | ((display as u64) << 48);
-                let slow = |this: &mut Self| {
-                    let tag = this.builder.ins().iconst(types::I64, *tag as i64);
-                    let arity = this.builder.ins().iconst(types::I64, arity as i64);
-                    let display = this.builder.ins().iconst(types::I64, display as i64);
-                    let record_new_ref = this
-                        .module
-                        .declare_func_in_func(this.runtime.record_new, this.builder.func);
-                    let call = this
-                        .builder
-                        .ins()
-                        .call(record_new_ref, &[tag, arity, display]);
-                    Ok(this.builder.inst_results(call)[0])
-                };
-                if arity == 0 {
-                    // A zero-arity constructor is immutable and content-equal
-                    // to every other instance of its variant: one shared
-                    // instance per site, like a string literal.
-                    return self.interned(slow);
+                self.allocate_record(*tag, display, values)
+            }
+
+            native_ir::Expression::List { elements, tail } => {
+                // Elements evaluate left to right, then the tail; the cells
+                // are built from the tail outwards, exactly as the
+                // equivalent cons chain would evaluate.
+                let mut values = Vec::with_capacity(elements.len());
+                for element in elements {
+                    values.push(self.expression(element)?);
                 }
-                let reusable = match self.reuse_token {
-                    Some((token, fields)) if fields == arity => {
-                        self.reuse_token = None;
-                        Some(token)
-                    }
-                    _ => None,
+                let mut list = match tail {
+                    Some(tail) => self.expression(tail)?,
+                    None => self.builder.ins().iconst(types::I64, EMPTY_LIST),
                 };
-                let record = match reusable {
-                    // A drop-reuse token of this shape: when it captured a
-                    // block (the deconstructed record was uniquely owned),
-                    // write the new header over it — its count is already
-                    // one — and skip allocation entirely.
-                    Some(token_slot) => {
-                        let token = self.builder.use_var(token_slot);
-                        let reused = self.builder.create_block();
-                        let fresh = self.builder.create_block();
-                        let joined = self.builder.create_block();
-                        self.builder.append_block_param(joined, types::I64);
-                        self.builder.ins().brif(token, reused, &[], fresh, &[]);
-                        self.builder.seal_block(reused);
-                        self.builder.seal_block(fresh);
-
-                        self.builder.switch_to_block(reused);
-                        let header_value = self.builder.ins().iconst(types::I64, header as i64);
-                        let _ = self.builder.ins().store(
-                            MemFlagsData::trusted(),
-                            header_value,
-                            token,
-                            0,
-                        );
-                        self.builder.ins().jump(joined, &[token.into()]);
-
-                        self.builder.switch_to_block(fresh);
-                        let allocated = self.pool_alloc(1 + arity, header, slow)?;
-                        self.builder.ins().jump(joined, &[allocated.into()]);
-                        self.builder.seal_block(joined);
-
-                        self.builder.switch_to_block(joined);
-                        self.builder.block_params(joined)[0]
-                    }
-                    None => self.pool_alloc(1 + arity, header, slow)?,
-                };
-                for (index, value) in values.into_iter().enumerate() {
-                    let _ = self.builder.ins().store(
-                        MemFlagsData::trusted(),
-                        value,
-                        record,
-                        8 + 8 * index as i32,
-                    );
+                for value in values.into_iter().rev() {
+                    list =
+                        self.allocate_record(1, native_runtime::DISPLAY_LIST, vec![value, list])?;
                 }
-                Ok(record)
+                Ok(list)
             }
 
             native_ir::Expression::FieldAccess { record, index } => {

@@ -485,20 +485,23 @@ impl Lowerer<'_> {
             }),
 
             TypedExpr::List { elements, tail, .. } => {
-                // Cons cells are two-field records with tag 1, built from
-                // the tail outwards.
-                let mut list = match tail {
-                    Some(tail) => self.expression(tail)?,
-                    None => native_ir::Expression::EmptyList,
+                // A flat node, not a cons chain: the tree must stay shallow
+                // however long the literal is.
+                let tail = match tail {
+                    Some(tail) => Some(Box::new(self.expression(tail)?)),
+                    None => None,
                 };
-                for element in elements.iter().rev() {
-                    list = native_ir::Expression::Constructor {
-                        tag: 1,
-                        display: native_ir::ConstructorDisplay::List,
-                        arguments: vec![self.expression(element)?, list],
-                    };
+                let elements = elements
+                    .iter()
+                    .map(|element| self.expression(element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if elements.is_empty() {
+                    return Ok(match tail {
+                        Some(tail) => *tail,
+                        None => native_ir::Expression::EmptyList,
+                    });
                 }
-                Ok(list)
+                Ok(native_ir::Expression::List { elements, tail })
             }
 
             TypedExpr::PositionalAccess { record, index, .. } => {
@@ -953,15 +956,17 @@ impl Lowerer<'_> {
                 })
             }
             Constant::List { elements, .. } => {
-                let mut list = native_ir::Expression::EmptyList;
-                for element in elements.iter().rev() {
-                    list = native_ir::Expression::Constructor {
-                        tag: 1,
-                        display: native_ir::ConstructorDisplay::List,
-                        arguments: vec![self.constant(element)?, list],
-                    };
+                let elements = elements
+                    .iter()
+                    .map(|element| self.constant(element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if elements.is_empty() {
+                    return Ok(native_ir::Expression::EmptyList);
                 }
-                Ok(list)
+                Ok(native_ir::Expression::List {
+                    elements,
+                    tail: None,
+                })
             }
             // A constant referring to another constant or to a function.
             Constant::Var { constructor, .. } => {
@@ -2307,26 +2312,18 @@ pub fn main() {
             native_ir::Statement::Let {
                 line: 0,
                 name: "rest".into(),
-                value: native_ir::Expression::Constructor {
-                    tag: 1,
-                    display: native_ir::ConstructorDisplay::List,
-                    arguments: vec![
-                        native_ir::Expression::Int(4),
-                        native_ir::Expression::EmptyList,
-                    ],
+                value: native_ir::Expression::List {
+                    elements: vec![native_ir::Expression::Int(4)],
+                    tail: None,
                 },
             }
         );
         // The spread tail is used directly rather than rebuilt.
         assert_eq!(
             body[1],
-            native_ir::Statement::expression(native_ir::Expression::Constructor {
-                tag: 1,
-                display: native_ir::ConstructorDisplay::List,
-                arguments: vec![
-                    native_ir::Expression::Int(3),
-                    native_ir::Expression::Variable("rest".into()),
-                ],
+            native_ir::Statement::expression(native_ir::Expression::List {
+                elements: vec![native_ir::Expression::Int(3)],
+                tail: Some(Box::new(native_ir::Expression::Variable("rest".into()))),
             })
         );
     }
@@ -2616,20 +2613,12 @@ pub fn main() {
             native_ir::Statement::Let {
                 line: 0,
                 name: "z".into(),
-                value: native_ir::Expression::Constructor {
-                    tag: 1,
-                    display: native_ir::ConstructorDisplay::List,
-                    arguments: vec![
+                value: native_ir::Expression::List {
+                    elements: vec![
                         native_ir::Expression::String("forty".into()),
-                        native_ir::Expression::Constructor {
-                            tag: 1,
-                            display: native_ir::ConstructorDisplay::List,
-                            arguments: vec![
-                                native_ir::Expression::String("two".into()),
-                                native_ir::Expression::EmptyList,
-                            ],
-                        },
+                        native_ir::Expression::String("two".into()),
                     ],
+                    tail: None,
                 },
             }
         );
