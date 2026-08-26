@@ -1330,11 +1330,39 @@ impl Lowerer<'_> {
                     BitArrayMatchedValue::Variable(_) | BitArrayMatchedValue::Discard(_) => {
                         native_ir::BitsTest::AlwaysTrue
                     }
-                    // Codepoint and string variable reads, floats, and
-                    // literal ints whose bits could not be computed.
-                    BitArrayMatchedValue::LiteralFloat(_)
-                    | BitArrayMatchedValue::LiteralInt { .. }
-                    | BitArrayMatchedValue::Assign { .. } => {
+                    // A literal float matches by reading the float and
+                    // comparing numerically, like the other targets.
+                    BitArrayMatchedValue::LiteralFloat(value) => {
+                        let value = crate::parse::LiteralFloatValue::parse(value)
+                            .ok_or_else(|| self.unsupported_pattern("this float literal"))?;
+                        let bits = self
+                            .read_size_expression(&match_test.read_action.size)?
+                            .ok_or_else(|| self.unsupported_pattern("this bit array pattern"))?;
+                        native_ir::BitsTest::FloatEquals {
+                            offset,
+                            bits: Box::new(bits),
+                            endian: Self::endian(match_test.read_action.endianness),
+                            value: value.value(),
+                        }
+                    }
+                    // A literal int whose bit encoding could not be
+                    // precomputed (its size is only known at run time)
+                    // matches by reading the integer and comparing
+                    // numerically, like the other targets.
+                    BitArrayMatchedValue::LiteralInt { value, .. } => {
+                        let bits = self
+                            .read_size_expression(&match_test.read_action.size)?
+                            .ok_or_else(|| self.unsupported_pattern("this bit array pattern"))?;
+                        native_ir::BitsTest::IntEquals {
+                            offset,
+                            bits: Box::new(bits),
+                            endian: Self::endian(match_test.read_action.endianness),
+                            signed: match_test.read_action.signed,
+                            value: Box::new(lower_int(value)),
+                        }
+                    }
+                    // Unreachable: assignments were unwrapped above.
+                    BitArrayMatchedValue::Assign { .. } => {
                         return Err(self.unsupported_pattern("this bit array pattern"));
                     }
                 }

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the types in this crate change shape, so that stale
 /// artifacts from previous compiler builds are rejected rather than
 /// misinterpreted. bitcode is not a self-describing format.
-pub const FORMAT_VERSION: u32 = 31;
+pub const FORMAT_VERSION: u32 = 32;
 
 /// Whether the bytes are an artifact of the current format version, from
 /// the four-byte little-endian version header alone. The build uses this to
@@ -356,6 +356,28 @@ pub enum BitsTest {
         offset: Box<Expression>,
         bits: Box<Expression>,
         endian: Endian,
+    },
+    /// The integer at the given position (read with the segment's
+    /// endianness and signedness) equals the literal, compared
+    /// numerically; used when the segment's size is only known at run
+    /// time (constant-size literal integers use [`BitsTest::Bytes`]).
+    IntEquals {
+        offset: Box<Expression>,
+        bits: Box<Expression>,
+        endian: Endian,
+        signed: bool,
+        /// The literal, an `Int` or `BigInt` expression.
+        value: Box<Expression>,
+    },
+    /// The float at the given position equals the literal, compared
+    /// numerically (like the other targets: NaN data never matches, and
+    /// negative zero equals zero). Sizes other than 16, 32, and 64 bits
+    /// never match.
+    FloatEquals {
+        offset: Box<Expression>,
+        bits: Box<Expression>,
+        endian: Endian,
+        value: f64,
     },
     /// The remainder past the offset is a whole number of bytes.
     RestIsBytes { offset: Box<Expression> },
@@ -832,9 +854,20 @@ fn check_free(check: &Check, bound: &mut HashSet<String>, sink: &mut dyn FnMut(&
         BitsTest::Bytes { offset, .. } | BitsTest::RestIsBytes { offset } => {
             expression_free(offset, bound, sink)
         }
-        BitsTest::IsFiniteFloat { offset, bits, .. } => {
+        BitsTest::IsFiniteFloat { offset, bits, .. }
+        | BitsTest::FloatEquals { offset, bits, .. } => {
             expression_free(offset, bound, sink);
             expression_free(bits, bound, sink);
+        }
+        BitsTest::IntEquals {
+            offset,
+            bits,
+            value,
+            ..
+        } => {
+            expression_free(offset, bound, sink);
+            expression_free(bits, bound, sink);
+            expression_free(value, bound, sink);
         }
         BitsTest::AlwaysTrue => {}
     }

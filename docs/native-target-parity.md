@@ -169,9 +169,14 @@ platform C convention.
   `bytes-size(n)` payloads, `rest:bits` captures, sizes referring to
   earlier segments and outer variables with arithmetic, structural
   equality, and `echo` (partial trailing bits print as `n:size(b)`).
-  Sizes are validated at run time. Codepoint and string *variable* reads in
-  patterns are rejected at code generation — exactly as on the JavaScript
-  target
+  Sizes are validated at run time. Literal float patterns (every size and
+  endianness) and literal int patterns whose size is only known at run
+  time match by reading the segment and comparing numerically, following
+  Erlang — a dynamic float size other than 16/32/64 simply never matches
+  (where the JavaScript runtime throws). Codepoint *variable* reads in
+  patterns remain rejected at code generation — exactly as on the
+  JavaScript target, which rejects them at analysis; supporting them
+  would need variable-length reads in the shared exhaustiveness model
 - ✅ Constants (`const x = …`): inlined at use sites like the Erlang
   target, covering scalars, tuples, lists, records, bit arrays,
   references to other constants, to functions, and to constructors (a

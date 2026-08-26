@@ -453,6 +453,11 @@ fn bit_arrays_wide() {
 }
 
 #[test]
+fn bit_arrays_literal_patterns() {
+    assert_output!(no_javascript: "bit_arrays_literal_patterns");
+}
+
+#[test]
 fn destructuring() {
     assert_output!("destructuring");
 }

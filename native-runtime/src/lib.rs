@@ -1910,6 +1910,72 @@ pub extern "C" fn gleam_native_bitarray_read_float(
     box_float(float_from_bytes(&bytes, is_little(endian)))
 }
 
+/// Whether the integer of `bits` (tagged) bits at (tagged) bit offset
+/// `offset` equals `expected` (a tagged small integer or heap big
+/// integer), compared numerically; literal integer patterns whose size is
+/// only known at run time match this way. A negative or non-small size,
+/// or a read past the end of the array, never matches.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_bitarray_int_equals(
+    array: u64,
+    offset: u64,
+    bits: u64,
+    endian: u64,
+    signed: u64,
+    expected: u64,
+) -> u64 {
+    if !is_small_int(bits) || (bits as i64) < 0 {
+        return FALSE;
+    }
+    let bits = ((bits as i64) >> 1) as u64;
+    let offset = untag_bits(offset, "offset");
+    let payload = bitarray_value(array);
+    if offset + bits > payload.bits {
+        return FALSE;
+    }
+    let value = read_int_bits(payload, offset, bits, is_little(endian), signed != 0);
+    if value == untag(expected) {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// Whether the float of `bits` (tagged) bits at (tagged) bit offset
+/// `offset` equals `expected` (an f64 passed as its bits), compared
+/// numerically like the other targets: NaN data never matches, and
+/// negative zero equals zero. Sizes other than 16, 32, and 64 bits, and
+/// reads past the end of the array, never match.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_bitarray_float_equals(
+    array: u64,
+    offset: u64,
+    bits: u64,
+    endian: u64,
+    expected: u64,
+) -> u64 {
+    if !is_small_int(bits) {
+        return FALSE;
+    }
+    let bits = (bits as i64) >> 1;
+    if !matches!(bits, 16 | 32 | 64) {
+        return FALSE;
+    }
+    let bits = bits as u64;
+    let offset = untag_bits(offset, "offset");
+    let payload = bitarray_value(array);
+    if offset + bits > payload.bits {
+        return FALSE;
+    }
+    let bytes = extract_bits(payload, offset, bits);
+    let value = float_from_bytes(&bytes, is_little(endian));
+    if value == f64::from_bits(expected) {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
 /// Whether the float at the given position is finite (not NaN or
 /// infinity); float segments only match finite values.
 #[unsafe(no_mangle)]
@@ -3197,6 +3263,14 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         (
             "gleam_native_bitarray_is_finite_float",
             gleam_native_bitarray_is_finite_float as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_int_equals",
+            gleam_native_bitarray_int_equals as *const u8,
+        ),
+        (
+            "gleam_native_bitarray_float_equals",
+            gleam_native_bitarray_float_equals as *const u8,
         ),
         (
             "gleam_native_bitarray_size_test",

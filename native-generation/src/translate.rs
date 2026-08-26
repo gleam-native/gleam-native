@@ -63,6 +63,8 @@ pub const BITARRAY_APPEND_CODEPOINT: &str = "gleam_native_bitarray_append_codepo
 pub const BITARRAY_APPEND_BITS: &str = "gleam_native_bitarray_append_bits";
 pub const BITARRAY_READ_FLOAT: &str = "gleam_native_bitarray_read_float";
 pub const BITARRAY_IS_FINITE_FLOAT: &str = "gleam_native_bitarray_is_finite_float";
+pub const BITARRAY_INT_EQUALS: &str = "gleam_native_bitarray_int_equals";
+pub const BITARRAY_FLOAT_EQUALS: &str = "gleam_native_bitarray_float_equals";
 pub const BITARRAY_SIZE_TEST: &str = "gleam_native_bitarray_size_test";
 pub const BITARRAY_BYTES_TEST: &str = "gleam_native_bitarray_bytes_test";
 pub const BITARRAY_REST_IS_BYTES: &str = "gleam_native_bitarray_rest_is_bytes";
@@ -162,6 +164,8 @@ struct RuntimeFunctions {
     bitarray_append_bits: FuncId,
     bitarray_read_float: FuncId,
     bitarray_is_finite_float: FuncId,
+    bitarray_int_equals: FuncId,
+    bitarray_float_equals: FuncId,
     bitarray_size_test: FuncId,
     bitarray_bytes_test: FuncId,
     bitarray_rest_is_bytes: FuncId,
@@ -210,6 +214,8 @@ impl RuntimeFunctions {
             bitarray_append_bits: declare(BITARRAY_APPEND_BITS, 4)?,
             bitarray_read_float: declare(BITARRAY_READ_FLOAT, 4)?,
             bitarray_is_finite_float: declare(BITARRAY_IS_FINITE_FLOAT, 4)?,
+            bitarray_int_equals: declare(BITARRAY_INT_EQUALS, 6)?,
+            bitarray_float_equals: declare(BITARRAY_FLOAT_EQUALS, 5)?,
             bitarray_size_test: declare(BITARRAY_SIZE_TEST, 3)?,
             bitarray_bytes_test: declare(BITARRAY_BYTES_TEST, 4)?,
             bitarray_rest_is_bytes: declare(BITARRAY_REST_IS_BYTES, 2)?,
@@ -3214,6 +3220,58 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             .builder
                             .ins()
                             .call(test_ref, &[subject, offset, bits, endian]);
+                        let matched = self.builder.inst_results(call)[0];
+                        self.dec(offset);
+                        self.dec(bits);
+                        Ok(self.builder.ins().band_imm_u(matched, 2))
+                    }
+                    native_ir::BitsTest::IntEquals {
+                        offset,
+                        bits,
+                        endian,
+                        signed,
+                        value,
+                    } => {
+                        let offset = self.expression(offset)?;
+                        let bits = self.expression(bits)?;
+                        let endian = self.endian_flag(*endian);
+                        let signed = self.builder.ins().iconst(types::I64, *signed as i64);
+                        let value = self.expression(value)?;
+                        let test_ref = self.module.declare_func_in_func(
+                            self.runtime.bitarray_int_equals,
+                            self.builder.func,
+                        );
+                        let call = self
+                            .builder
+                            .ins()
+                            .call(test_ref, &[subject, offset, bits, endian, signed, value]);
+                        let matched = self.builder.inst_results(call)[0];
+                        self.dec(offset);
+                        self.dec(bits);
+                        self.dec(value);
+                        Ok(self.builder.ins().band_imm_u(matched, 2))
+                    }
+                    native_ir::BitsTest::FloatEquals {
+                        offset,
+                        bits,
+                        endian,
+                        value,
+                    } => {
+                        let offset = self.expression(offset)?;
+                        let bits = self.expression(bits)?;
+                        let endian = self.endian_flag(*endian);
+                        let expected = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, value.to_bits() as i64);
+                        let test_ref = self.module.declare_func_in_func(
+                            self.runtime.bitarray_float_equals,
+                            self.builder.func,
+                        );
+                        let call = self
+                            .builder
+                            .ins()
+                            .call(test_ref, &[subject, offset, bits, endian, expected]);
                         let matched = self.builder.inst_results(call)[0];
                         self.dec(offset);
                         self.dec(bits);
