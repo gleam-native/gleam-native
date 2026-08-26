@@ -1738,13 +1738,32 @@ fn rc_check(value: u64, operation: &str) {
     }
 }
 
+/// The process's peak resident set size in bytes, from `getrusage`
+/// (macOS reports bytes, Linux kilobytes).
+pub fn peak_rss_bytes() -> u64 {
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return 0;
+        }
+        let maximum = usage.ru_maxrss as u64;
+        if cfg!(target_os = "macos") {
+            maximum
+        } else {
+            maximum * 1024
+        }
+    }
+}
+
 extern "C" fn report_rc_stats() {
     let allocations = RC_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
     let frees = RC_FREES.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
         "RC STATS: {allocations} allocations, {frees} frees, {} live at exit \
-         (interned literals and constructors are expected to remain)",
-        allocations - frees
+         (interned literals and constructors are expected to remain), \
+         peak RSS {:.1} MB",
+        allocations - frees,
+        peak_rss_bytes() as f64 / (1024.0 * 1024.0),
     );
 }
 
