@@ -147,8 +147,8 @@ platform C convention.
   including non-variable spread expressions and module-qualified
   constructors (`module.Wibble(..old, …)`)
 - ✅ Strings: UTF-8 heap objects with literals, concatenation, equality,
-  and prefix patterns; plus the runtime external suite a standard library
-  port binds to — grapheme-aware length/reverse/slice/pop_grapheme/
+  and prefix patterns; plus the runtime external suite the standard
+  library fork binds to — grapheme-aware length/reverse/slice/pop_grapheme/
   graphemes (via unicode-segmentation), three-way comparison (bytewise
   UTF-8, which is code point order — exactly Erlang's binary comparison),
   case mapping, contains/ends_with, trim family, replace, split, code point
@@ -195,8 +195,9 @@ platform C convention.
   bare tagged integers, so *nested* inside structures they print as their
   integer encoding (tracked by `echo_tuple`'s native-specific conformance
   snapshot)
-- ✅ Value formatting: the runtime's `inspect` now renders constructor
-  names, ready to back a `gleam/string.inspect` external
+- ✅ Value formatting: the runtime's `inspect` renders constructor names
+  and backs the `gleam/string.inspect` external in the standard library
+  fork (with the nested `Bool`/`Nil` representation limit noted above)
 - ✅ Reference counting: a count word before every heap object, with
   mechanical local ownership rules inserted during code generation
   (expressions yield owned references, variable reads share, container
@@ -205,8 +206,21 @@ platform C convention.
   released early, so tail-recursive loops free their garbage every
   iteration (verified: an allocation-churn program runs at baseline memory).
   Destruction is worklist-based, so long lists do not overflow the stack.
-  Counts are runtime calls today; Perceus-style reuse and inline fast paths
-  are future optimization work
+  On top of the mechanical rules, a Perceus-style optimization pipeline is
+  implemented: inline inc/dec/pool-allocation fast paths emitted directly
+  in generated code (per-thread size-class allocation pool, mimalloc as the
+  global allocator behind it), last-use consumption (a binding's final
+  mention becomes a move), drop-reuse (a case clause that deconstructs a
+  uniquely-owned subject recycles its cell for the record it constructs),
+  borrow inference (plain variable reads in operator/field-access/subject
+  positions skip RC traffic entirely), uniqueness steals in the runtime
+  (in-place dict insert and string append when the reference count is 1),
+  zero-arity constructor and string literal interning, and zero-copy
+  substring views. Env-gated debug modes ship permanently: `GLEAM_DEBUG_RC`
+  (all fast paths routed through checked runtime calls that validate every
+  count and poison freed blocks), `GLEAM_RC_STATS` (allocation/free
+  counters plus peak RSS in an atexit report), and `GLEAM_TRACE_RC`
+  (per-operation tracing)
 - ❌ Stack traces or at least source positions on panics
 - ✅ Command line arguments and exit codes: `gleam run -- args...` passes
   the arguments through to the program, readable as a `List(String)` via
@@ -250,8 +264,10 @@ platform C convention.
   named after the package. The static library is looked up next to the
   `gleam` binary (`libnative_runtime_static.a`), overridable with
   `GLEAM_NATIVE_RUNTIME_LIB`
-- ✅ `gleam test` — a built-in runner (gleeunit needs the standard library,
-  which native does not support yet): the harness discovers public
+- ✅ `gleam test` — a built-in runner substitutes for gleeunit on native
+  (the stdlib fork's `test/gleeunit.gleam` carries a `@target(native)`
+  stub `main`, since discovery is done by the toolchain): the harness
+  discovers public
   zero-argument `*_test` functions in the root package's `test`-directory
   modules — gleeunit's convention, so suites stay compatible — compiles
   them with a C-convention wrapper each, and runs them in order on the
@@ -263,8 +279,14 @@ platform C convention.
   `Ran N tests, F failures` summary; exit code 1 if anything failed. A
   stack overflow still aborts the whole run, and `gleeunit` itself remains
   unsupported
-- ❌ Debug info (DWARF via `gimli`) — spans must keep flowing through the IR
-  so this stays possible
+- ✅ Debug info for AOT executables (DWARF v4 via `gimli`): statements
+  carry source line numbers through the IR, code generation stamps
+  Cranelift source locations per statement, and `gleam export native`
+  appends a debug-info section to the object — one compilation unit with a
+  subprogram and line-program sequence per function. On a macOS host,
+  linking runs `dsymutil` best-effort so lldb resolves frames to
+  `module.function at module.gleam:line`. JIT frames remain anonymous
+  (profiling uses an AOT export instead)
 - ✅ Cross-compilation: `gleam export native --platform <name>` with the
   curated platforms `linux-arm64` / `linux-x64` (musl, fully static),
   `linux-arm64-gnu` / `linux-x64-gnu` (dynamic glibc), and `macos-arm64` /
@@ -285,7 +307,9 @@ platform C convention.
   all-target macro is enabled — native runs every shared case (compiled
   ahead of time and executed, its stderr byte-compared against the same
   snapshot Erlang and the three JavaScript runtimes produce) except
-  `echo_dict` (needs the standard library). Cases whose output legitimately
+  `echo_dict` (excluded when native could not yet build the standard
+  library; now that the stdlib fork exists it is a candidate to
+  re-enable). Cases whose output legitimately
   diverges (`echo_tuple`'s nested booleans, plus the per-target
   `echo_float`/`echo_custom_type`/`echo_bitarray`) have native-specific
   snapshots documenting their output. The language-semantics tests formerly
@@ -306,11 +330,22 @@ platform C convention.
 
 ## Ecosystem
 
-- ❌ `gleam_stdlib` support — the largest single work item. The stdlib is
-  gated on `@target(erlang)` / `@target(javascript)` and their externals, so
-  today it fails analysis under the native target. Requires a fork or
-  upstream additions: `@target(native)` branches plus a native externals
-  library covering strings, lists, dicts, IO, etc.
+- ✅ `gleam_stdlib` support — implemented as a fork
+  (`gleam-stdlib-native`, consumed as a path dependency). Every public
+  stdlib function works on native: `@external(native, ...)` annotations
+  bind hot paths (strings, dicts, string_tree, bit arrays, ints, floats,
+  dynamic/decode, uri, IO, a native stable list sort) to implementations
+  in the `native-runtime-stdlib` crate, and everything else falls back to
+  the pure Gleam bodies — `list.map`/`fold` deliberately stay in Gleam,
+  where the Perceus-compiled loops beat native implementations. The full
+  suite passes on native (1487 tests, also validated under
+  `GLEAM_DEBUG_RC`), with the Erlang and JavaScript suites unaffected.
+  Roughly 50 test functions stay target-guarded because on native
+  `True`/`False`/`Nil` share an integer representation, so
+  `string.inspect` and `dynamic.classify` cannot distinguish them — the
+  one remaining observable semantic divergence
+- ❌ Upstreaming or publishing the stdlib fork — today it only works as a
+  local path dependency on this compiler fork
 - ❌ The prelude types' runtime contract (`Result`, `Bool`, `Order`, …)
   documented for FFI authors, as `prelude.mjs` does for JavaScript
 - ❌ Concurrency story — explicitly out of scope for language parity;
@@ -320,7 +355,9 @@ platform C convention.
 ## Explicit non-goals for parity
 
 These are quality work, not parity requirements, and are tracked separately:
-unboxed fast paths for floats and ints, Perceus-style RC optimization,
 inlining at the native IR level (reusing `compiler-core/src/inline.rs`),
 constant caching for big integer literals (currently rebuilt from bytes at
-each evaluation), and code size or compile speed tuning.
+each evaluation), and code size or compile speed tuning. Two former
+entries have since landed as part of the optimization rounds: Perceus-style
+RC optimization (see the reference counting item above) and unboxed fast
+paths for small integers and float arithmetic.
