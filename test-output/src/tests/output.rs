@@ -398,6 +398,7 @@ fn linked_process_exit() {
 #[test]
 fn stack_trace() {
     assert_output!(Target::Erlang, "panic_stack_trace");
+    assert_output!(Target::Native, "panic_stack_trace");
 }
 
 // The cases below were migrated from the end-to-end tests in

@@ -24,4 +24,5 @@ runtime error: panic
 
 boom
 
-    main.main:6
+stacktrace:
+  main.main[90m src/main.gleam:6[0m

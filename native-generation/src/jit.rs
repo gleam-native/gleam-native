@@ -4,9 +4,9 @@
 //! The JIT driver: compiles a set of native IR modules in memory and either
 //! runs the project's `main` function or runs its test suite.
 
+use cranelift_codegen::settings::{self, Configurable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::default_libcall_names;
-use cranelift_codegen::settings::{self, Configurable};
 
 use crate::translate::Translator;
 
@@ -25,6 +25,11 @@ fn make_jit_module() -> Result<JITModule, String> {
     // compute-bound loop this buys 2-3% run time for ~20ms of compile
     // time on a stdlib-sized project; runtime-bound programs see neither.
     flag_builder.set("opt_level", "speed").expect("valid flag");
+    // Standard frame records in every function, so panic reports can walk
+    // the frame-pointer chain for a stack trace.
+    flag_builder
+        .set("preserve_frame_pointers", "true")
+        .expect("valid flag");
     let isa = cranelift_native::builder()
         .map_err(|error| format!("host machine is not supported: {error}"))?
         .finish(settings::Flags::new(flag_builder))
@@ -66,6 +71,7 @@ pub fn run(
     })?;
     let entry = translator.define_entry_wrapper(main)?;
     let thunks = translator.define_invoke_thunks()?;
+    let debug_functions = translator.take_debug_functions();
 
     jit_module
         .finalize_definitions()
@@ -74,9 +80,26 @@ pub fn run(
     for (arity, id) in thunks {
         native_runtime::set_invoker(arity, jit_module.get_finalized_function(id));
     }
+    set_frame_table(&jit_module, debug_functions);
     let pointer = jit_module.get_finalized_function(entry) as usize;
     let entry_function = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u64>(pointer) };
     native_runtime::run_program_thread(stack_size_megabytes, entry_function)
+}
+
+/// Registers the compiled functions' finalized code ranges with the
+/// runtime, so panic reports can resolve walked frames to Gleam functions.
+fn set_frame_table(jit_module: &JITModule, debug_functions: Vec<crate::translate::DebugFunction>) {
+    let table = debug_functions
+        .into_iter()
+        .map(|function| native_runtime::FrameInfo {
+            start: jit_module.get_finalized_function(function.id) as usize,
+            length: function.code_length,
+            name: function.name,
+            path: function.src_path,
+            rows: function.rows,
+        })
+        .collect();
+    native_runtime::set_frame_table(table);
 }
 
 /// JIT-compiles the given modules and runs the given `(module, function)`
@@ -104,9 +127,7 @@ pub fn run_tests(
     let mut wrappers = Vec::with_capacity(tests.len());
     for (index, (module, function)) in tests.iter().enumerate() {
         let id = translator.function_id(module, function).ok_or_else(|| {
-            format!(
-                "module `{module}` has no `{function}` function compiled for the native target"
-            )
+            format!("module `{module}` has no `{function}` function compiled for the native target")
         })?;
         let wrapper = translator.define_c_wrapper(&format!("gleam_test_wrapper${index}"), id)?;
         wrappers.push(wrapper);
@@ -114,6 +135,7 @@ pub fn run_tests(
 
     native_runtime::set_constructor_names(translator.constructor_names());
     let thunks = translator.define_invoke_thunks()?;
+    let debug_functions = translator.take_debug_functions();
     jit_module
         .finalize_definitions()
         .map_err(|error| error.to_string())?;
@@ -121,6 +143,7 @@ pub fn run_tests(
     for (arity, id) in thunks {
         native_runtime::set_invoker(arity, jit_module.get_finalized_function(id));
     }
+    set_frame_table(&jit_module, debug_functions);
     let tests: Vec<(String, extern "C" fn() -> u64)> = tests
         .iter()
         .zip(wrappers)

@@ -18,9 +18,7 @@ use cranelift_codegen::isa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_module::{DataDescription, Linkage, Module, default_libcall_names};
 use cranelift_object::object::write::{Relocation, StandardSegment};
-use cranelift_object::object::{
-    RelocationEncoding, RelocationFlags, RelocationKind, SectionKind,
-};
+use cranelift_object::object::{RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use gimli::write::{
     Address, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Sections, Writer,
@@ -44,8 +42,11 @@ pub fn compile(
     // Position-independent code, so the executable can be linked PIE (the
     // default on modern macOS and Linux toolchains).
     flag_builder.set("is_pic", "true").expect("valid flag");
+    flag_builder.set("opt_level", "speed").expect("valid flag");
+    // Standard frame records in every function, so panic reports can walk
+    // the frame-pointer chain for a stack trace.
     flag_builder
-        .set("opt_level", "speed")
+        .set("preserve_frame_pointers", "true")
         .expect("valid flag");
     let flags = settings::Flags::new(flag_builder);
     let isa = match triple {
@@ -85,12 +86,15 @@ pub fn compile(
     // Exported so the static runtime's `main` can register them.
     let _ = translator.define_invoke_thunks()?;
 
-    let program_data = native_runtime::encode_program_data(
-        stack_size_megabytes,
-        &translator.constructor_names(),
-    );
+    let program_data =
+        native_runtime::encode_program_data(stack_size_megabytes, &translator.constructor_names());
     let data = object_module
-        .declare_data(native_runtime::PROGRAM_DATA_SYMBOL, Linkage::Export, false, false)
+        .declare_data(
+            native_runtime::PROGRAM_DATA_SYMBOL,
+            Linkage::Export,
+            false,
+            false,
+        )
         .map_err(|error| error.to_string())?;
     let mut description = DataDescription::new();
     description.define(program_data.into_boxed_slice());
@@ -98,9 +102,59 @@ pub fn compile(
         .define_data(data, &description)
         .map_err(|error| error.to_string())?;
 
+    define_frame_table(&mut object_module, &debug_functions)?;
+
     let mut product = object_module.finish();
     append_debug_info(&mut product, &debug_functions)?;
     product.emit().map_err(|error| error.to_string())
+}
+
+/// Embeds the panic stack-trace frame table as an exported data blob whose
+/// per-entry function addresses are object relocations the linker
+/// resolves; the static runtime's `main` decodes it with
+/// `native_runtime::decode_frame_table` before the program runs. The
+/// layout is documented on that decoder: a u64 entry count, then 8-byte
+/// aligned entries of address, code length, name, path, and line rows.
+fn define_frame_table(
+    object_module: &mut ObjectModule,
+    functions: &[DebugFunction],
+) -> Result<(), String> {
+    let mut bytes: Vec<u8> = (functions.len() as u64).to_le_bytes().to_vec();
+    let mut addresses = Vec::with_capacity(functions.len());
+    for function in functions {
+        addresses.push((bytes.len() as u32, function.id));
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&function.code_length.to_le_bytes());
+        bytes.extend_from_slice(&(function.name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(function.src_path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(function.rows.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(function.name.as_bytes());
+        bytes.extend_from_slice(function.src_path.as_bytes());
+        for (offset, line) in &function.rows {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(&line.to_le_bytes());
+        }
+        bytes.resize(bytes.len().next_multiple_of(8), 0);
+    }
+
+    let mut description = DataDescription::new();
+    description.define(bytes.into_boxed_slice());
+    description.set_align(8);
+    for (offset, id) in addresses {
+        let function = object_module.declare_func_in_data(id, &mut description);
+        description.write_function_addr(offset, function);
+    }
+    let data = object_module
+        .declare_data(
+            native_runtime::FRAME_TABLE_SYMBOL,
+            Linkage::Export,
+            false,
+            false,
+        )
+        .map_err(|error| error.to_string())?;
+    object_module
+        .define_data(data, &description)
+        .map_err(|error| error.to_string())
 }
 
 /// A DWARF section writer that records where symbol addresses land, so
@@ -254,22 +308,16 @@ fn append_debug_info(
         if writer.writer.len() == 0 {
             return Ok(());
         }
-        let segment = product
-            .object
-            .segment_name(StandardSegment::Debug)
-            .to_vec();
+        let segment = product.object.segment_name(StandardSegment::Debug).to_vec();
         // Mach-O spells ".debug_info" as "__debug_info" (in the __DWARF
         // segment); the object writer does not translate custom names.
         let name = match product.object.format() {
-            cranelift_object::object::BinaryFormat::MachO => {
-                id.name().replacen('.', "__", 1)
-            }
+            cranelift_object::object::BinaryFormat::MachO => id.name().replacen('.', "__", 1),
             _ => id.name().to_string(),
         };
-        let section =
-            product
-                .object
-                .add_section(segment, name.into_bytes(), SectionKind::Debug);
+        let section = product
+            .object
+            .add_section(segment, name.into_bytes(), SectionKind::Debug);
         let offset = product
             .object
             .append_section_data(section, writer.writer.slice(), 1);

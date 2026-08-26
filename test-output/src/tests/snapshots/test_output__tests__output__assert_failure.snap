@@ -22,4 +22,5 @@ runtime error: assert
 
 Assertion failed
 
-    main.main:5
+stacktrace:
+  main.main[90m src/main.gleam:5[0m

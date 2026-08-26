@@ -131,8 +131,9 @@ platform C convention.
   stack by default, configurable per project with `stack_size_megabytes`
   under `[native]` in `gleam.toml`; deep non-tail recursion that exhausts
   it is caught by a `sigaltstack` handler that reports
-  `runtime error: stack overflow` and exits with code 1 instead of
-  crashing raw
+  `runtime error: stack overflow` — with a stack trace of the runaway
+  recursion walked from the signal context — and exits with code 1
+  instead of crashing raw
 
 ## Data types
 
@@ -223,7 +224,21 @@ platform C convention.
   count and poison freed blocks), `GLEAM_RC_STATS` (allocation/free
   counters plus peak RSS in an atexit report), and `GLEAM_TRACE_RC`
   (per-operation tracing)
-- ❌ Stack traces or at least source positions on panics
+- ✅ Stack traces on panics: every runtime failure report (`panic`,
+  `todo`, `let assert`, `assert`, and the stack overflow handler) ends
+  with an Erlang-style `stacktrace:` block — one
+  `module.function src/module.gleam:line` row per frame, deepest first,
+  consecutive identical frames collapsed. Generated code preserves frame
+  pointers (measured cost: none); the runtime walks the frame-pointer
+  chain within the program thread's stack bounds and resolves return
+  addresses (pointer-authentication signatures stripped on aarch64)
+  through a table of function code ranges built from the same line
+  tables that back the DWARF debug info — registered from finalized
+  addresses by the JIT, and embedded in ahead-of-time objects as a data
+  section whose entries carry linker-resolved function-address
+  relocations. Tail-called frames do not appear (a tail call replaces
+  its caller's frame — the same elision Erlang's last-call optimization
+  produces), and non-Gleam frames are skipped
 - ✅ Command line arguments and exit codes: `gleam run -- args...` passes
   the arguments through to the program, readable as a `List(String)` via
   the `gleam_native_start_arguments` external; the `gleam_native_exit`

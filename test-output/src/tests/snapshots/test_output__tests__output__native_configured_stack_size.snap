@@ -30,3 +30,8 @@ pub fn main() -> Nil {
 runtime error: stack overflow
 
 The program recursed too deeply. Gleam tail calls run in constant stack space, but deeply nested non-tail recursion exhausted the stack.
+
+stacktrace:
+  main.deep[90m src/main.gleam:8[0m
+  [90m... (frame repeated 510 more times)[0m
+  [90m...[0m

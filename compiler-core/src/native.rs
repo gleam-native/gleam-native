@@ -23,11 +23,6 @@ use crate::{
     type_::{ModuleValueConstructor, PRELUDE_MODULE_NAME, Type, ValueConstructorVariant},
 };
 
-/// The tagged word encoding of a small integer; see `native-runtime`.
-fn tag_small_int(value: i64) -> i64 {
-    (value << 1) | 1
-}
-
 fn lower_int(value: &BigInt) -> native_ir::Expression {
     match value
         .to_i64()

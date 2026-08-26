@@ -21,4 +21,5 @@ runtime error: todo
 
 This has not yet been implemented
 
-    main.main:5
+stacktrace:
+  main.main[90m src/main.gleam:5[0m

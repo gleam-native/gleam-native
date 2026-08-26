@@ -26,4 +26,5 @@ runtime error: let assert
 
 wanted a success
 
-    main.main:9
+stacktrace:
+  main.main[90m src/main.gleam:9[0m

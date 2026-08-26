@@ -1046,11 +1046,281 @@ pub unsafe extern "C" fn gleam_native_float_to_string(value: u64) -> u64 {
     box_string(format_float(float_value(value)))
 }
 
+// ---------------------------------------------------------------------------
+// Panic stack traces
+//
+// Generated code preserves frame pointers, so at panic time the runtime can
+// walk the frame-pointer chain and map each return address to a compiled
+// Gleam function through a table of code ranges built from the same
+// per-function line tables that back the DWARF debug info. Tail calls
+// replace their caller's frame, so tail-called frames do not appear — the
+// same elision Erlang's last-call optimization produces.
+
+/// One compiled Gleam function's code range and line table, registered by
+/// the host before the program runs (the JIT from finalized addresses, an
+/// ahead-of-time executable from the table embedded in its object file).
+pub struct FrameInfo {
+    /// The function's first instruction address.
+    pub start: usize,
+    /// The function's code length in bytes.
+    pub length: u32,
+    /// The `module.function` display name.
+    pub name: String,
+    /// The function's module source path, package-root relative.
+    pub path: String,
+    /// Sorted (code offset, source line) pairs: where each source line's
+    /// machine code begins.
+    pub rows: Vec<(u32, u32)>,
+}
+
+static FRAME_TABLE: std::sync::OnceLock<Vec<FrameInfo>> = std::sync::OnceLock::new();
+
+/// Stores the compiled functions' code ranges for stack traces; called by
+/// the host before the program runs.
+pub fn set_frame_table(mut table: Vec<FrameInfo>) {
+    table.sort_by_key(|frame| frame.start);
+    let _ = FRAME_TABLE.set(table);
+}
+
+/// The symbol of the frame table blob that ahead-of-time compilation embeds
+/// in the executable, decoded by [`start`] before the program runs.
+pub const FRAME_TABLE_SYMBOL: &str = "gleam_native_frame_table";
+
+/// Decodes the frame table blob ahead-of-time compilation embeds under
+/// [`FRAME_TABLE_SYMBOL`] and registers it. Layout, all integers
+/// little-endian, every entry 8-byte aligned: a u64 entry count, then per
+/// entry a u64 function address (a linker-resolved relocation), u32 code
+/// length, u32 name length, u32 path length, u32 row count, the name and
+/// path bytes, then the (u32 offset, u32 line) rows, padded to 8 bytes.
+///
+/// # Safety
+///
+/// `data` must point at a blob with the layout above whose relocations the
+/// linker has resolved.
+pub unsafe fn decode_frame_table(data: *const u8) -> Vec<FrameInfo> {
+    unsafe fn read_u32(cursor: &mut *const u8) -> u32 {
+        let value = unsafe { std::ptr::read_unaligned(*cursor as *const u32) };
+        *cursor = unsafe { cursor.add(4) };
+        u32::from_le(value)
+    }
+    unsafe fn read_bytes<'a>(cursor: &mut *const u8, length: usize) -> &'a [u8] {
+        let bytes = unsafe { std::slice::from_raw_parts(*cursor, length) };
+        *cursor = unsafe { cursor.add(length) };
+        bytes
+    }
+    let mut cursor = data;
+    let count = u64::from_le(unsafe { std::ptr::read_unaligned(cursor as *const u64) });
+    cursor = unsafe { cursor.add(8) };
+    let mut table = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let start =
+            u64::from_le(unsafe { std::ptr::read_unaligned(cursor as *const u64) }) as usize;
+        cursor = unsafe { cursor.add(8) };
+        let length = unsafe { read_u32(&mut cursor) };
+        let name_length = unsafe { read_u32(&mut cursor) } as usize;
+        let path_length = unsafe { read_u32(&mut cursor) } as usize;
+        let row_count = unsafe { read_u32(&mut cursor) } as usize;
+        let name =
+            String::from_utf8_lossy(unsafe { read_bytes(&mut cursor, name_length) }).into_owned();
+        let path =
+            String::from_utf8_lossy(unsafe { read_bytes(&mut cursor, path_length) }).into_owned();
+        let mut rows = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            let offset = unsafe { read_u32(&mut cursor) };
+            let line = unsafe { read_u32(&mut cursor) };
+            rows.push((offset, line));
+        }
+        let position = cursor as usize - data as usize;
+        cursor = unsafe { cursor.add(position.next_multiple_of(8) - position) };
+        table.push(FrameInfo {
+            start,
+            length,
+            name,
+            path,
+            rows,
+        });
+    }
+    table
+}
+
+/// The program thread's approximate stack top, recorded when the thread
+/// starts: the walk stops there, and never dereferences a frame pointer
+/// outside the thread's stack.
+static STACK_TOP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The Gleam function containing an address, and the source line of the
+/// instruction before it (return addresses point after their call).
+fn resolve_frame(return_address: usize) -> Option<(&'static FrameInfo, u32)> {
+    let table = FRAME_TABLE.get()?;
+    let address = return_address.checked_sub(1)?;
+    let index = table
+        .partition_point(|frame| frame.start <= address)
+        .checked_sub(1)?;
+    let frame = table.get(index)?;
+    let offset = address - frame.start;
+    if offset >= frame.length as usize {
+        return None;
+    }
+    let offset = offset as u32;
+    let row = frame
+        .rows
+        .partition_point(|(row_offset, _)| *row_offset <= offset)
+        .checked_sub(1)?;
+    let (_, line) = *frame.rows.get(row)?;
+    Some((frame, line))
+}
+
+/// The caller's frame pointer register. Even when this function's caller
+/// set up no frame of its own, the register still holds the most recent
+/// frame in the chain.
+#[inline(always)]
+fn current_frame_pointer() -> usize {
+    let frame_pointer: usize;
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        std::arch::asm!("mov {}, x29", out(reg) frame_pointer);
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("mov {}, rbp", out(reg) frame_pointer);
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            frame_pointer = 0;
+        }
+    }
+    frame_pointer
+}
+
+/// Removes the pointer-authentication signature from a return address:
+/// generated aarch64 code signs return addresses when the CPU supports
+/// it, hiding the real address from the frame-table lookup. The feature
+/// probe caches in an atomic; [`install_stack_overflow_handler`] warms it
+/// so the signal handler's use stays async-signal-safe.
+#[cfg(target_arch = "aarch64")]
+fn strip_pointer_authentication(pointer: usize) -> usize {
+    if std::arch::is_aarch64_feature_detected!("paca") {
+        let mut value = pointer;
+        unsafe { std::arch::asm!("xpaci {0}", inout(reg) value) };
+        value
+    } else {
+        pointer
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn strip_pointer_authentication(pointer: usize) -> usize {
+    pointer
+}
+
+/// How many resolved Gleam frames a trace prints at most, and how many raw
+/// frame records the walk visits at most (an overflowed stack can hold
+/// millions).
+const MAX_TRACE_FRAMES: usize = 64;
+const MAX_TRACE_STEPS: usize = 512;
+
+/// Walks the frame-pointer chain upward from `frame_pointer`, writing an
+/// Erlang-style stack trace through `write` — deepest frame first, one
+/// `  module.function src/module.gleam:line` row per Gleam frame with the
+/// location greyed, consecutive identical frames collapsed, and a greyed
+/// `...` row when the walk is cut short. Frames that are not compiled
+/// Gleam code (runtime internals between generated frames) are skipped.
+/// Returns the number of rows written; writes nothing (and returns zero)
+/// when no frame resolves.
+///
+/// Performs no allocation, so the stack overflow signal handler can use it;
+/// every frame pointer is bounds-checked against the program thread's stack
+/// before it is dereferenced.
+fn write_stack_trace(mut frame_pointer: usize, write: &mut dyn FnMut(&[u8])) -> usize {
+    fn write_row(write: &mut dyn FnMut(&[u8]), frame: &FrameInfo, line: u32, repeats: usize) {
+        let mut digits = [0u8; 20];
+        write(b"  ");
+        write(frame.name.as_bytes());
+        write(b"\x1b[90m ");
+        write(frame.path.as_bytes());
+        write(b":");
+        write(format_int(line as usize, &mut digits));
+        write(b"\x1b[0m\n");
+        if repeats > 1 {
+            write(b"  \x1b[90m... (frame repeated ");
+            write(format_int(repeats - 1, &mut digits));
+            write(b" more times)\x1b[0m\n");
+        }
+    }
+    /// Formats an integer into the buffer without allocating.
+    fn format_int(mut value: usize, digits: &mut [u8; 20]) -> &[u8] {
+        let mut index = digits.len();
+        loop {
+            index -= 1;
+            digits[index] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        &digits[index..]
+    }
+
+    let top = STACK_TOP.load(std::sync::atomic::Ordering::Acquire);
+    let mut pending: Option<(&FrameInfo, u32, usize)> = None;
+    let mut rows = 0;
+    let mut truncated = false;
+    for step in 0..MAX_TRACE_STEPS {
+        if frame_pointer == 0 || frame_pointer & 7 != 0 || top == 0 || frame_pointer + 16 > top {
+            break;
+        }
+        if step + 1 == MAX_TRACE_STEPS {
+            truncated = true;
+            break;
+        }
+        // A frame record is [previous frame pointer, return address] on
+        // both supported architectures.
+        let next = unsafe { *(frame_pointer as *const usize) };
+        let return_address = unsafe { *((frame_pointer + 8) as *const usize) };
+        let return_address = strip_pointer_authentication(return_address);
+        if let Some((frame, line)) = resolve_frame(return_address) {
+            match &mut pending {
+                Some((held, held_line, repeats))
+                    if std::ptr::eq(*held, frame) && *held_line == line =>
+                {
+                    *repeats += 1;
+                }
+                _ => {
+                    if let Some((held, held_line, repeats)) = pending.take() {
+                        write_row(write, held, held_line, repeats);
+                        rows += 1;
+                    }
+                    if rows == MAX_TRACE_FRAMES {
+                        truncated = true;
+                        break;
+                    }
+                    pending = Some((frame, line, 1));
+                }
+            }
+        }
+        // The chain must move strictly upward to terminate.
+        if next <= frame_pointer {
+            break;
+        }
+        frame_pointer = next;
+    }
+    if let Some((held, held_line, repeats)) = pending {
+        write_row(write, held, held_line, repeats);
+        rows += 1;
+    }
+    if truncated && rows > 0 {
+        write(b"  \x1b[90m...\x1b[0m\n");
+    }
+    rows
+}
+
 /// Installs a handler that reports stack overflows (and other fatal memory
 /// faults) as a runtime error with exit code 1 instead of a raw signal
 /// death. Uses an alternate signal stack, since the main stack is exhausted
-/// when a stack overflow fires.
+/// when a stack overflow fires; the report walks the exhausted stack's
+/// frame pointers (read out of the signal context) for a trace of the
+/// runaway recursion.
 pub fn install_stack_overflow_handler() {
+    // Warm the pointer-authentication feature probe's cache, so the signal
+    // handler's stack walk performs no first-use system call.
+    let _ = strip_pointer_authentication(0);
     unsafe {
         let stack = libc::stack_t {
             ss_sp: std::alloc::alloc(
@@ -1061,20 +1331,82 @@ pub fn install_stack_overflow_handler() {
         };
         let _ = libc::sigaltstack(&stack, std::ptr::null_mut());
 
-        extern "C" fn handler(_signal: libc::c_int) {
-            let message = b"runtime error: stack overflow
+        /// The faulting thread's frame pointer register, from the signal's
+        /// machine context.
+        unsafe fn context_frame_pointer(context: *mut libc::c_void) -> usize {
+            if context.is_null() {
+                return 0;
+            }
+            let context = context as *mut libc::ucontext_t;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            unsafe {
+                let state = (*context).uc_mcontext;
+                if state.is_null() {
+                    return 0;
+                }
+                (*state).__ss.__fp as usize
+            }
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            unsafe {
+                let state = (*context).uc_mcontext;
+                if state.is_null() {
+                    return 0;
+                }
+                (*state).__ss.__rbp as usize
+            }
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            unsafe {
+                (*context).uc_mcontext.regs[29] as usize
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            unsafe {
+                (*context).uc_mcontext.gregs[libc::REG_RBP as usize] as usize
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = context;
+                0
+            }
+        }
+
+        // Everything in the handler is async-signal-safe: raw writes to
+        // standard error, reads of the (already published) frame table,
+        // and bounds-checked reads of the faulting thread's stack.
+        extern "C" fn handler(
+            _signal: libc::c_int,
+            _info: *mut libc::siginfo_t,
+            context: *mut libc::c_void,
+        ) {
+            fn write_bytes(bytes: &[u8]) {
+                unsafe {
+                    let _ = libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
+                }
+            }
+            write_bytes(
+                b"runtime error: stack overflow
 
 The program recursed too deeply. Gleam tail calls run in constant stack space, but deeply nested non-tail recursion exhausted the stack.
-";
+",
+            );
+            let frame_pointer = unsafe { context_frame_pointer(context) };
+            if frame_pointer != 0 {
+                let mut wrote_header = false;
+                let _ = write_stack_trace(frame_pointer, &mut |bytes| {
+                    if !wrote_header {
+                        wrote_header = true;
+                        write_bytes(b"\nstacktrace:\n");
+                    }
+                    write_bytes(bytes);
+                });
+            }
             unsafe {
-                let _ = libc::write(2, message.as_ptr() as *const libc::c_void, message.len());
                 libc::_exit(1);
             }
         }
 
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = handler as *const () as libc::sighandler_t;
-        action.sa_flags = libc::SA_ONSTACK;
+        action.sa_flags = libc::SA_ONSTACK | libc::SA_SIGINFO;
         let _ = libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut());
         let _ = libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
     }
@@ -1173,6 +1505,13 @@ pub fn run_program_thread_with(
         .name("gleam-main".into())
         .stack_size(stack_size)
         .spawn(move || {
+            // The stack-trace walk's upper bound: a local's address is
+            // (within one frame) the top of this thread's stack.
+            let marker = 0u8;
+            STACK_TOP.store(
+                &raw const marker as usize,
+                std::sync::atomic::Ordering::Release,
+            );
             publish_pool();
             install_stack_overflow_handler();
             body();
@@ -1260,19 +1599,23 @@ pub fn encode_program_data(stack_size_megabytes: u64, constructor_names: &[Strin
 /// The entry point for ahead-of-time compiled programs, called from the C
 /// `main` that the `native-runtime-static` library provides. Stores the
 /// command line arguments (without the program name), decodes the embedded
-/// program data, and runs the entry wrapper on the program thread. Returns
-/// the process exit code.
+/// program data and frame table, and runs the entry wrapper on the program
+/// thread. Returns the process exit code.
 ///
 /// # Safety
 ///
-/// `argc`/`argv` must be the values C `main` received, and `program_data`
-/// must point at a blob produced by [`encode_program_data`].
+/// `argc`/`argv` must be the values C `main` received, `program_data`
+/// must point at a blob produced by [`encode_program_data`], and
+/// `frame_table` at a linker-resolved blob with [`decode_frame_table`]'s
+/// layout.
 pub unsafe fn start(
     argc: i32,
     argv: *const *const std::ffi::c_char,
     program_data: *const u8,
+    frame_table: *const u8,
     entry: extern "C" fn() -> u64,
 ) -> i32 {
+    set_frame_table(unsafe { decode_frame_table(frame_table) });
     let mut arguments = Vec::new();
     for index in 1..argc.max(0) {
         let argument = unsafe { std::ffi::CStr::from_ptr(*argv.add(index as usize)) };
@@ -2625,7 +2968,19 @@ pub unsafe extern "C" fn gleam_native_panic(
     eprintln!();
     eprintln!("{message}");
     eprintln!();
-    eprintln!("    {module}.{function}:{line}");
+    // An Erlang-style stack trace from the frame-pointer chain; when the
+    // walk resolves nothing (no frame table registered, or an unsupported
+    // platform), fall back to the panic site metadata baked into the call.
+    let mut trace = String::new();
+    let _ = write_stack_trace(current_frame_pointer(), &mut |bytes| {
+        trace.push_str(std::str::from_utf8(bytes).expect("trace rows are UTF-8"));
+    });
+    eprintln!("stacktrace:");
+    if trace.is_empty() {
+        eprintln!("  {module}.{function}:{line}");
+    } else {
+        eprint!("{trace}");
+    }
     if let Some((run, _)) = failed_test {
         let _ = run.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Resume with the next test instead of exiting; the failed test's

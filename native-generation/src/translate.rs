@@ -1123,6 +1123,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         let (module_pointer, module_length) = self.constant_bytes(module_name.as_bytes())?;
         let (function_pointer, function_length) =
             self.constant_bytes(function.to_string().as_bytes())?;
+        // Stamp the panic's own source line over the enclosing statement's,
+        // so the stack trace's innermost frame names the panic expression
+        // exactly (a panic nested in a `case` would otherwise report the
+        // whole case statement's line).
+        if line != 0 {
+            self.builder.set_srcloc(SourceLoc::new(line));
+        }
         let line = self.builder.ins().iconst(types::I64, line as i64);
         let panic_ref = self
             .module

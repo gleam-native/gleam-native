@@ -53,6 +53,10 @@ unsafe extern "C" {
     /// The program data blob; the symbol name is
     /// [`native_runtime::PROGRAM_DATA_SYMBOL`].
     static gleam_native_program_data: u8;
+
+    /// The frame table blob for panic stack traces; the symbol name is
+    /// [`native_runtime::FRAME_TABLE_SYMBOL`].
+    static gleam_native_frame_table: u8;
 }
 
 /// The executable's C entry point.
@@ -74,6 +78,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const std::ffi::c_char) -
             argc,
             argv,
             &raw const gleam_native_program_data,
+            &raw const gleam_native_frame_table,
             gleam_native_main_wrapper,
         )
     }
