@@ -444,6 +444,9 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
     NativeUnsupportedFeature {
         module: EcoString,
         feature: EcoString,
+        path: Utf8PathBuf,
+        src: EcoString,
+        location: SrcSpan,
     },
 }
 
@@ -2552,14 +2555,28 @@ add `gleam add {name}` in this project."
                 hint: None,
             }],
 
-            Error::NativeUnsupportedFeature { module, feature } => vec![Diagnostic {
+            Error::NativeUnsupportedFeature {
+                module,
+                feature,
+                path,
+                src,
+                location,
+            } => vec![Diagnostic {
                 title: "Unsupported feature for native target".into(),
                 text: wrap_format!(
                     "The module `{module}` uses a feature that the native \
 target does not support yet: {feature}."
                 ),
                 level: Level::Error,
-                location: None,
+                location: Some(Location {
+                    src: src.clone(),
+                    path: path.clone(),
+                    label: Label {
+                        text: Some("This is not supported on the native target".into()),
+                        span: *location,
+                    },
+                    extra_labels: vec![],
+                }),
                 hint: None,
             }],
         }

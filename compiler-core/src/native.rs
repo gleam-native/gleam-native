@@ -36,6 +36,7 @@ fn lower_int(value: &BigInt) -> native_ir::Expression {
 pub fn module(
     module: &TypedModule,
     package_root: &camino::Utf8Path,
+    src: &EcoString,
 ) -> Result<native_ir::Module, Error> {
     // The path `echo` prints, root-relative like the other targets print it.
     let src_path = module
@@ -79,6 +80,9 @@ pub fn module(
             module_name: module.name.clone(),
             function_name: name.clone(),
             line_numbers: &module.type_info.line_numbers,
+            src: src.clone(),
+            src_path: module.type_info.src_path.clone(),
+            match_location: std::cell::Cell::new(function.location),
         };
         let body = lowerer.statements(function.body.iter())?;
         functions.push(native_ir::Function::Defined {
@@ -99,14 +103,30 @@ struct Lowerer<'a> {
     module_name: EcoString,
     function_name: EcoString,
     line_numbers: &'a src_span::LineNumbers,
+    src: EcoString,
+    src_path: camino::Utf8PathBuf,
+    /// The nearest enclosing pattern match's source location, kept for
+    /// errors raised while lowering compiled decision trees, whose
+    /// exhaustiveness structures carry no spans of their own. Starts as
+    /// the function head's location.
+    match_location: std::cell::Cell<src_span::SrcSpan>,
 }
 
 impl Lowerer<'_> {
-    fn unsupported(&self, feature: &str) -> Error {
+    fn unsupported(&self, feature: &str, location: src_span::SrcSpan) -> Error {
         Error::NativeUnsupportedFeature {
             module: self.module_name.clone(),
             feature: feature.into(),
+            path: self.src_path.clone(),
+            src: self.src.clone(),
+            location,
         }
+    }
+
+    /// [`unsupported`](Self::unsupported) located at the nearest enclosing
+    /// pattern match, for decision-tree lowering.
+    fn unsupported_pattern(&self, feature: &str) -> Error {
+        self.unsupported(feature, self.match_location.get())
     }
 
     fn statements<'a>(
@@ -143,8 +163,10 @@ impl Lowerer<'_> {
                     .expect("assignment decision tree has a subject")
                     .id as u32;
                 let mut prefix_slices = HashMap::new();
-                let tree =
-                    self.decision(&assignment.compiled_case.tree, None, &mut prefix_slices)?;
+                let enclosing = self.match_location.replace(assignment.pattern.location());
+                let tree = self.decision(&assignment.compiled_case.tree, None, &mut prefix_slices);
+                self.match_location.set(enclosing);
+                let tree = tree?;
                 let on_failure = match &assignment.kind {
                     AssignmentKind::Let | AssignmentKind::Generated => None,
                     AssignmentKind::Assert {
@@ -270,9 +292,9 @@ impl Lowerer<'_> {
                 ..
             } => match constructor {
                 ModuleValueConstructor::Fn { module, name, .. } => {
-                    let arity = type_
-                        .fn_arity()
-                        .ok_or_else(|| self.unsupported("this module access"))?;
+                    let arity = type_.fn_arity().ok_or_else(|| {
+                        self.unsupported("this module access", expression.location())
+                    })?;
                     Ok(native_ir::Expression::FunctionReference {
                         module: module.clone().into(),
                         function: name.clone().into(),
@@ -496,7 +518,9 @@ impl Lowerer<'_> {
                         ValueConstructorVariant::LocalVariable { .. }
                         | ValueConstructorVariant::ModuleFn { .. }
                         | ValueConstructorVariant::ModuleConstant { .. } => {
-                            return Err(self.unsupported("this record update"));
+                            return Err(
+                                self.unsupported("this record update", expression.location())
+                            );
                         }
                     }
                 } else if let TypedExpr::ModuleSelect {
@@ -511,7 +535,7 @@ impl Lowerer<'_> {
                 {
                     (*variant_index as u32, name.clone())
                 } else {
-                    return Err(self.unsupported("this record update"));
+                    return Err(self.unsupported("this record update", expression.location()));
                 };
                 let arguments = arguments
                     .iter()
@@ -580,7 +604,10 @@ impl Lowerer<'_> {
                     .map(|variable| variable.id as u32)
                     .collect();
                 let mut prefix_slices = HashMap::new();
-                let tree = self.decision(&compiled_case.tree, Some(clauses), &mut prefix_slices)?;
+                let enclosing = self.match_location.replace(expression.location());
+                let tree = self.decision(&compiled_case.tree, Some(clauses), &mut prefix_slices);
+                self.match_location.set(enclosing);
+                let tree = tree?;
                 let subjects = subjects
                     .iter()
                     .map(|subject| self.expression(subject))
@@ -627,7 +654,9 @@ impl Lowerer<'_> {
 
             // Only present when analysis already reported a type error, so
             // code generation never runs on it.
-            TypedExpr::Invalid { .. } => Err(self.unsupported("this kind of expression")),
+            TypedExpr::Invalid { location, .. } => {
+                Err(self.unsupported("this kind of expression", *location))
+            }
         }
     }
 
@@ -792,10 +821,12 @@ impl Lowerer<'_> {
                 index: *index as u32,
             }),
             ClauseGuard::FieldAccess { index: None, .. } => {
-                Err(self.unsupported("this guard expression"))
+                Err(self.unsupported("this guard expression", guard.location()))
             }
             ClauseGuard::ModuleSelect { literal, .. } => self.constant(literal),
-            ClauseGuard::Invalid { .. } => Err(self.unsupported("this guard expression")),
+            ClauseGuard::Invalid { .. } => {
+                Err(self.unsupported("this guard expression", guard.location()))
+            }
         }
     }
 
@@ -879,7 +910,9 @@ impl Lowerer<'_> {
                         | ValueConstructorVariant::ModuleFn { .. }
                         | ValueConstructorVariant::ModuleConstant { .. } => None,
                     })
-                    .ok_or_else(|| self.unsupported("this kind of constant"))?;
+                    .ok_or_else(|| {
+                        self.unsupported("this kind of constant", constant.location())
+                    })?;
                 // A constructor with fields referenced without arguments is
                 // the constructor as a function value, not a record.
                 let Some(arguments) = arguments.as_deref() else {
@@ -921,9 +954,9 @@ impl Lowerer<'_> {
             }
             // A constant referring to another constant or to a function.
             Constant::Var { constructor, .. } => {
-                let constructor = constructor
-                    .as_deref()
-                    .ok_or_else(|| self.unsupported("this kind of constant"))?;
+                let constructor = constructor.as_deref().ok_or_else(|| {
+                    self.unsupported("this kind of constant", constant.location())
+                })?;
                 match &constructor.variant {
                     ValueConstructorVariant::ModuleConstant { literal, .. } => {
                         self.constant(literal)
@@ -951,7 +984,7 @@ impl Lowerer<'_> {
                         *variant_index,
                     )),
                     ValueConstructorVariant::LocalVariable { .. } => {
-                        Err(self.unsupported("this kind of constant"))
+                        Err(self.unsupported("this kind of constant", constant.location()))
                     }
                 }
             }
@@ -969,10 +1002,12 @@ impl Lowerer<'_> {
             Constant::BitArray { segments, .. } => {
                 let mut lowered = Vec::with_capacity(segments.len());
                 for segment in segments {
-                    let kind =
-                        self.bit_segment_kind_of(&segment.options, &segment.type_, &mut |value| {
-                            self.constant(value)
-                        })?;
+                    let kind = self.bit_segment_kind_of(
+                        &segment.options,
+                        &segment.type_,
+                        segment.location,
+                        &mut |value| self.constant(value),
+                    )?;
                     lowered.push(native_ir::BitSegment {
                         value: Box::new(self.constant(&segment.value)?),
                         kind,
@@ -983,7 +1018,7 @@ impl Lowerer<'_> {
             // Analysis desugars record updates in constants and rejects
             // `todo` and invalid constants before code generation runs.
             Constant::RecordUpdate { .. } | Constant::Todo { .. } | Constant::Invalid { .. } => {
-                Err(self.unsupported("this kind of constant"))
+                Err(self.unsupported("this kind of constant", constant.location()))
             }
         }
     }
@@ -994,9 +1029,12 @@ impl Lowerer<'_> {
         &self,
         segment: &crate::ast::TypedExprBitArraySegment,
     ) -> Result<native_ir::BitSegmentKind, Error> {
-        self.bit_segment_kind_of(&segment.options, &segment.type_, &mut |value| {
-            self.expression(value)
-        })
+        self.bit_segment_kind_of(
+            &segment.options,
+            &segment.type_,
+            segment.location,
+            &mut |value| self.expression(value),
+        )
     }
 
     /// [`bit_segment_kind`](Self::bit_segment_kind) generalized over the
@@ -1007,6 +1045,7 @@ impl Lowerer<'_> {
         &self,
         options: &[crate::ast::BitArrayOption<Value>],
         type_: &Type,
+        location: src_span::SrcSpan,
         lower: &mut dyn FnMut(&Value) -> Result<native_ir::Expression, Error>,
     ) -> Result<native_ir::BitSegmentKind, Error> {
         use crate::ast::BitArrayOption;
@@ -1072,7 +1111,7 @@ impl Lowerer<'_> {
             });
         }
         if !type_.is_int() {
-            return Err(self.unsupported("this bit array segment"));
+            return Err(self.unsupported("this bit array segment", location));
         }
         let bits = Self::multiply(size.unwrap_or(native_ir::Expression::Int(8)), unit as u64);
         Ok(native_ir::BitSegmentKind::Int {
@@ -1193,10 +1232,10 @@ impl Lowerer<'_> {
             } => {
                 let left = self
                     .read_size_expression(left)?
-                    .ok_or_else(|| self.unsupported("this bit array pattern"))?;
+                    .ok_or_else(|| self.unsupported_pattern("this bit array pattern"))?;
                 let right = self
                     .read_size_expression(right)?
-                    .ok_or_else(|| self.unsupported("this bit array pattern"))?;
+                    .ok_or_else(|| self.unsupported_pattern("this bit array pattern"))?;
                 Some(self.binary_operator_for_bits(*operator, left, right))
             }
             ReadSize::RemainingBits | ReadSize::RemainingBytes => None,
@@ -1218,11 +1257,11 @@ impl Lowerer<'_> {
         let mut reads = Vec::with_capacity(references.len());
         for (name, action) in references {
             if action.type_ != exhaustiveness::ReadType::Int {
-                return Err(self.unsupported("this bit array pattern"));
+                return Err(self.unsupported_pattern("this bit array pattern"));
             }
             let bits = self
                 .read_size_expression(&action.size)?
-                .ok_or_else(|| self.unsupported("this bit array pattern"))?;
+                .ok_or_else(|| self.unsupported_pattern("this bit array pattern"))?;
             reads.push(native_ir::SegmentRead {
                 name: Self::segment_variable_name(name),
                 offset: Box::new(self.offset_expression(&action.from)?),
@@ -1251,7 +1290,7 @@ impl Lowerer<'_> {
             BitArrayTest::ReadSizeIsNotNegative { size } => {
                 let value = self
                     .read_size_expression(size)?
-                    .ok_or_else(|| self.unsupported("this bit array pattern"))?;
+                    .ok_or_else(|| self.unsupported_pattern("this bit array pattern"))?;
                 native_ir::BitsTest::NonNegative {
                     value: Box::new(value),
                 }
@@ -1296,14 +1335,14 @@ impl Lowerer<'_> {
                     BitArrayMatchedValue::LiteralFloat(_)
                     | BitArrayMatchedValue::LiteralInt { .. }
                     | BitArrayMatchedValue::Assign { .. } => {
-                        return Err(self.unsupported("this bit array pattern"));
+                        return Err(self.unsupported_pattern("this bit array pattern"));
                     }
                 }
             }
             BitArrayTest::SegmentIsFiniteFloat { read_action } => {
                 let bits = self
                     .read_size_expression(&read_action.size)?
-                    .ok_or_else(|| self.unsupported("this bit array pattern"))?;
+                    .ok_or_else(|| self.unsupported_pattern("this bit array pattern"))?;
                 native_ir::BitsTest::IsFiniteFloat {
                     offset: Box::new(self.offset_expression(&read_action.from)?),
                     bits: Box::new(bits),
@@ -1330,8 +1369,8 @@ impl Lowerer<'_> {
                 if_true,
                 if_false,
             } => {
-                let clauses =
-                    clauses.ok_or_else(|| self.unsupported("guards outside case expressions"))?;
+                let clauses = clauses
+                    .ok_or_else(|| self.unsupported_pattern("guards outside case expressions"))?;
                 let guard_expression = clauses
                     .get(*guard)
                     .expect("guard clause index in range")
@@ -1507,7 +1546,7 @@ impl Lowerer<'_> {
                 }
                 exhaustiveness::BoundValue::LiteralFloat(value) => {
                     let value = crate::parse::LiteralFloatValue::parse(value)
-                        .ok_or_else(|| self.unsupported("this float literal"))?;
+                        .ok_or_else(|| self.unsupported_pattern("this float literal"))?;
                     native_ir::Bound::Value(native_ir::Expression::Float(value.value()))
                 }
                 exhaustiveness::BoundValue::LiteralString(value) => {
@@ -1542,7 +1581,7 @@ impl Lowerer<'_> {
                             offset,
                             bits: bits.map(Box::new),
                         },
-                        _ => return Err(self.unsupported("this bit array pattern")),
+                        _ => return Err(self.unsupported_pattern("this bit array pattern")),
                     }
                 }
                 exhaustiveness::BoundValue::StringSlice { subject, prefix } => {
@@ -1611,7 +1650,7 @@ mod tests {
             None,
         )
         .expect("should compile");
-        super::module(&module, camino::Utf8Path::new("/root")).expect("should lower")
+        super::module(&module, camino::Utf8Path::new("/root"), &src.into()).expect("should lower")
     }
 
     /// The statements with their debug source lines zeroed (recursively,
@@ -1623,12 +1662,11 @@ mod tests {
             match value {
                 serde_json::Value::Object(map) => {
                     for (key, inner) in map.iter_mut() {
-                        if matches!(key.as_str(), "Let" | "Destructure" | "Expression") {
-                            if let serde_json::Value::Object(fields) = inner {
-                                if let Some(line) = fields.get_mut("line") {
-                                    *line = serde_json::Value::from(0);
-                                }
-                            }
+                        if matches!(key.as_str(), "Let" | "Destructure" | "Expression")
+                            && let serde_json::Value::Object(fields) = inner
+                            && let Some(line) = fields.get_mut("line")
+                        {
+                            *line = serde_json::Value::from(0);
                         }
                         zero_statement_lines(inner);
                     }

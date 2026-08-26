@@ -269,8 +269,12 @@ platform C convention.
 - ✅ `gleam build --target native` producing per-module `.nir` artifacts
   with incremental reuse
 - ✅ `gleam run --target native` (in-process JIT)
-- 🚧 Unsupported features fail with a named error rather than miscompiling
-  (no source location yet in `NativeUnsupportedFeature`)
+- ✅ Unsupported features fail with a named error rather than
+  miscompiling, rendered as a full diagnostic with a source snippet:
+  `NativeUnsupportedFeature` carries the module's path, source, and the
+  offending span (the exact expression, constant, guard, or segment;
+  pattern features raised from compiled decision trees, which carry no
+  spans of their own, point at the nearest enclosing match)
 - ✅ Ahead-of-time compilation: `gleam export native` builds the project in
   production mode, compiles the `.nir` modules to a host object file via
   `cranelift-object` (position-independent, optimized), and links it with
