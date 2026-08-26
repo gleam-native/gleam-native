@@ -1220,6 +1220,37 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         Ok(result)
     }
 
+    /// Evaluates an expression whose value is only read within the
+    /// current statement. A plain variable whose binding is not being
+    /// consumed is a borrow — the binding outlives the statement, so the
+    /// reference-count round trip is skipped; the caller must then not
+    /// release it. Returns the value and whether it is borrowed. Never
+    /// use this for values handed to a taker: an external that steals
+    /// uniquely-referenced arguments would mutate the live binding.
+    fn expression_read(
+        &mut self,
+        expression: &native_ir::Expression,
+    ) -> Result<(Value, bool), String> {
+        if let native_ir::Expression::Variable(name) = expression
+            && !self.dying.contains(name)
+        {
+            let variable = *self
+                .environment
+                .get(name)
+                .ok_or_else(|| format!("unbound variable `{name}`"))?;
+            return Ok((self.builder.use_var(variable), true));
+        }
+        Ok((self.expression(expression)?, false))
+    }
+
+    /// Releases a value from [`Self::expression_read`] unless it was
+    /// borrowed.
+    fn release_read(&mut self, value: Value, borrowed: bool) {
+        if !borrowed {
+            self.dec(value);
+        }
+    }
+
     /// Emits a reference count increment. Yields the value for chaining.
     fn inc(&mut self, value: Value) -> Value {
         if debug_rc() {
@@ -1767,16 +1798,20 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     }
                 }
                 let mut variables = HashMap::new();
-                let mut subject_values = Vec::with_capacity(subjects.len());
+                let mut owned_subjects = Vec::new();
                 for (id, subject) in subject_ids.iter().zip(subjects) {
-                    let value = self.expression(subject)?;
+                    // Borrowed subjects skip the count round trip and are
+                    // owed nothing at a transfer; see the non-tail case.
+                    let (value, borrowed) = self.expression_read(subject)?;
                     let _ = variables.insert(*id, value);
-                    subject_values.push(value);
+                    if !borrowed {
+                        owned_subjects.push(value);
+                    }
                 }
                 let mut cleanups = cleanups;
                 self.remove_consumed(&mut cleanups);
                 let mut tail_cleanups = cleanups;
-                tail_cleanups.extend(subject_values.iter().map(|value| (None, *value)));
+                tail_cleanups.extend(owned_subjects.iter().map(|value| (None, *value)));
 
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
@@ -1786,7 +1821,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     join,
                     DecisionMode::Case {
                         tail: Some(tail_cleanups),
-                        subjects: subject_values.clone(),
+                        subjects: owned_subjects.clone(),
                     },
                     None,
                 )?;
@@ -1794,7 +1829,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.builder.switch_to_block(join);
                 if joined {
                     let result = self.builder.block_params(join)[0];
-                    for subject in subject_values {
+                    for subject in owned_subjects {
                         self.dec(subject);
                     }
                     Ok(Some(result))
@@ -1931,11 +1966,16 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 tree,
             } => {
                 let mut variables = HashMap::new();
-                let mut subject_values = Vec::with_capacity(subjects.len());
+                let mut owned_subjects = Vec::new();
                 for (id, subject) in subject_ids.iter().zip(subjects) {
-                    let value = self.expression(subject)?;
+                    // A borrowed subject (a plain variable read) skips the
+                    // count round trip; it is then not a drop-reuse
+                    // candidate, since its binding stays live.
+                    let (value, borrowed) = self.expression_read(subject)?;
                     let _ = variables.insert(*id, value);
-                    subject_values.push(value);
+                    if !borrowed {
+                        owned_subjects.push(value);
+                    }
                 }
 
                 let join = self.builder.create_block();
@@ -1946,7 +1986,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     join,
                     DecisionMode::Case {
                         tail: None,
-                        subjects: subject_values.clone(),
+                        subjects: owned_subjects.clone(),
                     },
                     None,
                 )?;
@@ -1954,7 +1994,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
                 self.builder.switch_to_block(join);
                 let result = self.builder.block_params(join)[0];
-                for subject in subject_values {
+                for subject in owned_subjects {
                     self.dec(subject);
                 }
                 Ok(result)
@@ -2068,7 +2108,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::FieldAccess { record, index } => {
-                let record = self.expression(record)?;
+                let (record, borrowed) = self.expression_read(record)?;
                 let field = self.builder.ins().load(
                     types::I64,
                     MemFlagsData::trusted(),
@@ -2076,7 +2116,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     8 + 8 * *index as i32,
                 );
                 let _ = self.inc(field);
-                self.dec(record);
+                self.release_read(record, borrowed);
                 Ok(field)
             }
 
@@ -2324,11 +2364,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 left,
                 right,
             } => {
-                let left = self.expression(left)?;
-                let right = self.expression(right)?;
+                let (left, left_borrowed) = self.expression_read(left)?;
+                let (right, right_borrowed) = self.expression_read(right)?;
                 let result = self.int_binary(*operator, left, right)?;
-                self.dec(left);
-                self.dec(right);
+                self.release_read(left, left_borrowed);
+                self.release_read(right, right_borrowed);
                 Ok(result)
             }
 
@@ -2345,11 +2385,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         IntCC::SignedGreaterThanOrEqual
                     }
                 };
-                let left = self.expression(left)?;
-                let right = self.expression(right)?;
+                let (left, left_borrowed) = self.expression_read(left)?;
+                let (right, right_borrowed) = self.expression_read(right)?;
                 let result = self.int_compare(condition, left, right)?;
-                self.dec(left);
-                self.dec(right);
+                self.release_read(left, left_borrowed);
+                self.release_read(right, right_borrowed);
                 Ok(result)
             }
 
@@ -2359,8 +2399,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 left,
                 right,
             } => {
-                let left = self.expression(left)?;
-                let right = self.expression(right)?;
+                let (left, left_borrowed) = self.expression_read(left)?;
+                let (right, right_borrowed) = self.expression_read(right)?;
                 let result = match kind {
                     // Bool and Nil are always tagged immediates: word
                     // equality is value equality.
@@ -2422,8 +2462,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         }
                     }
                 }?;
-                self.dec(left);
-                self.dec(right);
+                self.release_read(left, left_borrowed);
+                self.release_read(right, right_borrowed);
                 Ok(result)
             }
 
@@ -2476,8 +2516,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 left,
                 right,
             } => {
-                let left_boxed = self.expression(left)?;
-                let right_boxed = self.expression(right)?;
+                let (left_boxed, left_borrowed) = self.expression_read(left)?;
+                let (right_boxed, right_borrowed) = self.expression_read(right)?;
                 let left = self.load_float(left_boxed);
                 let right = self.load_float(right_boxed);
                 let result = match operator {
@@ -2496,8 +2536,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     }
                 };
                 let result = self.box_float(result)?;
-                self.dec(left_boxed);
-                self.dec(right_boxed);
+                self.release_read(left_boxed, left_borrowed);
+                self.release_read(right_boxed, right_borrowed);
                 Ok(result)
             }
 
@@ -2514,14 +2554,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         FloatCC::GreaterThanOrEqual
                     }
                 };
-                let left_boxed = self.expression(left)?;
-                let right_boxed = self.expression(right)?;
+                let (left_boxed, left_borrowed) = self.expression_read(left)?;
+                let (right_boxed, right_borrowed) = self.expression_read(right)?;
                 let left = self.load_float(left_boxed);
                 let right = self.load_float(right_boxed);
                 let flag = self.builder.ins().fcmp(condition, left, right);
                 let result = self.tag_boolean_flag(flag);
-                self.dec(left_boxed);
-                self.dec(right_boxed);
+                self.release_read(left_boxed, left_borrowed);
+                self.release_read(right_boxed, right_borrowed);
                 Ok(result)
             }
         }
