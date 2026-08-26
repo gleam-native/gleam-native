@@ -61,7 +61,7 @@ tracing = "0"
 async-trait = "0"
 # The native target's scheduler substrate: worker threads, reactor, and
 # timer wheel for the fiber-hosted process runtime.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
 # Stackful coroutines: each native-target Gleam program (and later each
 # process) runs on its own guard-paged fiber stack, resumed from a future.
 corosensei = "0.3"

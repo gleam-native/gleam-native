@@ -41,6 +41,12 @@
 use std::cell::Cell;
 
 use compact_str::CompactString;
+
+mod process;
+pub use process::{
+    SubjectPayload, exit_current_abnormally, in_child_process, monitor_arc, process_symbols,
+    receive_tags, spawn_child,
+};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use unicode_segmentation::UnicodeSegmentation;
@@ -78,6 +84,9 @@ pub const KIND_BITARRAY: u64 = 5;
 /// A standard library dict, created by the runtime's dict functions rather
 /// than by generated code.
 pub const KIND_DICT: u64 = 6;
+/// A process subject: the handle messages are sent and received on,
+/// created by the process runtime.
+pub const KIND_SUBJECT: u64 = 7;
 
 /// The header word of a record with the given variant tag and field count.
 /// Code generation computes expected headers with this same formula, so a
@@ -328,7 +337,7 @@ pub(crate) fn bitarray_panic(message: &str) -> ! {
     eprintln!("runtime error: bit array");
     eprintln!();
     eprintln!("{message}");
-    std::process::exit(1);
+    exit_current_abnormally(format!("bit array error: {message}"));
 }
 
 /// Decodes a tagged size or offset in bits; it must be a non-negative
@@ -1488,60 +1497,12 @@ pub fn set_start_arguments(arguments: Vec<String>) {
     let _ = START_ARGUMENTS.set(arguments);
 }
 
-/// Runs the program's entry wrapper on the dedicated "gleam-main" thread
-/// with the given stack size (in megabytes) and the stack overflow handler
-/// installed. Tail calls run in constant space, and deep non-tail recursion
-/// gets generous room before the overflow handler reports it. A minimum of
-/// one megabyte keeps a misconfigured project able to reach `main` at all.
-pub fn run_program_thread(
-    stack_size_megabytes: u64,
-    entry: extern "C" fn() -> u64,
-) -> Result<(), String> {
-    run_program_thread_with(stack_size_megabytes, move || {
-        let _ = entry();
-    })
-}
-
-/// [`run_program_thread`] for an arbitrary body: used by the test runner,
-/// whose entry is a Rust loop over the compiled test functions.
-pub fn run_program_thread_with(
-    stack_size_megabytes: u64,
-    body: impl FnOnce() + Send + 'static,
-) -> Result<(), String> {
-    let stack_size = usize::try_from(stack_size_megabytes.max(1))
-        .unwrap_or(usize::MAX)
-        .saturating_mul(1024 * 1024);
-    std::thread::Builder::new()
-        .name("gleam-main".into())
-        .stack_size(stack_size)
-        .spawn(move || {
-            // The stack-trace walk's upper bound: a local's address is
-            // (within one frame) the top of this thread's stack.
-            let marker = 0u8;
-            let top = &raw const marker as usize;
-            let mut context = ProcessContext {
-                pool: POOL.with(|pool| pool as *const Pool),
-                stack_low: top.saturating_sub(stack_size),
-                stack_high: top,
-                reductions: 0,
-            };
-            CURRENT_CONTEXT.with(|current| current.set(&raw mut context));
-            arm_rc_debugging();
-            install_stack_overflow_handler();
-            body();
-        })
-        .map_err(|error| format!("could not start the program thread: {error}"))?
-        .join()
-        .map_err(|_| "the program crashed".to_string())?;
-    Ok(())
-}
-
-/// Runs the program's entry wrapper on a fiber: a corosensei coroutine
-/// with its own guard-paged stack, wrapped in a future and executed on a
-/// tokio multi-thread runtime's worker threads. The substrate the process
-/// scheduler will build on; for now the whole program is one fiber that
-/// never suspends. `gleam run` and `gleam test` use this; ahead-of-time
-/// executables still use [`run_program_thread`] until they migrate.
+/// Runs the program's entry wrapper as the root process: a fiber with its
+/// own guard-paged stack, scheduled (with every process it spawns) on a
+/// tokio multi-thread runtime's worker threads. Returns when the root
+/// process finishes; remaining processes are abandoned, matching the
+/// other targets' behavior when `main` returns. Used by `gleam run`,
+/// `gleam test`, and ahead-of-time compiled executables alike.
 pub fn run_program_fiber(
     stack_size_megabytes: u64,
     entry: extern "C" fn() -> u64,
@@ -1556,89 +1517,32 @@ pub fn run_program_fiber_with(
     stack_size_megabytes: u64,
     body: impl FnOnce() + Send + 'static,
 ) -> Result<(), String> {
+    // Stacks are committed lazily by the OS, so a generous size reserves
+    // address space, not memory; the guard page below each turns overflow
+    // into a fault the handler reports.
     let stack_size = usize::try_from(stack_size_megabytes.max(1))
         .unwrap_or(usize::MAX)
         .saturating_mul(1024 * 1024);
+    process::PROCESS_STACK_SIZE.store(stack_size, std::sync::atomic::Ordering::Relaxed);
     arm_rc_debugging();
     install_fault_handler();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("gleam-scheduler")
         .on_thread_start(install_signal_stack)
+        .enable_time()
         .build()
         .map_err(|error| format!("could not start the scheduler: {error}"))?;
-    // The stack is committed lazily by the OS, so a generous size reserves
-    // address space, not memory; the guard page below it turns overflow
-    // into a fault the handler reports.
-    let stack = corosensei::stack::DefaultStack::new(stack_size)
-        .map_err(|error| format!("could not allocate the program stack: {error}"))?;
-    let (stack_high, stack_low) = {
-        use corosensei::stack::Stack;
-        (stack.base().get(), stack.limit().get())
-    };
-    let context = Box::new(ProcessContext {
-        pool: std::ptr::null(),
-        stack_low,
-        stack_high,
-        reductions: 0,
-    });
-    let coroutine = corosensei::Coroutine::with_stack(stack, move |_yielder, ()| {
-        body();
-    });
-    match runtime.block_on(runtime.spawn(FiberFuture { coroutine, context })) {
+    let (_shared, future) = process::new_process(true, body)?;
+    match runtime.block_on(runtime.spawn(future)) {
         Ok(()) => Ok(()),
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => Err(format!("the program crashed: {error}")),
     }
 }
 
-/// A fiber hosting Gleam code, as a future the tokio runtime can poll.
-/// Each poll points the fiber's context at the current worker's pool, sets
-/// it as the thread's running context, and resumes the fiber; a yield
-/// reschedules immediately (mailbox waits and sleeps will register real
-/// wakers here once processes exist), and the fiber returning completes
-/// the future.
-struct FiberFuture {
-    coroutine: corosensei::Coroutine<(), (), ()>,
-    context: Box<ProcessContext>,
-}
-
-/// SAFETY: a corosensei coroutine is not automatically `Send` because the
-/// data on its suspended stack could borrow thread state. Gleam fibers
-/// uphold the invariant wasmtime's async fibers rely on: the only
-/// suspension points are inside this runtime, which never holds a
-/// thread-local borrow across a suspend — the context's pool is rewritten
-/// to the new worker's pool on every resume, and generated code reads it
-/// fresh (through its `env` parameter) per allocation. Externals run to
-/// completion within one resume, so they can never observe a migration.
-unsafe impl Send for FiberFuture {}
-
-impl std::future::Future for FiberFuture {
-    type Output = ();
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        task: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
-        // The coroutine handle owns its heap-allocated stack and is
-        // movable while suspended, so the future needs no pinning.
-        let this = self.get_mut();
-        this.context.pool = POOL.with(|pool| pool as *const Pool);
-        CURRENT_CONTEXT.with(|current| current.set(&raw mut *this.context));
-        let result = this.coroutine.resume(());
-        CURRENT_CONTEXT.with(|current| current.set(std::ptr::null_mut()));
-        match result {
-            corosensei::CoroutineResult::Yield(()) => {
-                task.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-            corosensei::CoroutineResult::Return(()) => std::task::Poll::Ready(()),
-        }
-    }
-}
-
 /// The state of a `gleam test` run: the discovered tests and the run's
 /// progress. Present only while tests are executing; its presence is what
-/// switches [`gleam_native_panic`] into recoverable test mode.
+/// makes [`gleam_native_panic`] print the failing test's name.
 struct TestRun {
     /// Test display names and their C-convention entry wrappers.
     tests: Vec<(String, extern "C" fn() -> u64)>,
@@ -1650,37 +1554,41 @@ struct TestRun {
 
 static TEST_RUN: std::sync::OnceLock<TestRun> = std::sync::OnceLock::new();
 
-/// Runs the given tests in order on the current thread, reporting each
-/// outcome, then exits the process: 0 if every test passed, 1 otherwise.
+/// Runs the given tests in order — each as its own process, monitored by
+/// this one — reporting each outcome, then exits: 0 if every test passed,
+/// 1 otherwise. Called inside the root fiber.
 ///
 /// A failing test panics into [`gleam_native_panic`], which reports the
-/// failure and resumes the run by calling [`continue_test_run`] rather than
-/// returning through the failed test's stack frames. Those frames (and the
-/// failed test's allocations) are simply abandoned — the process exits when
-/// the run finishes, so the leak is harmless. A stack overflow is not
-/// recoverable this way and still aborts the whole run.
+/// failure and terminates the test's process; its fiber is abandoned
+/// without unwinding and the runner moves on — the same mechanism any
+/// crashing process uses. A stack overflow still aborts the whole run.
 pub fn run_tests(tests: Vec<(String, extern "C" fn() -> u64)>) -> ! {
+    use std::sync::atomic::Ordering;
     let _ = TEST_RUN.set(TestRun {
         tests,
         next: std::sync::atomic::AtomicUsize::new(0),
         failed: std::sync::atomic::AtomicUsize::new(0),
     });
-    continue_test_run()
-}
-
-/// Runs every not-yet-started test to completion, then reports the summary
-/// and exits the process. Called from [`run_tests`] and re-entered by
-/// [`gleam_native_panic`] after a test fails.
-fn continue_test_run() -> ! {
-    use std::sync::atomic::Ordering;
-    let run = TEST_RUN.get().expect("a test run is in progress");
+    let run = TEST_RUN.get().expect("the test run was just stored");
     loop {
         let index = run.next.fetch_add(1, Ordering::SeqCst);
         let Some((name, function)) = run.tests.get(index) else {
             break;
         };
-        let _ = function();
-        println!("  PASS {name}");
+        let function = *function;
+        let test_process = spawn_child(move || {
+            let _ = function();
+        });
+        let down = monitor_arc(&test_process);
+        let envelope = receive_tags(&[down], None).expect("a monitored test reports down");
+        let reason = envelope.take_value();
+        let passed = string_value(reason) == "normal";
+        let _ = gleam_native_dec(reason);
+        if passed {
+            println!("  PASS {name}");
+        }
+        // A failure printed its own FAIL line and report from the panic,
+        // and counted itself in `run.failed`.
     }
     let total = run.tests.len();
     let failed = run.failed.load(Ordering::SeqCst);
@@ -1760,7 +1668,7 @@ pub unsafe fn start(
     }
     set_constructor_names(names);
 
-    match run_program_thread(stack_size_megabytes, entry) {
+    match run_program_fiber(stack_size_megabytes, entry) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("error: {error}");
@@ -2271,6 +2179,18 @@ pub extern "C" fn gleam_native_current_context() -> u64 {
 /// C-convention wrappers.
 pub const CURRENT_CONTEXT_SYMBOL: &str = "gleam_native_current_context";
 
+/// Sets the thread's running context; used by the process scheduler
+/// around every fiber resume.
+pub(crate) fn set_current_context(context: *mut ProcessContext) {
+    CURRENT_CONTEXT.with(|current| current.set(context));
+}
+
+/// The calling thread's allocation pool, for pinning a process context to
+/// the worker about to run it.
+pub(crate) fn current_pool() -> *const Pool {
+    POOL.with(|pool| pool as *const Pool)
+}
+
 /// The stack top recorded in the running context, or zero when no context
 /// is set: the stack-trace walk's upper bound.
 fn current_stack_top() -> usize {
@@ -2593,6 +2513,7 @@ fn free_object(value: u64, worklist: &mut Vec<u64>) {
             // [`DictEntry`]'s `Drop` implementations.
             free_payload::<DictPayload>(value);
         }
+        KIND_SUBJECT => free_payload::<SubjectPayload>(value),
         _ => {}
     }
 }
@@ -2749,6 +2670,10 @@ fn hash_value(value: u64, state: &mut impl std::hash::Hasher) {
             }
             combined.hash(state);
         }
+        // Subjects compare by channel identity, so they hash by it too
+        // (copies of one subject are equal but live at different
+        // addresses).
+        KIND_SUBJECT => subject_payload(value).tag.hash(state),
         // Closures and unknown kinds compare by identity.
         _ => value.hash(state),
     }
@@ -2888,6 +2813,108 @@ pub fn dict_payload_mut(value: u64) -> &'static mut DictPayload {
     unsafe { &mut (*container::<DictPayload>(value)).value }
 }
 
+/// Boxes a subject payload as a Gleam value.
+pub(crate) fn box_subject(payload: SubjectPayload) -> u64 {
+    box_heap(KIND_SUBJECT, payload)
+}
+
+/// The payload of a subject value.
+pub(crate) fn subject_payload(value: u64) -> &'static SubjectPayload {
+    unsafe { &(*container::<SubjectPayload>(value)).value }
+}
+
+/// Deep-copies a value for delivery to another process: the copy shares
+/// nothing with the original except permanent objects (interned literals,
+/// safe to share because count operations skip them) and the
+/// internally-synchronized process handles inside subjects. Record and
+/// list spines copy iteratively, so long lists cannot overflow the stack;
+/// recursion happens only through dict entries.
+pub fn deep_copy(value: u64) -> u64 {
+    fn copy_node(value: u64, worklist: &mut Vec<u64>) -> u64 {
+        let header = heap_header(value);
+        match header_kind(header) {
+            KIND_RECORD => {
+                let arity = record_arity(header) as usize;
+                let copy = allocate_words(1 + arity);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        value as *const u64,
+                        copy as *mut u64,
+                        1 + arity,
+                    );
+                }
+                // The copy's fields still point at the original's
+                // children; the worklist rewrites them.
+                if arity > 0 {
+                    worklist.push(copy);
+                }
+                copy
+            }
+            KIND_CLOSURE => {
+                let captures = record_arity(header) as usize;
+                let copy = allocate_words(2 + captures);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        value as *const u64,
+                        copy as *mut u64,
+                        2 + captures,
+                    );
+                }
+                if captures > 0 {
+                    worklist.push(copy);
+                }
+                copy
+            }
+            KIND_BIGINT => box_bigint(bigint_value(value).clone()),
+            KIND_FLOAT => box_float(float_value(value)),
+            // Views flatten into owned strings on copy.
+            KIND_STRING => box_string(string_value(value)),
+            KIND_BITARRAY => {
+                let payload = bitarray_value(value);
+                box_bitarray(BitArrayPayload {
+                    bits: payload.bits,
+                    bytes: payload.bytes.clone(),
+                })
+            }
+            KIND_DICT => {
+                // Structural sharing must not cross the process boundary:
+                // rebuild the map, deep-copying every key and entry.
+                let payload = dict_payload(value);
+                let mut map = DictMap::default();
+                for (key, entry) in payload.map.iter() {
+                    let _ = map.insert(DictKey(deep_copy(key.0)), DictEntry(deep_copy(entry.0)));
+                }
+                box_dict(DictPayload { map })
+            }
+            KIND_SUBJECT => box_subject(subject_payload(value).clone()),
+            kind => unreachable!("deep copy of unknown kind {kind}"),
+        }
+    }
+
+    if is_immediate(value) || is_permanent(value) {
+        return value;
+    }
+    let mut worklist = Vec::new();
+    let root = copy_node(value, &mut worklist);
+    while let Some(node) = worklist.pop() {
+        let header = heap_header(node);
+        let (first, count) = match header_kind(header) {
+            KIND_RECORD => (1, record_arity(header) as usize),
+            KIND_CLOSURE => (2, record_arity(header) as usize),
+            _ => unreachable!("only records and closures carry child slots"),
+        };
+        for index in first..first + count {
+            let slot = (node as *mut u64).wrapping_add(index);
+            let child = unsafe { *slot };
+            if is_immediate(child) || is_permanent(child) {
+                continue;
+            }
+            unsafe { *slot = copy_node(child, &mut worklist) };
+        }
+    }
+    root
+}
+
 pub fn box_dict(payload: DictPayload) -> u64 {
     box_heap(KIND_DICT, payload)
 }
@@ -2973,6 +3000,13 @@ pub(crate) fn deep_eq(left: u64, right: u64) -> bool {
             let left = bitarray_value(left);
             let right = bitarray_value(right);
             left.bits == right.bits && left.bytes == right.bytes
+        }
+        KIND_SUBJECT => {
+            // Subjects are equal when they name the same channel: the same
+            // process and the same tag.
+            let left = subject_payload(left);
+            let right = subject_payload(right);
+            left.tag == right.tag && std::ptr::eq(&*left.shared, &*right.shared)
         }
         KIND_DICT => {
             // Equal dicts may iterate in different orders (hash collisions
@@ -3126,6 +3160,10 @@ pub fn inspect(value: u64) -> String {
                 .collect();
             format!("dict.from_list([{}])", entries.join(", "))
         }
+        KIND_SUBJECT => {
+            let payload = subject_payload(value);
+            format!("//Subject({}, {})", payload.shared.pid, payload.tag)
+        }
         kind => format!("<unknown kind {kind}>"),
     }
 }
@@ -3241,11 +3279,12 @@ pub unsafe extern "C" fn gleam_native_panic(
     }
     if let Some((run, _)) = failed_test {
         let _ = run.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Resume with the next test instead of exiting; the failed test's
-        // frames below this one are abandoned.
-        continue_test_run();
     }
-    std::process::exit(1);
+    // Inside a child process (a test, or a spawned process) the crash
+    // kills just that process — its fiber is abandoned without unwinding
+    // and links and monitors are notified. The root process's crash ends
+    // the program.
+    exit_current_abnormally(format!("{name}: {message}"));
 }
 
 /// Prints an integer followed by a newline. The standin for a real printing
@@ -3511,6 +3550,9 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("print_float", print_float as *const u8),
         ("println", println as *const u8),
     ]
+    .into_iter()
+    .chain(process_symbols())
+    .collect()
 }
 
 #[cfg(test)]
@@ -3529,37 +3571,35 @@ mod fiber_tests {
         assert!(ran.load(std::sync::atomic::Ordering::Acquire));
     }
 
-    /// A yielding fiber is rescheduled through the waker until it returns,
-    /// and every resume lands with the running context set and its pool
-    /// pointing at the current worker's pool — the scheduler contract
-    /// processes will rely on.
+    /// A spawned process runs, its monitor reports a normal exit, and the
+    /// down message arrives through the mailbox — the round trip the test
+    /// runner and gleam_otp both rely on.
     #[test]
-    fn fiber_yield_reschedules() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .build()
-            .expect("runtime");
-        let coroutine = corosensei::Coroutine::new(|yielder, ()| {
-            for _ in 0..100 {
-                let context = CURRENT_CONTEXT.with(|current| current.get());
-                assert!(!context.is_null(), "every resume sets the context");
-                let expected = POOL.with(|pool| pool as *const Pool);
-                assert!(
-                    std::ptr::eq(unsafe { (*context).pool }, expected),
-                    "the context's pool is the running worker's pool"
-                );
-                yielder.suspend(());
-            }
-        });
-        let context = Box::new(ProcessContext {
-            pool: std::ptr::null(),
-            stack_low: 0,
-            stack_high: 0,
-            reductions: 0,
-        });
-        runtime
-            .block_on(runtime.spawn(FiberFuture { coroutine, context }))
-            .expect("the fiber completes");
+    fn spawned_process_reports_down() {
+        run_program_fiber_with(1, || {
+            let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = ran.clone();
+            let child = spawn_child(move || {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            });
+            let down = monitor_arc(&child);
+            let envelope = receive_tags(&[down], None).expect("a down message arrives");
+            let reason = envelope.take_value();
+            assert_eq!(string_value(reason), "normal");
+            let _ = gleam_native_dec(reason);
+            assert!(ran.load(std::sync::atomic::Ordering::Acquire));
+        })
+        .expect("the program runs");
+    }
+
+    /// A receive with a timeout returns empty-handed when nothing is sent.
+    #[test]
+    fn receive_times_out() {
+        run_program_fiber_with(1, || {
+            let received = receive_tags(&[42], Some(std::time::Duration::from_millis(20)));
+            assert!(received.is_none());
+        })
+        .expect("the program runs");
     }
 
     /// Prints the round-trip suspend/resume cost; run with
