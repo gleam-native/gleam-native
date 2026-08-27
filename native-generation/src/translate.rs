@@ -278,6 +278,8 @@ enum PendingFunction {
 enum InternedLiteral {
     String { slot: DataId, content: String },
     Record { slot: DataId, tag: u32, display: u16 },
+    Float { slot: DataId, bits: u64 },
+    BigInt { slot: DataId, bytes: Vec<u8> },
 }
 
 /// Per-function debug data collected as functions are defined, consumed
@@ -873,6 +875,33 @@ impl<'a, M: Module> Translator<'a, M> {
                         .module
                         .declare_func_in_func(self.runtime.record_new, builder.func);
                     let call = builder.ins().call(record_new_ref, &[tag, arity, display]);
+                    (*slot, builder.inst_results(call)[0])
+                }
+                InternedLiteral::Float { slot, bits } => {
+                    let bits = builder.ins().iconst(types::I64, *bits as i64);
+                    let from_bits_ref = self
+                        .module
+                        .declare_func_in_func(self.runtime.float_from_bits, builder.func);
+                    let call = builder.ins().call(from_bits_ref, &[bits]);
+                    (*slot, builder.inst_results(call)[0])
+                }
+                InternedLiteral::BigInt { slot, bytes } => {
+                    let data = self
+                        .module
+                        .declare_anonymous_data(false, false)
+                        .map_err(|error| error.to_string())?;
+                    let mut description = DataDescription::new();
+                    description.define(bytes.clone().into_boxed_slice());
+                    self.module
+                        .define_data(data, &description)
+                        .map_err(|error| error.to_string())?;
+                    let data_ref = self.module.declare_data_in_func(data, builder.func);
+                    let pointer = builder.ins().symbol_value(pointer_type, data_ref);
+                    let length = builder.ins().iconst(types::I64, bytes.len() as i64);
+                    let constructor_ref = self
+                        .module
+                        .declare_func_in_func(self.runtime.bigint_from_bytes, builder.func);
+                    let call = builder.ins().call(constructor_ref, &[pointer, length]);
                     (*slot, builder.inst_results(call)[0])
                 }
             };
@@ -2514,7 +2543,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::BigInt(bytes) => {
-                self.construct_from_constant_bytes(bytes, self.runtime.bigint_from_bytes)
+                // Built once by the literal-init function; every
+                // evaluation is a plain load of the permanent instance.
+                self.interned(|slot| InternedLiteral::BigInt {
+                    slot,
+                    bytes: bytes.clone(),
+                })
             }
 
             native_ir::Expression::String(string) => {
@@ -2528,15 +2562,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::Float(value) => {
-                let bits = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, value.to_bits() as i64);
-                let from_bits_ref = self
-                    .module
-                    .declare_func_in_func(self.runtime.float_from_bits, self.builder.func);
-                let call = self.builder.ins().call(from_bits_ref, &[bits]);
-                Ok(self.builder.inst_results(call)[0])
+                // Built once by the literal-init function; every
+                // evaluation is a plain load of the permanent instance.
+                // In-place float updates skip permanent boxes (their
+                // count word is negative), so sharing stays unobservable.
+                self.interned(|slot| InternedLiteral::Float {
+                    slot,
+                    bits: value.to_bits(),
+                })
             }
 
             native_ir::Expression::Nil => Ok(self.builder.ins().iconst(types::I64, NIL)),
