@@ -44,6 +44,32 @@ or `FUZZ_GLEAM_BIN`.
 `bench` reuses the smith's programs as workloads with the same
 methodology as `test-fuzz --bench` (see that crate's README): per-
 iteration execution as the slope between warm runs at repeat counts 1
-and N, cold `gleam build` per target, `gleam export native`, and warm
-startup, comparing Erlang against the native JIT and AOT executable.
-Results are written to `fuzzing-cli/bench-results.json`.
+and N, cold `gleam build` per target, `gleam export native`, warm
+startup, and peak RSS (one run at the calibrated repeat count through
+`/usr/bin/time -l`, child processes included), comparing Erlang, the
+native JIT and AOT executable, and JavaScript on Node.js. Results are
+written to `fuzzing-cli/bench-results.json`.
+
+## Results
+
+On an Apple Silicon Mac (M3, macOS 14, release-built compiler,
+Erlang/OTP 29, Node 24), 2026-08-28, over 24 generated programs
+(seeds 0–23; seed 21 skipped — its Erlang leg dies on the known OTP
+compiler bug) — after the day's optimizations (single-write `echo`,
+in-place float updates, inline float free, scalar replacement,
+float/big-integer literal interning):
+
+| configuration | exec vs erlang | peak RSS | cold compile | startup |
+| ------------- | -------------- | -------- | ------------ | ------- |
+| erlang (BEAM) |          1.00× |    83 MB |       196 ms |  256 ms |
+| node 24       |          6.13× |    65 MB |         7 ms |   26 ms |
+| native (JIT)  |         10.47× |    16 MB |         6 ms |  6.5 ms |
+| native (AOT)  |         10.75× |     3 MB |       247 ms |  6.6 ms |
+
+Execution is the geometric mean of per-iteration time ratios (the
+`echo` rendering included); the native JIT is 1.71× faster than
+Node.js and ahead on every program. Peak RSS is one run at the
+calibrated repeat count, children included. The AOT compile figure is
+`gleam export native`: a from-scratch build plus linking and the
+runtime-library freshness check. Full charts:
+https://claude.ai/code/artifact/6051ad4d-9293-47d6-a7e9-fb9be34a5099

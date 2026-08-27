@@ -46,6 +46,10 @@ struct ProgramResult {
     exec: Targets<f64>,
     /// Cold compile time in seconds, per target.
     compile: Targets<f64>,
+    /// Peak resident set size in bytes of one run at the calibrated
+    /// repeat count (child processes included), or `None` where the
+    /// platform cannot measure it.
+    rss: Targets<Option<u64>>,
 }
 
 struct Targets<T> {
@@ -227,6 +231,15 @@ fn measure_program(
     }
     let aot_many = sample(SAMPLES, || timed(&binary, project, &[]))?;
 
+    // Peak memory of one run each at the calibrated repeat count, with
+    // the many-repeats source still in place.
+    let rss = Targets {
+        erlang: peak_rss(gleam, project, &erlang),
+        node: peak_rss(gleam, project, &node),
+        jit: peak_rss(gleam, project, &native),
+        aot: peak_rss(&binary, project, &[]),
+    };
+
     let per_iteration = |many: f64, one: f64| ((many - one) / (repeats - 1) as f64).max(0.0);
     Some(ProgramResult {
         seed,
@@ -238,6 +251,36 @@ fn measure_program(
             aot: per_iteration(aot_many, aot_one),
         },
         compile,
+        rss,
+    })
+}
+
+/// Peak resident set size in bytes of one run, child processes included
+/// (so `gleam run`'s BEAM or Node.js child is what dominates), measured
+/// through `/usr/bin/time -l`. macOS only; elsewhere `None`. Called only
+/// for configurations whose timed runs already succeeded, so a plain
+/// blocking wait is safe.
+fn peak_rss(executable: &Path, project: &Path, arguments: &[&str]) -> Option<u64> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = Command::new("/usr/bin/time")
+        .arg("-l")
+        .arg(executable)
+        .args(arguments)
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_suffix("maximum resident set size")
+            .and_then(|number| number.trim().parse().ok())
     })
 }
 
@@ -401,6 +444,23 @@ fn print_report(results: &[ProgramResult], startup: &Targets<f64>) {
     );
 
     println!();
+    println!("Peak RSS (one run at the calibrated repeat count, children included):");
+    println!(
+        "  {:>20} {:>9} {:>9} {:>9} {:>9}",
+        "seed", "erlang", "node", "jit", "aot"
+    );
+    for result in results {
+        println!(
+            "  {:>20} {:>9} {:>9} {:>9} {:>9}",
+            result.seed,
+            format_rss(result.rss.erlang),
+            format_rss(result.rss.node),
+            format_rss(result.rss.jit),
+            format_rss(result.rss.aot),
+        );
+    }
+
+    println!();
     println!(
         "Startup (trivial program, warm): erlang {:.1}ms, node {:.1}ms, jit {:.1}ms, aot {:.1}ms",
         startup.erlang * 1000.0,
@@ -416,8 +476,12 @@ fn save_json(results: &[ProgramResult], startup: &Targets<f64>, base_seed: u64) 
         if index > 0 {
             programs.push(',');
         }
+        let rss = |bytes: Option<u64>| match bytes {
+            Some(bytes) => bytes.to_string(),
+            None => "null".into(),
+        };
         programs.push_str(&format!(
-            r#"{{"seed":{},"repeats":{},"exec_seconds":{{"erlang":{:e},"node":{:e},"jit":{:e},"aot":{:e}}},"compile_seconds":{{"erlang":{:e},"node":{:e},"jit":{:e},"aot":{:e}}}}}"#,
+            r#"{{"seed":{},"repeats":{},"exec_seconds":{{"erlang":{:e},"node":{:e},"jit":{:e},"aot":{:e}}},"compile_seconds":{{"erlang":{:e},"node":{:e},"jit":{:e},"aot":{:e}}},"peak_rss_bytes":{{"erlang":{},"node":{},"jit":{},"aot":{}}}}}"#,
             result.seed,
             result.repeats,
             result.exec.erlang,
@@ -428,6 +492,10 @@ fn save_json(results: &[ProgramResult], startup: &Targets<f64>, base_seed: u64) 
             result.compile.node,
             result.compile.jit,
             result.compile.aot,
+            rss(result.rss.erlang),
+            rss(result.rss.node),
+            rss(result.rss.jit),
+            rss(result.rss.aot),
         ));
     }
     let json = format!(
@@ -437,6 +505,13 @@ fn save_json(results: &[ProgramResult], startup: &Targets<f64>, base_seed: u64) 
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench-results.json");
     std::fs::write(&path, json).expect("write results");
     println!("results saved to {}", path.display());
+}
+
+fn format_rss(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("{:.0}MB", bytes as f64 / (1024.0 * 1024.0)),
+        None => "?".into(),
+    }
 }
 
 fn format_seconds(seconds: f64) -> String {
