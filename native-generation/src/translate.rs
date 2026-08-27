@@ -2339,8 +2339,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::Block(statements) => {
+                // A block is a lexical scope: its bindings — including
+                // shadows of enclosing names — must not leak past it.
                 let scope_start = self.scope_owned.len();
-                self.statements_scoped(statements, scope_start, Some(cleanups))
+                let saved_environment = self.environment.clone();
+                let outcome = self.statements_scoped(statements, scope_start, Some(cleanups));
+                self.environment = saved_environment;
+                outcome
             }
 
             native_ir::Expression::Case {
@@ -2510,7 +2515,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 Ok(self.inc(value))
             }
 
-            native_ir::Expression::Block(statements) => self.statements(statements),
+            native_ir::Expression::Block(statements) => {
+                // A block is a lexical scope: its bindings — including
+                // shadows of enclosing names — must not leak past it.
+                let saved_environment = self.environment.clone();
+                let result = self.statements(statements);
+                self.environment = saved_environment;
+                result
+            }
 
             native_ir::Expression::Call {
                 module,

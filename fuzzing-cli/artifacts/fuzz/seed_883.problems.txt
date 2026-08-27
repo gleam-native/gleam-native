@@ -1,1 +1,0 @@
-checked: erlang exit 0 vs exit -1
