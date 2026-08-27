@@ -773,10 +773,16 @@ pub struct JavaScriptConfig {
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Copy)]
 pub struct NativeConfig {
-    /// The stack size for programs run on the native target, in megabytes.
-    /// Tail calls run in constant stack space, so this only limits how deep
-    /// non-tail recursion may go before the runtime reports a stack
-    /// overflow.
+    /// The stack size for programs run on the native target, in megabytes:
+    /// every process reserves this much lazily-committed address space for
+    /// its fiber stack, so memory is only used as recursion actually
+    /// deepens. Tail calls run in constant stack space, so this only limits
+    /// how deep non-tail recursion may go before the runtime reports a
+    /// stack overflow — the default absorbs roughly ten million simple
+    /// frames. Unlike the BEAM, whose process stacks grow without bound,
+    /// the reservation is fixed (a live native stack cannot be safely
+    /// relocated) and it trades against how many processes fit in the
+    /// address space; raise it for programs that recurse deeper.
     #[serde(default = "default_native_stack_size")]
     pub stack_size_megabytes: u64,
 }

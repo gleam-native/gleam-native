@@ -127,13 +127,24 @@ platform C convention.
 - ✅ Labelled arguments (the type checker reorders them)
 - ✅ Generic functions through the uniform value representation (exercised
   by generic `map`/`fold` over closures and module functions)
-- ✅ Recursion depth: the program runs on a dedicated thread with a 1 GiB
-  stack by default, configurable per project with `stack_size_megabytes`
-  under `[native]` in `gleam.toml`; deep non-tail recursion that exhausts
-  it is caught by a `sigaltstack` handler that reports
-  `runtime error: stack overflow` — with a stack trace of the runaway
-  recursion walked from the signal context — and exits with code 1
-  instead of crashing raw
+- ✅ Recursion depth: every process runs on its own guard-paged fiber
+  stack reserving `stack_size_megabytes` (default 1 GiB, configurable
+  under `[native]` in `gleam.toml`) of lazily-committed address space —
+  reservation costs no memory, and pages commit only as recursion
+  actually deepens (measured ~48 committed bytes per simple frame, so
+  the default absorbs roughly ten million non-tail frames). Deep
+  non-tail recursion that exhausts it is caught by a `sigaltstack`
+  handler that reports `runtime error: stack overflow` — with a stack
+  trace of the runaway recursion walked from the signal context — and
+  exits with code 1 instead of crashing raw. Known divergence, kept by
+  design (decided 2026-08-27): BEAM grows process stacks on demand, so
+  recursion there is bounded only by memory and runs deeper than the
+  default reservation. A live native stack cannot be safely relocated
+  (frames may hold interior pointers), which makes the reservation the
+  limit, and since every process reserves this much address space,
+  raising it trades directly against how many processes can exist
+  (address space ÷ reservation); programs that genuinely need deeper
+  non-tail recursion raise `stack_size_megabytes` instead
 
 ## Data types
 
