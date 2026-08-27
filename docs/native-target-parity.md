@@ -364,7 +364,7 @@ platform C convention.
 ## Ecosystem
 
 - ✅ `gleam_stdlib` support — implemented as a fork
-  (`gleam-stdlib-native`, consumed as a path dependency). Every public
+  (`gleam-native-stdlib`, consumed as a path dependency). Every public
   stdlib function works on native: `@external(native, ...)` annotations
   bind hot paths (strings, dicts, string_tree, bit arrays, ints, floats,
   dynamic/decode, uri, IO, a native stable list sort) to implementations

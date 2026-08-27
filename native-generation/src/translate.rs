@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, Block, InstBuilder, MemFlagsData, Signature, SourceLoc, TrapCode, Value, types,
+    AbiParam, AtomicRmwOp, Block, InstBuilder, MemFlagsData, Signature, SourceLoc, TrapCode, Value,
+    types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -25,9 +26,10 @@ pub const INT_ADD_SLOW: &str = "gleam_native_int_add_slow";
 pub const INT_SUB_SLOW: &str = "gleam_native_int_sub_slow";
 pub const INT_MUL_SLOW: &str = "gleam_native_int_mul_slow";
 
-/// The symbols of the runtime's integer division and remainder, which have
-/// no generated fast path: the zero-divisor rule and big integer operands
-/// live entirely in the runtime.
+/// The symbols of the runtime's integer division and remainder slow
+/// paths, called when an operand is a big integer, the divisor is zero
+/// (Gleam yields zero), or the one small division whose result outgrows
+/// the small range (`SMALL_INT_MIN / -1`).
 pub const INT_DIV: &str = "gleam_native_int_div";
 pub const INT_REM: &str = "gleam_native_int_rem";
 
@@ -88,9 +90,18 @@ pub const ECHO: &str = "gleam_native_echo";
 /// code emits inline.
 pub const DESTROY: &str = "gleam_native_destroy";
 
-/// The symbol of the runtime data word holding the program thread's
-/// allocation pool address, read by inline pooled allocations.
-pub const POOL: &str = "gleam_native_pool";
+/// The symbol of the runtime function returning the running context's
+/// address: how generated C-convention wrappers obtain the hidden `env`
+/// argument when crossing into tail-convention code.
+pub const CURRENT_CONTEXT: &str = "gleam_native_current_context";
+
+/// The symbol of the runtime function that marks a value permanent,
+/// called by the generated literal-init function on each interned literal.
+pub const MAKE_PERMANENT: &str = "gleam_native_make_permanent";
+
+/// The byte offset of the pool pointer inside the context, read by inline
+/// pooled allocations through `env`.
+const CONTEXT_POOL_OFFSET: i32 = 0;
 
 /// The symbol of the runtime's panic/todo report-and-abort function.
 pub const PANIC: &str = "gleam_native_panic";
@@ -113,6 +124,8 @@ pub const INVOKE_ARITIES: std::ops::RangeInclusive<usize> = 0..=6;
 /// pointers are 8-byte aligned, so any set low bit marks an immediate:
 /// generated immediate tests mask the low three bits.
 const NIL: i64 = native_runtime::NIL as i64;
+const ATOMIC_COUNT: i64 = native_runtime::ATOMIC_COUNT as i64;
+const ATOMIC_COUNT_MASK: i64 = native_runtime::ATOMIC_COUNT_MASK as i64;
 const FALSE: i64 = native_runtime::FALSE as i64;
 const TRUE: i64 = native_runtime::TRUE as i64;
 const EMPTY_LIST: i64 = native_runtime::EMPTY_LIST as i64;
@@ -122,11 +135,15 @@ pub fn mangle(module: &str, function: &str) -> String {
     format!("gleam${}${}", module.replace('/', "$"), function)
 }
 
+/// The signature of a Gleam function of the given arity: the hidden
+/// context parameter (`env`, always first), then the Gleam arguments.
+/// Every tail-convention function receives and forwards `env`; the arity
+/// counts only the Gleam arguments.
 fn gleam_signature(arity: usize) -> Signature {
     let mut signature = Signature::new(CallConv::Tail);
     signature
         .params
-        .extend(std::iter::repeat_n(AbiParam::new(types::I64), arity));
+        .extend(std::iter::repeat_n(AbiParam::new(types::I64), 1 + arity));
     signature.returns.push(AbiParam::new(types::I64));
     signature
 }
@@ -177,16 +194,17 @@ struct RuntimeFunctions {
     echo: FuncId,
     destroy: FuncId,
     panic: FuncId,
-    /// The pool-address data symbol, for inline pooled allocation.
-    pool: DataId,
+    /// The running context's address, called by C-convention wrappers to
+    /// obtain the hidden `env` argument.
+    current_context: FuncId,
+    /// Marks an interned literal permanent, called by the literal-init
+    /// function.
+    make_permanent: FuncId,
 }
 
 impl RuntimeFunctions {
     fn declare(module: &mut impl Module) -> Result<Self, String> {
         let call_conv = module.isa().default_call_conv();
-        let pool = module
-            .declare_data(POOL, Linkage::Import, true, false)
-            .map_err(|error| error.to_string())?;
         let mut declare = |symbol: &str, arity: usize| {
             module
                 .declare_function(symbol, Linkage::Import, &c_signature(call_conv, arity))
@@ -227,7 +245,8 @@ impl RuntimeFunctions {
             echo: declare(ECHO, 5)?,
             destroy: declare(DESTROY, 1)?,
             panic: declare(PANIC, 7)?,
-            pool,
+            current_context: declare(CURRENT_CONTEXT, 0)?,
+            make_permanent: declare(MAKE_PERMANENT, 1)?,
         })
     }
 }
@@ -251,6 +270,16 @@ enum PendingFunction {
     },
 }
 
+/// An interned literal registered during translation: its writable slot
+/// (read by every evaluation site) and what to build into it. The
+/// generated literal-init function populates every slot — each value
+/// marked permanent — before the program runs, so sites are a plain load
+/// with no count traffic and no lazy-build race across scheduler threads.
+enum InternedLiteral {
+    String { slot: DataId, content: String },
+    Record { slot: DataId, tag: u32, display: u16 },
+}
+
 /// Per-function debug data collected as functions are defined, consumed
 /// by the object backend's DWARF emission. The JIT collects and ignores
 /// it.
@@ -266,11 +295,28 @@ pub struct DebugFunction {
     pub rows: Vec<(u32, u32)>,
 }
 
+/// The argument indices an external takes ownership of instead of
+/// borrowing: the release normally emitted after an external call (or in
+/// a function-value wrapper) is skipped for them, and the runtime
+/// consumes the reference — moving the value into a mailbox when it is
+/// exclusively owned, copying it otherwise. Grow this list only together
+/// with a matching consuming runtime symbol.
+fn consumed_argument_indices(symbol: &str) -> &'static [usize] {
+    match symbol {
+        "gleam_native_process_send_owned" => &[2],
+        "gleam_native_process_send_named_owned" => &[1],
+        _ => &[],
+    }
+}
+
 pub struct Translator<'a, M: Module> {
     module: &'a mut M,
     /// Gleam (module, function) to declared Cranelift function and whether
     /// it is an external (C convention, borrows its arguments).
     functions: HashMap<(String, String), (FuncId, bool)>,
+    /// Externals that consume some of their arguments, by declared id;
+    /// see [`consumed_argument_indices`].
+    consuming: HashMap<FuncId, &'static [usize]>,
     runtime: RuntimeFunctions,
     pending: Vec<PendingFunction>,
     /// One wrapper per module function used as a value.
@@ -281,6 +327,9 @@ pub struct Translator<'a, M: Module> {
     display_names: Vec<String>,
     display_ids: HashMap<String, u16>,
     debug_functions: Vec<DebugFunction>,
+    /// The interned literals registered so far, built by the generated
+    /// literal-init function.
+    literals: Vec<InternedLiteral>,
 }
 
 impl<'a, M: Module> Translator<'a, M> {
@@ -289,6 +338,7 @@ impl<'a, M: Module> Translator<'a, M> {
         Ok(Self {
             module,
             functions: HashMap::new(),
+            consuming: HashMap::new(),
             runtime,
             pending: Vec::new(),
             wrappers: HashMap::new(),
@@ -296,6 +346,7 @@ impl<'a, M: Module> Translator<'a, M> {
             display_names: Vec::new(),
             display_ids: HashMap::new(),
             debug_functions: Vec::new(),
+            literals: Vec::new(),
         })
     }
 
@@ -378,6 +429,10 @@ impl<'a, M: Module> Translator<'a, M> {
                             &c_signature(call_conv, *arity as usize),
                         )
                         .map_err(|error| error.to_string())?;
+                    let consumed = consumed_argument_indices(symbol);
+                    if !consumed.is_empty() {
+                        let _ = self.consuming.insert(id, consumed);
+                    }
                     (name, id, true)
                 }
             };
@@ -455,11 +510,12 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let closure = builder.block_params(entry)[0];
+        let env = builder.block_params(entry)[0];
+        let closure = builder.block_params(entry)[1];
         let mut environment = HashMap::new();
         let mut scope_owned = Vec::new();
         for (index, parameter) in parameters.iter().enumerate() {
-            let value = builder.block_params(entry)[1 + index];
+            let value = builder.block_params(entry)[2 + index];
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
             let _ = environment.insert(parameter.clone(), variable);
@@ -480,22 +536,26 @@ impl<'a, M: Module> Translator<'a, M> {
 
         let mut function_translator = FunctionTranslator {
             functions: &self.functions,
+            consuming: &self.consuming,
             runtime: self.runtime,
             module_name,
             src_path,
             module: self.module,
             builder: &mut builder,
+            env,
             environment,
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
+            literals: &mut self.literals,
             scope_owned,
             dying: HashSet::new(),
             consumed: Vec::new(),
             reuse_token: None,
             branch_depth: 0,
+            self_loop: None,
         };
         // The capture slots take their own references, then the closure
         // itself (owned by this call) is released.
@@ -537,23 +597,30 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let closure = builder.block_params(entry)[0];
-        let arguments: Vec<Value> = builder.block_params(entry)[1..].to_vec();
+        let env = builder.block_params(entry)[0];
+        let closure = builder.block_params(entry)[1];
+        let arguments: Vec<Value> = builder.block_params(entry)[2..].to_vec();
         let target_ref = self.module.declare_func_in_func(target, builder.func);
         if target_external {
-            // Externals borrow: call, then release what this wrapper owns.
+            // Externals borrow (and take no env): call, then release what
+            // this wrapper owns — minus any argument the external consumes.
             let call = builder.ins().call(target_ref, &arguments);
             let result = builder.inst_results(call)[0];
             emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
-            for argument in &arguments {
-                emit_dec(self.module, self.runtime.destroy, &mut builder, *argument);
+            let consumed = self.consuming.get(&target).copied().unwrap_or(&[]);
+            for (index, argument) in arguments.iter().enumerate() {
+                if !consumed.contains(&index) {
+                    emit_dec(self.module, self.runtime.destroy, &mut builder, *argument);
+                }
             }
             builder.ins().return_(&[result]);
         } else {
             // Gleam functions own their arguments: release the closure and
-            // transfer the rest with a genuine tail call.
+            // transfer the rest (with the env) as a genuine tail call.
             emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
-            builder.ins().return_call(target_ref, &arguments);
+            let mut values = vec![env];
+            values.extend(&arguments);
+            builder.ins().return_call(target_ref, &values);
         }
         builder.finalize(self.module.target_config());
 
@@ -584,40 +651,58 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
+        let env = builder.block_params(entry)[0];
         let mut environment = HashMap::new();
         let mut scope_owned = Vec::new();
+        let mut parameter_variables = Vec::with_capacity(parameters.len());
         for (index, parameter) in parameters.iter().enumerate() {
-            let value = builder.block_params(entry)[index];
+            let value = builder.block_params(entry)[1 + index];
             let variable = builder.declare_var(types::I64);
             builder.def_var(variable, value);
             let _ = environment.insert(parameter.clone(), variable);
             // The callee owns its arguments; parameters are released like
             // any other scope binding (or early, when dead).
             scope_owned.push((parameter.clone(), variable));
+            parameter_variables.push(variable);
         }
+
+        // The body translates inside a loop header so self-tail-calls can
+        // jump back to it; sealed once every back-edge is known.
+        let loop_header = builder.create_block();
+        builder.ins().jump(loop_header, &[]);
+        builder.switch_to_block(loop_header);
 
         let mut function_translator = FunctionTranslator {
             functions: &self.functions,
+            consuming: &self.consuming,
             runtime: self.runtime,
             module_name,
             src_path,
             module: self.module,
             builder: &mut builder,
+            env,
             environment,
             pending: &mut self.pending,
             wrappers: &mut self.wrappers,
             generated_counter: &mut self.generated_counter,
             display_names: &mut self.display_names,
             display_ids: &mut self.display_ids,
+            literals: &mut self.literals,
             scope_owned,
             dying: HashSet::new(),
             consumed: Vec::new(),
             reuse_token: None,
             branch_depth: 0,
+            self_loop: Some(SelfLoop {
+                id,
+                header: loop_header,
+                parameters: parameter_variables,
+            }),
         };
         if let Some(result) = function_translator.statements_scoped(body, 0, Some(Vec::new()))? {
             builder.ins().return_(&[result]);
         }
+        builder.seal_block(loop_header);
         builder.finalize(self.module.target_config());
 
         self.module
@@ -658,8 +743,18 @@ impl<'a, M: Module> Translator<'a, M> {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
 
-            let values: Vec<Value> = builder.block_params(entry).to_vec();
-            let closure = values[0];
+            let closure_and_arguments: Vec<Value> = builder.block_params(entry).to_vec();
+            let closure = closure_and_arguments[0];
+            // The hidden env argument comes from the runtime's thread-local
+            // running context: thunks are called from C code, which has no
+            // env of its own.
+            let context_ref = self
+                .module
+                .declare_func_in_func(self.runtime.current_context, builder.func);
+            let context_call = builder.ins().call(context_ref, &[]);
+            let env = builder.inst_results(context_call)[0];
+            let mut values = vec![env];
+            values.extend(closure_and_arguments);
             let code = builder
                 .ins()
                 .load(types::I64, MemFlagsData::trusted(), closure, 8);
@@ -697,10 +792,98 @@ impl<'a, M: Module> Translator<'a, M> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
+        // The target is a tail-convention Gleam function: pass the running
+        // context from the runtime's thread-local as its env.
+        let context_ref = self
+            .module
+            .declare_func_in_func(self.runtime.current_context, builder.func);
+        let context_call = builder.ins().call(context_ref, &[]);
+        let env = builder.inst_results(context_call)[0];
         let target_ref = self.module.declare_func_in_func(target, builder.func);
-        let call = builder.ins().call(target_ref, &[]);
+        let call = builder.ins().call(target_ref, &[env]);
         let result = builder.inst_results(call)[0];
         builder.ins().return_(&[result]);
+        builder.finalize(self.module.target_config());
+
+        self.module
+            .define_function(id, &mut context)
+            .map_err(|error| error.to_string())?;
+        self.module.clear_context(&mut context);
+        Ok(id)
+    }
+
+    /// Generates the exported C-convention literal-init function: builds
+    /// every interned literal into its slot, marked permanent, so that
+    /// evaluation sites are a plain load. The host calls it once, before
+    /// any Gleam code runs. Must be called after every module is defined,
+    /// so all literals are registered.
+    pub fn define_literal_init(&mut self) -> Result<FuncId, String> {
+        let call_conv = self.module.isa().default_call_conv();
+        let signature = c_signature(call_conv, 0);
+        let id = self
+            .module
+            .declare_function(
+                native_runtime::LITERAL_INIT_SYMBOL,
+                Linkage::Export,
+                &signature,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let mut context = self.module.make_context();
+        context.func.signature = signature;
+        let mut builder_context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let pointer_type = self.module.target_config().pointer_type();
+        let literals = std::mem::take(&mut self.literals);
+        for literal in &literals {
+            let (slot, value) = match literal {
+                InternedLiteral::String { slot, content } => {
+                    let bytes = self
+                        .module
+                        .declare_anonymous_data(false, false)
+                        .map_err(|error| error.to_string())?;
+                    let mut description = DataDescription::new();
+                    description.define(content.as_bytes().to_vec().into_boxed_slice());
+                    self.module
+                        .define_data(bytes, &description)
+                        .map_err(|error| error.to_string())?;
+                    let bytes_ref = self.module.declare_data_in_func(bytes, builder.func);
+                    let pointer = builder.ins().symbol_value(pointer_type, bytes_ref);
+                    let length = builder.ins().iconst(types::I64, content.len() as i64);
+                    let constructor_ref = self
+                        .module
+                        .declare_func_in_func(self.runtime.string_from_bytes, builder.func);
+                    let call = builder.ins().call(constructor_ref, &[pointer, length]);
+                    (*slot, builder.inst_results(call)[0])
+                }
+                InternedLiteral::Record { slot, tag, display } => {
+                    let tag = builder.ins().iconst(types::I64, *tag as i64);
+                    let arity = builder.ins().iconst(types::I64, 0);
+                    let display = builder.ins().iconst(types::I64, *display as i64);
+                    let record_new_ref = self
+                        .module
+                        .declare_func_in_func(self.runtime.record_new, builder.func);
+                    let call = builder.ins().call(record_new_ref, &[tag, arity, display]);
+                    (*slot, builder.inst_results(call)[0])
+                }
+            };
+            let permanent_ref = self
+                .module
+                .declare_func_in_func(self.runtime.make_permanent, builder.func);
+            let call = builder.ins().call(permanent_ref, &[value]);
+            let permanent = builder.inst_results(call)[0];
+            let slot_ref = self.module.declare_data_in_func(slot, builder.func);
+            let slot_address = builder.ins().symbol_value(pointer_type, slot_ref);
+            let _ = builder
+                .ins()
+                .store(MemFlagsData::trusted(), permanent, slot_address, 0);
+        }
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().return_(&[zero]);
         builder.finalize(self.module.target_config());
 
         self.module
@@ -716,6 +899,89 @@ impl<'a, M: Module> Translator<'a, M> {
 /// short-circuiting booleans), no nested scopes (blocks), and no deferred
 /// bodies (lambdas, whose mentions become captures evaluated elsewhere).
 /// Only such expressions may consume a binding at its last use.
+/// Whether a decision tree observes the given variable only as a
+/// zero-or-not integer test: its top node switches on the variable with
+/// `Check::Int(0)` choices alone, and nothing below reads or binds the
+/// variable again. Such a subject's exact value is irrelevant — any
+/// stand-in that is tagged zero exactly when it is zero dispatches
+/// identically. This is what lets `case n % 2 { 0 -> .. _ -> .. }`
+/// compile to a single bit test on the dividend.
+fn variable_only_zero_tested(tree: &native_ir::Decision, var: u32) -> bool {
+    fn uses(decision: &native_ir::Decision, var: u32) -> bool {
+        let bound_uses = |bindings: &[(String, native_ir::Bound)]| {
+            bindings.iter().any(|(_, bound)| match bound {
+                native_ir::Bound::Variable(id) => *id == var,
+                native_ir::Bound::StringSlice { subject, .. }
+                | native_ir::Bound::BitsReadInt { subject, .. }
+                | native_ir::Bound::BitsReadFloat { subject, .. }
+                | native_ir::Bound::BitsSlice { subject, .. } => *subject == var,
+                native_ir::Bound::Value(_) => false,
+            })
+        };
+        match decision {
+            native_ir::Decision::Run { bindings, .. } => bound_uses(bindings),
+            native_ir::Decision::Switch {
+                var: switched,
+                choices,
+                fallback,
+                ..
+            } => {
+                *switched == var
+                    || choices.iter().any(|(_, decision)| uses(decision, var))
+                    || uses(fallback, var)
+            }
+            native_ir::Decision::Guard {
+                bindings, if_false, ..
+            } => bound_uses(bindings) || uses(if_false, var),
+            native_ir::Decision::Fail => false,
+        }
+    }
+
+    match tree {
+        native_ir::Decision::Switch {
+            var: switched,
+            choices,
+            fallback,
+            fallback_fields,
+        } => {
+            *switched == var
+                && fallback_fields.is_empty()
+                && choices.iter().all(|(check, decision)| {
+                    matches!(check, native_ir::Check::Int(0)) && !uses(decision, var)
+                })
+                && !uses(fallback, var)
+        }
+        _ => false,
+    }
+}
+
+/// The single-subject evenness fusion a case is eligible for, if any:
+/// the subject is `dividend % ±2^k` and the tree only asks whether it
+/// is zero — see [`variable_only_zero_tested`]. Returns the dividend
+/// expression and the divisor.
+fn evenness_fusion<'e>(
+    subjects: &'e [native_ir::Expression],
+    subject_ids: &[u32],
+    tree: &native_ir::Decision,
+) -> Option<(&'e native_ir::Expression, i64)> {
+    if let [
+        native_ir::Expression::IntBinary {
+            operator: native_ir::IntOperator::Remainder,
+            left,
+            right,
+        },
+    ] = subjects
+        && let native_ir::Expression::Int(divisor) = right.as_ref()
+        && divisor.unsigned_abs().is_power_of_two()
+        && divisor.unsigned_abs() >= 2
+        && variable_only_zero_tested(tree, subject_ids[0])
+    {
+        Some((left.as_ref(), *divisor))
+    } else {
+        None
+    }
+}
+
 fn straight_line(expression: &native_ir::Expression) -> bool {
     use native_ir::Expression;
     match expression {
@@ -947,10 +1213,14 @@ fn debug_rc() -> bool {
     *DEBUG
 }
 
-/// Emits an inline reference count increment: nothing for immediates, one
-/// added to the count word before the object for heap values.
+/// Emits an inline reference count increment: nothing for immediates and
+/// permanent objects (count word sign bit set), one added to the count
+/// word before the object for ordinary heap values.
 fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
     let heap = builder.create_block();
+    let counted = builder.create_block();
+    let slow = builder.create_block();
+    let atomic = builder.create_block();
     let done = builder.create_block();
     let immediate = builder.ins().band_imm_u(value, IMMEDIATE_MASK);
     builder.ins().brif(immediate, done, &[], heap, &[]);
@@ -960,19 +1230,48 @@ fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
     let count = builder
         .ins()
         .load(types::I64, MemFlagsData::trusted(), value, -8);
+    let negative = builder
+        .ins()
+        .icmp_imm_s(IntCC::SignedLessThan, count, 0);
+    builder.ins().brif(negative, slow, &[], counted, &[]);
+    builder.seal_block(counted);
+    builder.seal_block(slow);
+
+    builder.switch_to_block(counted);
     let incremented = builder.ins().iadd_imm_s(count, 1);
     let _ = builder
         .ins()
         .store(MemFlagsData::trusted(), incremented, value, -8);
+    builder.ins().jump(done, &[]);
+
+    // A negative count word is permanent (nothing to do) or an
+    // atomically counted shared leaf, whose count must move — atomically.
+    builder.switch_to_block(slow);
+    let shared = builder.ins().band_imm_u(count, ATOMIC_COUNT);
+    builder.ins().brif(shared, atomic, &[], done, &[]);
+    builder.seal_block(atomic);
+    builder.set_cold_block(atomic);
+
+    builder.switch_to_block(atomic);
+    let address = builder.ins().iadd_imm_s(value, -8);
+    let one = builder.ins().iconst(types::I64, 1);
+    let _ = builder.ins().atomic_rmw(
+        types::I64,
+        MemFlagsData::trusted(),
+        AtomicRmwOp::Add,
+        address,
+        one,
+    );
     builder.ins().jump(done, &[]);
     builder.seal_block(done);
 
     builder.switch_to_block(done);
 }
 
-/// Emits an inline reference count decrement: nothing for immediates, one
-/// subtracted from the count word for heap values, and a cold runtime
-/// destroy call when the count reaches zero.
+/// Emits an inline reference count decrement: nothing for immediates and
+/// permanent objects (count word sign bit set), one subtracted from the
+/// count word for ordinary heap values, and a cold runtime destroy call
+/// when the count reaches zero.
 fn emit_dec<M: Module>(
     module: &mut M,
     destroy: FuncId,
@@ -980,6 +1279,9 @@ fn emit_dec<M: Module>(
     value: Value,
 ) {
     let heap = builder.create_block();
+    let counted = builder.create_block();
+    let slow = builder.create_block();
+    let atomic = builder.create_block();
     let dead = builder.create_block();
     let done = builder.create_block();
     let immediate = builder.ins().band_imm_u(value, IMMEDIATE_MASK);
@@ -990,11 +1292,42 @@ fn emit_dec<M: Module>(
     let count = builder
         .ins()
         .load(types::I64, MemFlagsData::trusted(), value, -8);
+    let negative = builder
+        .ins()
+        .icmp_imm_s(IntCC::SignedLessThan, count, 0);
+    builder.ins().brif(negative, slow, &[], counted, &[]);
+    builder.seal_block(counted);
+    builder.seal_block(slow);
+
+    builder.switch_to_block(counted);
     let decremented = builder.ins().iadd_imm_s(count, -1);
     let _ = builder
         .ins()
         .store(MemFlagsData::trusted(), decremented, value, -8);
     builder.ins().brif(decremented, done, &[], dead, &[]);
+
+    // A negative count word is permanent (nothing to do) or an
+    // atomically counted shared leaf: subtract atomically and destroy on
+    // the last reference, exactly like the plain path.
+    builder.switch_to_block(slow);
+    let shared = builder.ins().band_imm_u(count, ATOMIC_COUNT);
+    builder.ins().brif(shared, atomic, &[], done, &[]);
+    builder.seal_block(atomic);
+    builder.set_cold_block(atomic);
+
+    builder.switch_to_block(atomic);
+    let address = builder.ins().iadd_imm_s(value, -8);
+    let minus_one = builder.ins().iconst(types::I64, -1);
+    let previous = builder.ins().atomic_rmw(
+        types::I64,
+        MemFlagsData::trusted(),
+        AtomicRmwOp::Add,
+        address,
+        minus_one,
+    );
+    let remaining = builder.ins().band_imm_u(previous, ATOMIC_COUNT_MASK);
+    let last = builder.ins().icmp_imm(IntCC::Equal, remaining, 1);
+    builder.ins().brif(last, dead, &[], done, &[]);
     builder.seal_block(dead);
     builder.set_cold_block(dead);
 
@@ -1025,6 +1358,15 @@ enum DecisionMode<'a> {
         /// The case's subject values: the only values a clause may claim
         /// for drop-reuse (nested switches scrutinize borrowed fields).
         subjects: Vec<Value>,
+        /// The owned subjects with their release variables. A plain
+        /// clause releases the deconstructed container at its body's
+        /// entry — once its fields are bound (counted), nothing on that
+        /// path reads it again, and freeing it early is what lets the
+        /// body see the container's children uniquely owned (a received
+        /// list spine becomes reusable in place). The variable is then
+        /// set to nil on that path, so the join release — shared with
+        /// guarded clauses, which do not release early — frees nothing.
+        owned: Vec<(Value, Variable)>,
     },
     Assignment {
         result: Value,
@@ -1034,18 +1376,23 @@ enum DecisionMode<'a> {
 
 struct FunctionTranslator<'a, 'b, M: Module> {
     functions: &'a HashMap<(String, String), (FuncId, bool)>,
+    consuming: &'a HashMap<FuncId, &'static [usize]>,
     runtime: RuntimeFunctions,
     module_name: &'a str,
     /// The module's package-root-relative source path, printed by `echo`.
     src_path: &'a str,
     module: &'a mut M,
     builder: &'a mut FunctionBuilder<'b>,
+    /// The function's hidden context parameter, forwarded to every Gleam
+    /// call and read by inline pooled allocation.
+    env: Value,
     environment: HashMap<String, Variable>,
     pending: &'a mut Vec<PendingFunction>,
     wrappers: &'a mut HashMap<(String, String), FuncId>,
     generated_counter: &'a mut u32,
     display_names: &'a mut Vec<String>,
     display_ids: &'a mut HashMap<String, u16>,
+    literals: &'a mut Vec<InternedLiteral>,
     /// Named variable slots holding owned references, decremented when
     /// their scope's statement sequence finishes — or earlier, as soon as
     /// no remaining statement mentions them, so that tail-recursive loops
@@ -1070,6 +1417,23 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     /// subject evaluation would need a different release state at the
     /// join.
     branch_depth: usize,
+    /// The function's own identity and loop header, when it can compile
+    /// direct self-tail-calls into back-edges instead of `return_call`s.
+    self_loop: Option<SelfLoop>,
+}
+
+/// A defined function's loop header: a direct tail call to the function
+/// itself writes its argument values into the parameter variables and
+/// jumps here instead of performing a genuine tail call, turning
+/// self-recursion into an intra-function loop (no per-iteration prologue,
+/// epilogue, or frame-pointer traffic). The header block stays unsealed
+/// until the whole body is translated, so back-edges may be added
+/// anywhere.
+#[derive(Clone)]
+struct SelfLoop {
+    id: FuncId,
+    header: Block,
+    parameters: Vec<Variable>,
 }
 
 /// A subject a clause may deconstruct in place: the matched record value
@@ -1292,6 +1656,58 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         }
     }
 
+    /// The stand-in subject for an evenness-fused case (see
+    /// [`evenness_fusion`]): tagged zero exactly when
+    /// `dividend % divisor` would be zero, an arbitrary nonzero tagged
+    /// small integer otherwise. A small dividend's low untagged bits
+    /// decide directly — sign-independent, since a remainder is zero
+    /// exactly when the dividend's low bits are; a big integer goes
+    /// through the runtime remainder, whose result for a power-of-two
+    /// divisor is always a small integer. Either way the stand-in is
+    /// immediate and owes no release.
+    fn emit_evenness_subject(&mut self, dividend: Value, divisor: i64) -> Value {
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        let small = self.builder.ins().band_imm_u(dividend, 1);
+        self.builder.ins().brif(small, fast, &[], slow, &[]);
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+        self.builder.set_cold_block(slow);
+
+        self.builder.switch_to_block(fast);
+        let mask = ((divisor.unsigned_abs() as i64) - 1) << 1;
+        let low_bits = self.builder.ins().band_imm_u(dividend, mask);
+        let stand_in = self.builder.ins().bor_imm(low_bits, 1);
+        self.builder.ins().jump(join, &[stand_in.into()]);
+
+        self.builder.switch_to_block(slow);
+        let tagged_divisor = self.builder.ins().iconst(types::I64, (divisor << 1) | 1);
+        let remainder = self.runtime_call(INT_REM, &[dividend, tagged_divisor]);
+        self.builder.ins().jump(join, &[remainder.into()]);
+        self.builder.seal_block(join);
+
+        self.builder.switch_to_block(join);
+        self.builder.block_params(join)[0]
+    }
+
+    /// One release variable per owned case subject, initially holding the
+    /// subject itself: releases of the subject read through the variable,
+    /// so a clause that frees its container early can set it to nil on
+    /// that path alone.
+    fn subject_release_variables(&mut self, owned_subjects: &[Value]) -> Vec<(Value, Variable)> {
+        owned_subjects
+            .iter()
+            .map(|value| {
+                let variable = self.builder.declare_var(types::I64);
+                self.builder.def_var(variable, *value);
+                (*value, variable)
+            })
+            .collect()
+    }
+
     /// Emits a reference count increment. Yields the value for chaining.
     fn inc(&mut self, value: Value) -> Value {
         if debug_rc() {
@@ -1329,15 +1745,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         self.builder.inst_results(call)[0]
     }
 
-    /// Emits a per-site permanent cache: a writable data slot holds a
-    /// value built at most once (cold path), and every evaluation takes
-    /// its own reference. The slot's own reference is never released, so
-    /// only immutable values whose sharing is unobservable belong here —
-    /// string literals and zero-arity constructors.
-    fn interned(
-        &mut self,
-        build: impl FnOnce(&mut Self) -> Result<Value, String>,
-    ) -> Result<Value, String> {
+    /// Emits an interned literal's evaluation: a plain load of its slot.
+    /// The generated literal-init function populates every slot with a
+    /// permanently-marked value before the program runs, so sites carry no
+    /// build check and no count traffic (count operations skip permanent
+    /// objects). Only immutable values whose sharing is unobservable
+    /// belong here — string literals and zero-arity constructors.
+    fn interned(&mut self, literal: impl FnOnce(DataId) -> InternedLiteral) -> Result<Value, String> {
         let slot = self
             .module
             .declare_anonymous_data(true, false)
@@ -1348,35 +1762,14 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         self.module
             .define_data(slot, &description)
             .map_err(|error| error.to_string())?;
+        self.literals.push(literal(slot));
         let slot_ref = self.module.declare_data_in_func(slot, self.builder.func);
         let pointer_type = self.module.target_config().pointer_type();
         let slot_address = self.builder.ins().symbol_value(pointer_type, slot_ref);
-        let cached = self
+        Ok(self
             .builder
             .ins()
-            .load(types::I64, MemFlagsData::trusted(), slot_address, 0);
-
-        let build_block = self.builder.create_block();
-        let join = self.builder.create_block();
-        self.builder.append_block_param(join, types::I64);
-        self.builder
-            .ins()
-            .brif(cached, join, &[cached.into()], build_block, &[]);
-        self.builder.seal_block(build_block);
-        self.builder.set_cold_block(build_block);
-
-        self.builder.switch_to_block(build_block);
-        let built = build(self)?;
-        let _ = self
-            .builder
-            .ins()
-            .store(MemFlagsData::trusted(), built, slot_address, 0);
-        self.builder.ins().jump(join, &[built.into()]);
-        self.builder.seal_block(join);
-
-        self.builder.switch_to_block(join);
-        let value = self.builder.block_params(join)[0];
-        Ok(self.inc(value))
+            .load(types::I64, MemFlagsData::trusted(), slot_address, 0))
     }
 
     /// Emits a call to the runtime's record allocator, which also writes
@@ -1478,25 +1871,19 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         if total >= native_runtime::POOL_CLASSES || debug_rc() {
             return slow(self);
         }
-        let check = self.builder.create_block();
         let hit = self.builder.create_block();
         let miss = self.builder.create_block();
         let join = self.builder.create_block();
         self.builder.append_block_param(join, types::I64);
 
-        let pool_ref = self
-            .module
-            .declare_data_in_func(self.runtime.pool, self.builder.func);
-        let pointer_type = self.module.target_config().pointer_type();
-        let pool_address = self.builder.ins().symbol_value(pointer_type, pool_ref);
-        let pool = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), pool_address, 0);
-        self.builder.ins().brif(pool, check, &[], miss, &[]);
-        self.builder.seal_block(check);
-
-        self.builder.switch_to_block(check);
+        // The running context always carries the current worker's pool, so
+        // there is no unpublished case to check for.
+        let pool = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            self.env,
+            CONTEXT_POOL_OFFSET,
+        );
         let head_offset = (8 * total) as i32;
         let head = self
             .builder
@@ -1746,15 +2133,37 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
             // Arm last-use consumption: a binding of this scope whose only
             // remaining mention sits in a statement that evaluates it
-            // unconditionally moves at that use instead.
-            let armable = match statement {
-                native_ir::Statement::Let { value, .. } => straight_line(value),
-                native_ir::Statement::Expression { expression, .. } => straight_line(expression),
-                native_ir::Statement::Destructure { .. } => false,
+            // unconditionally moves at that use instead. A `case` is not
+            // straight-line, but its subjects evaluate unconditionally
+            // before any branching — a binding mentioned nowhere else
+            // moves into the subject temporary, which lets a clause
+            // release the deconstructed container early.
+            let statement_expression = match statement {
+                native_ir::Statement::Let { value, .. } => Some(value),
+                native_ir::Statement::Expression { expression, .. } => Some(expression),
+                native_ir::Statement::Destructure { .. } => None,
             };
-            if armable {
+            let armable = statement_expression.is_some_and(straight_line);
+            let subject_counts = match statement_expression {
+                Some(native_ir::Expression::Case { subjects, .. })
+                    if !armable && subjects.iter().all(straight_line) =>
+                {
+                    let mut subject_counts = HashMap::new();
+                    for subject in subjects {
+                        native_ir::expression_mentions(subject, &mut subject_counts);
+                    }
+                    Some(subject_counts)
+                }
+                _ => None,
+            };
+            if armable || subject_counts.is_some() {
                 for (name, _) in &self.scope_owned[scope_start..] {
-                    if counts.get(name) == Some(&1) && !suffix.contains_key(name) {
+                    if counts.get(name) == Some(&1)
+                        && !suffix.contains_key(name)
+                        && subject_counts
+                            .as_ref()
+                            .is_none_or(|subject| subject.get(name) == Some(&1))
+                    {
                         let _ = self.dying.insert(name.clone());
                     }
                 }
@@ -1845,13 +2254,56 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .functions
                     .get(&(module.clone(), function.clone()))
                     .ok_or_else(|| format!("unknown function `{module}.{function}`"))?;
-                if external {
-                    // C-convention functions cannot be tail called.
-                    return Ok(Some(self.expression(expression)?));
-                }
                 let mentioned: Vec<&native_ir::Expression> = arguments.iter().collect();
+                if external {
+                    // C-convention functions cannot be tail called, but a
+                    // binding whose last use is an argument here still
+                    // moves — consumption removes it from the owned scope,
+                    // so the release after this statement skips it. That
+                    // is what lets a consuming external (see
+                    // [`consumed_argument_indices`]) take a tail-position
+                    // message by move.
+                    self.arm_last_uses(&mentioned, &cleanups);
+                    let value = self.expression(expression)?;
+                    // A consumed binding vanished from the owned scope,
+                    // but this path does not transfer: enclosing clause
+                    // emitters restore the owned list for their join
+                    // path, which would then release the moved value a
+                    // second time. Overwrite the consumed slots with nil
+                    // on this path so those releases free nothing.
+                    let nil = self.builder.ins().iconst(types::I64, NIL);
+                    for name in std::mem::take(&mut self.consumed) {
+                        if let Some(variable) = self.environment.get(&name) {
+                            self.builder.def_var(*variable, nil);
+                        }
+                    }
+                    self.dying.clear();
+                    return Ok(Some(value));
+                }
                 self.arm_last_uses(&mentioned, &cleanups);
-                let mut values = Vec::with_capacity(arguments.len());
+                // A direct call to the function being defined loops instead
+                // of tail calling: the new argument values (all computed
+                // before anything is released or overwritten) land in the
+                // parameter variables and control jumps to the loop header.
+                let looped = match &self.self_loop {
+                    Some(this) if this.id == id && this.parameters.len() == arguments.len() => {
+                        Some(this.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(this) = looped {
+                    let mut values = Vec::with_capacity(arguments.len());
+                    for argument in arguments {
+                        values.push(self.expression(argument)?);
+                    }
+                    self.release_cleanups(cleanups);
+                    for (variable, value) in this.parameters.iter().zip(values) {
+                        self.builder.def_var(*variable, value);
+                    }
+                    self.builder.ins().jump(this.header, &[]);
+                    return Ok(None);
+                }
+                let mut values = vec![self.env];
                 for argument in arguments {
                     values.push(self.expression(argument)?);
                 }
@@ -1866,7 +2318,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 mentioned.extend(arguments.iter());
                 self.arm_last_uses(&mentioned, &cleanups);
                 let callee = self.expression(callee)?;
-                let mut values = Vec::with_capacity(1 + arguments.len());
+                let mut values = Vec::with_capacity(2 + arguments.len());
+                values.push(self.env);
                 values.push(callee);
                 for argument in arguments {
                     values.push(self.expression(argument)?);
@@ -1876,7 +2329,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .ins()
                     .load(types::I64, MemFlagsData::trusted(), callee, 8);
                 self.release_cleanups(cleanups);
-                let signature = self.builder.import_signature(gleam_signature(values.len()));
+                let signature = self
+                    .builder
+                    .import_signature(gleam_signature(values.len() - 1));
                 self.builder
                     .ins()
                     .return_call_indirect(signature, code, &values);
@@ -1900,7 +2355,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 // claim it for drop-reuse.
                 self.dying.clear();
                 self.consumed.clear();
-                if self.branch_depth == 0 && subjects.iter().all(straight_line) {
+                if subjects.iter().all(straight_line) {
                     let mut subject_counts = HashMap::new();
                     for subject in subjects {
                         native_ir::expression_mentions(subject, &mut subject_counts);
@@ -1918,19 +2373,30 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 }
                 let mut variables = HashMap::new();
                 let mut owned_subjects = Vec::new();
-                for (id, subject) in subject_ids.iter().zip(subjects) {
-                    // Borrowed subjects skip the count round trip and are
-                    // owed nothing at a transfer; see the non-tail case.
-                    let (value, borrowed) = self.expression_read(subject)?;
-                    let _ = variables.insert(*id, value);
+                if let Some((dividend, divisor)) = evenness_fusion(subjects, subject_ids, tree) {
+                    let (value, borrowed) = self.expression_read(dividend)?;
+                    let stand_in = self.emit_evenness_subject(value, divisor);
+                    let _ = variables.insert(subject_ids[0], stand_in);
                     if !borrowed {
                         owned_subjects.push(value);
+                    }
+                } else {
+                    for (id, subject) in subject_ids.iter().zip(subjects) {
+                        // Borrowed subjects skip the count round trip and
+                        // are owed nothing at a transfer; see the non-tail
+                        // case.
+                        let (value, borrowed) = self.expression_read(subject)?;
+                        let _ = variables.insert(*id, value);
+                        if !borrowed {
+                            owned_subjects.push(value);
+                        }
                     }
                 }
                 let mut cleanups = cleanups;
                 self.remove_consumed(&mut cleanups);
                 let mut tail_cleanups = cleanups;
                 tail_cleanups.extend(owned_subjects.iter().map(|value| (None, *value)));
+                let owned = self.subject_release_variables(&owned_subjects);
 
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
@@ -1941,6 +2407,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     DecisionMode::Case {
                         tail: Some(tail_cleanups),
                         subjects: owned_subjects.clone(),
+                        owned: owned.clone(),
                     },
                     None,
                 )?;
@@ -1948,8 +2415,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 self.builder.switch_to_block(join);
                 if joined {
                     let result = self.builder.block_params(join)[0];
-                    for subject in owned_subjects {
-                        self.dec(subject);
+                    for (_, variable) in owned {
+                        let value = self.builder.use_var(variable);
+                        self.dec(value);
                     }
                     Ok(Some(result))
                 } else {
@@ -1976,14 +2444,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             }
 
             native_ir::Expression::String(string) => {
-                // A literal builds its heap string once per site; every
-                // evaluation takes its own reference. Loops re-running a
-                // literal stop allocating for it.
-                self.interned(|this| {
-                    this.construct_from_constant_bytes(
-                        string.as_bytes(),
-                        this.runtime.string_from_bytes,
-                    )
+                // A literal's heap string is built once, by the
+                // literal-init function; every evaluation is a plain load
+                // of the (permanent) shared instance.
+                self.interned(|slot| InternedLiteral::String {
+                    slot,
+                    content: string.clone(),
                 })
             }
 
@@ -2031,6 +2497,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     {
                         let _ = self.scope_owned.remove(position);
                         self.consumed.push(name.clone());
+                        // The move is per-path: enclosing emitters restore
+                        // the owned list for sibling clauses and join
+                        // paths, whose release code then reads this slot.
+                        // Overwrite it with nil so those releases free
+                        // nothing on this path.
+                        let nil = self.builder.ins().iconst(types::I64, NIL);
+                        self.builder.def_var(variable, nil);
                         return Ok(value);
                     }
                 }
@@ -2053,15 +2526,27 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     values.push(self.expression(argument)?);
                 }
                 let function_ref = self.module.declare_func_in_func(id, self.builder.func);
-                let call = self.builder.ins().call(function_ref, &values);
-                let result = self.builder.inst_results(call)[0];
-                // Gleam callees own their arguments; externals only borrow.
+                // Gleam callees take the env and own their arguments;
+                // externals take neither — they borrow, and are released
+                // here.
                 if external {
-                    for value in values {
-                        self.dec(value);
+                    let call = self.builder.ins().call(function_ref, &values);
+                    let result = self.builder.inst_results(call)[0];
+                    // The external borrows its arguments — except the ones
+                    // it consumes, whose reference it now owns.
+                    let consumed = self.consuming.get(&id).copied().unwrap_or(&[]);
+                    for (index, value) in values.into_iter().enumerate() {
+                        if !consumed.contains(&index) {
+                            self.dec(value);
+                        }
                     }
+                    Ok(result)
+                } else {
+                    let mut values_with_env = vec![self.env];
+                    values_with_env.extend(values);
+                    let call = self.builder.ins().call(function_ref, &values_with_env);
+                    Ok(self.builder.inst_results(call)[0])
                 }
-                Ok(result)
             }
 
             native_ir::Expression::StringConcat(left, right) => {
@@ -2084,17 +2569,27 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             } => {
                 let mut variables = HashMap::new();
                 let mut owned_subjects = Vec::new();
-                for (id, subject) in subject_ids.iter().zip(subjects) {
-                    // A borrowed subject (a plain variable read) skips the
-                    // count round trip; it is then not a drop-reuse
-                    // candidate, since its binding stays live.
-                    let (value, borrowed) = self.expression_read(subject)?;
-                    let _ = variables.insert(*id, value);
+                if let Some((dividend, divisor)) = evenness_fusion(subjects, subject_ids, tree) {
+                    let (value, borrowed) = self.expression_read(dividend)?;
+                    let stand_in = self.emit_evenness_subject(value, divisor);
+                    let _ = variables.insert(subject_ids[0], stand_in);
                     if !borrowed {
                         owned_subjects.push(value);
                     }
+                } else {
+                    for (id, subject) in subject_ids.iter().zip(subjects) {
+                        // A borrowed subject (a plain variable read) skips
+                        // the count round trip; it is then not a drop-reuse
+                        // candidate, since its binding stays live.
+                        let (value, borrowed) = self.expression_read(subject)?;
+                        let _ = variables.insert(*id, value);
+                        if !borrowed {
+                            owned_subjects.push(value);
+                        }
+                    }
                 }
 
+                let owned = self.subject_release_variables(&owned_subjects);
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
                 let _ = self.decision(
@@ -2104,6 +2599,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     DecisionMode::Case {
                         tail: None,
                         subjects: owned_subjects.clone(),
+                        owned: owned.clone(),
                     },
                     None,
                 )?;
@@ -2111,8 +2607,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
                 self.builder.switch_to_block(join);
                 let result = self.builder.block_params(join)[0];
-                for subject in owned_subjects {
-                    self.dec(subject);
+                for (_, variable) in owned {
+                    let value = self.builder.use_var(variable);
+                    self.dec(value);
                 }
                 Ok(result)
             }
@@ -2145,9 +2642,13 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 if arguments.is_empty() {
                     // A zero-arity constructor is immutable and content-equal
                     // to every other instance of its variant: one shared
-                    // instance per site, like a string literal.
+                    // (permanent) instance per site, like a string literal.
                     let tag = *tag;
-                    return self.interned(move |this| Ok(this.record_new(tag, 0, display)));
+                    return self.interned(move |slot| InternedLiteral::Record {
+                        slot,
+                        tag,
+                        display,
+                    });
                 }
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
@@ -2257,7 +2758,8 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
 
             native_ir::Expression::CallValue { callee, arguments } => {
                 let callee = self.expression(callee)?;
-                let mut values = Vec::with_capacity(1 + arguments.len());
+                let mut values = Vec::with_capacity(2 + arguments.len());
+                values.push(self.env);
                 values.push(callee);
                 for argument in arguments {
                     values.push(self.expression(argument)?);
@@ -2266,7 +2768,9 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     .builder
                     .ins()
                     .load(types::I64, MemFlagsData::trusted(), callee, 8);
-                let signature = self.builder.import_signature(gleam_signature(values.len()));
+                let signature = self
+                    .builder
+                    .import_signature(gleam_signature(values.len() - 1));
                 let call = self.builder.ins().call_indirect(signature, code, &values);
                 let result = self.builder.inst_results(call)[0];
                 // The callee owns the closure and the arguments.
@@ -2415,6 +2919,20 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 left,
                 right,
             } => {
+                // A division or remainder by an integer literal
+                // strength-reduces: shifts for powers of two, a
+                // constant-divisor machine division otherwise.
+                if matches!(
+                    operator,
+                    native_ir::IntOperator::Divide | native_ir::IntOperator::Remainder
+                ) && let native_ir::Expression::Int(divisor) = right.as_ref()
+                {
+                    let divisor = *divisor;
+                    let (left, left_borrowed) = self.expression_read(left)?;
+                    let result = self.int_div_rem_constant(*operator, left, divisor)?;
+                    self.release_read(left, left_borrowed);
+                    return Ok(result);
+                }
                 let (left, left_borrowed) = self.expression_read(left)?;
                 let (right, right_borrowed) = self.expression_read(right)?;
                 let result = self.int_binary(*operator, left, right)?;
@@ -2742,7 +3260,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                     binding_slots.push((name.clone(), variable));
                 }
                 let result = match mode {
-                    DecisionMode::Case { tail, .. } => {
+                    DecisionMode::Case { tail, owned, .. } => {
                         // Drop-reuse: when this clause deconstructed one of
                         // the case's own subjects, is certain to end in a
                         // tail transfer (so the join path cannot release
@@ -2753,6 +3271,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         // for that construction to reuse.
                         let mut tail = tail;
                         let mut claimed = false;
+                        let mut claimed_subject = None;
                         if let Some(candidate) = reuse
                             && !debug_rc()
                             && self.reuse_token.is_none()
@@ -2764,9 +3283,37 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                             })
                         {
                             let _ = chain.remove(position);
+                            claimed_subject = Some(candidate.subject);
                             let token = self.emit_reuse_claim(&candidate, variables)?;
                             self.reuse_token = Some((token, candidate.fields.len()));
                             claimed = true;
+                        }
+                        // Early release: the clause's bindings hold their
+                        // own references, so the deconstructed subjects are
+                        // never read again on this path — free them now,
+                        // before the body, instead of at the transfer or
+                        // join. Their children then reach the body with
+                        // their true counts (a forwarded list spine becomes
+                        // uniquely owned and reusable in place). The chain
+                        // entry goes so a transfer cannot release again;
+                        // the variable goes to nil so the join releases
+                        // nothing on this path. A claimed subject's block
+                        // is the drop-reuse token and stays.
+                        for (value, variable) in &owned {
+                            if claimed_subject == Some(*value) {
+                                continue;
+                            }
+                            if let Some(chain) = &mut tail
+                                && let Some(position) = chain.iter().rposition(|(name, entry)| {
+                                    name.is_none() && entry == value
+                                })
+                            {
+                                let _ = chain.remove(position);
+                            }
+                            let current = self.builder.use_var(*variable);
+                            self.dec(current);
+                            let nil = self.builder.ins().iconst(types::I64, NIL);
+                            self.builder.def_var(*variable, nil);
                         }
                         // Clause bindings join the scope machinery: the
                         // body's last-use analysis can consume them, and
@@ -2779,6 +3326,21 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         let saved_owned = self.scope_owned.clone();
                         let scope_start = self.scope_owned.len();
                         self.scope_owned.extend(binding_slots.iter().cloned());
+                        // A body that is one block runs directly in the
+                        // clause's scope: its bindings release with the
+                        // clause either way, and flattening lets last-use
+                        // arming see the clause's pattern bindings (a
+                        // shadowing binding still resolves by slot).
+                        let mut body: &[native_ir::Statement] = body;
+                        while let [
+                            native_ir::Statement::Expression {
+                                expression: native_ir::Expression::Block(inner),
+                                ..
+                            },
+                        ] = body
+                        {
+                            body = inner;
+                        }
                         self.branch_depth += 1;
                         let outcome = self.statements_scoped(body, scope_start, tail);
                         self.branch_depth -= 1;
@@ -3039,7 +3601,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 // containers.
                 let reusable_subject = matches!(
                     &mode,
-                    DecisionMode::Case { tail: Some(_), subjects } if subjects.contains(&subject)
+                    DecisionMode::Case { tail: Some(_), subjects, .. } if subjects.contains(&subject)
                 );
                 let mut joined = false;
                 for (check, decision) in choices {
@@ -3449,22 +4011,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         left: Value,
         right: Value,
     ) -> Result<Value, String> {
-        // Division and remainder are always runtime calls: the zero-divisor
-        // rule and truncation semantics live in one place there.
         let slow_function = match operator {
             native_ir::IntOperator::Add => self.runtime.int_add_slow,
             native_ir::IntOperator::Subtract => self.runtime.int_sub_slow,
             native_ir::IntOperator::Multiply => self.runtime.int_mul_slow,
             native_ir::IntOperator::Divide | native_ir::IntOperator::Remainder => {
-                let function = match operator {
-                    native_ir::IntOperator::Divide => self.runtime.int_div,
-                    _ => self.runtime.int_rem,
-                };
-                let function_ref = self
-                    .module
-                    .declare_func_in_func(function, self.builder.func);
-                let call = self.builder.ins().call(function_ref, &[left, right]);
-                return Ok(self.builder.inst_results(call)[0]);
+                return self.int_div_rem(operator, left, right);
             }
         };
 
@@ -3528,4 +4080,204 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
         self.builder.switch_to_block(join);
         Ok(self.builder.block_params(join)[0])
     }
+
+    /// Integer division and remainder on tagged values: a machine
+    /// division fast path when both operands are small integers and the
+    /// divisor is not zero, spilling to the runtime otherwise. The
+    /// runtime call keeps ownership of the zero-divisor rule (Gleam
+    /// yields zero) and big integer operands.
+    ///
+    /// Untagged small integers span only 63 bits, so the machine division
+    /// itself cannot overflow. The one result that leaves the small range
+    /// is `SMALL_INT_MIN / -1` (its quotient exceeds `SMALL_INT_MAX`),
+    /// excluded from the division fast path; a remainder's magnitude is
+    /// always below the divisor's, so remainders need no such check.
+    /// Truncation semantics match the runtime exactly: machine division
+    /// truncates toward zero and the remainder takes the dividend's sign,
+    /// as do Rust's `BigInt` `/` and `%`.
+    fn int_div_rem(
+        &mut self,
+        operator: native_ir::IntOperator,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, String> {
+        let divide = matches!(operator, native_ir::IntOperator::Divide);
+        let nonzero = self.builder.create_block();
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        // Both operands must have their small integer tag bit set.
+        let both = self.builder.ins().band(left, right);
+        let both_small = self.builder.ins().band_imm_u(both, 1);
+        self.builder.ins().brif(both_small, nonzero, &[], slow, &[]);
+        self.builder.seal_block(nonzero);
+
+        // The divisor must not be (tagged) zero — the runtime turns a zero
+        // divisor into a zero result.
+        self.builder.switch_to_block(nonzero);
+        let zero_divisor = self.builder.ins().icmp_imm_s(IntCC::Equal, right, 1);
+        match divide {
+            true => {
+                // `SMALL_INT_MIN / -1` is the one in-range division whose
+                // result is not: send it to the runtime's big integers.
+                let overflowing = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(zero_divisor, slow, &[], overflowing, &[]);
+                self.builder.seal_block(overflowing);
+                self.builder.switch_to_block(overflowing);
+                let minimum = self.builder.ins().icmp_imm_s(
+                    IntCC::Equal,
+                    left,
+                    tag_small_int_constant(native_runtime::SMALL_INT_MIN),
+                );
+                let negative_one =
+                    self.builder
+                        .ins()
+                        .icmp_imm_s(IntCC::Equal, right, tag_small_int_constant(-1));
+                let overflows = self.builder.ins().band(minimum, negative_one);
+                self.builder.ins().brif(overflows, slow, &[], fast, &[]);
+            }
+            false => {
+                self.builder.ins().brif(zero_divisor, slow, &[], fast, &[]);
+            }
+        }
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+
+        self.builder.switch_to_block(fast);
+        let left_untagged = self.builder.ins().sshr_imm_u(left, 1);
+        let right_untagged = self.builder.ins().sshr_imm_u(right, 1);
+        let quotient = match divide {
+            true => self.builder.ins().sdiv(left_untagged, right_untagged),
+            false => self.builder.ins().srem(left_untagged, right_untagged),
+        };
+        let shifted = self.builder.ins().ishl_imm_u(quotient, 1);
+        let result = self.builder.ins().bor_imm_u(shifted, 1);
+        self.builder.ins().jump(join, &[result.into()]);
+
+        self.builder.switch_to_block(slow);
+        let function = match divide {
+            true => self.runtime.int_div,
+            false => self.runtime.int_rem,
+        };
+        let function_ref = self
+            .module
+            .declare_func_in_func(function, self.builder.func);
+        let call = self.builder.ins().call(function_ref, &[left, right]);
+        let slow_result = self.builder.inst_results(call)[0];
+        self.builder.ins().jump(join, &[slow_result.into()]);
+        self.builder.seal_block(join);
+
+        self.builder.switch_to_block(join);
+        Ok(self.builder.block_params(join)[0])
+    }
+
+    /// Division or remainder by an integer literal, strength-reduced.
+    /// Semantics are the same as [`Self::int_div_rem`]'s: truncation
+    /// toward zero, the remainder taking the dividend's sign, a zero
+    /// divisor yielding zero, and big-integer dividends spilling to the
+    /// runtime.
+    ///
+    /// - By zero: always the runtime call (which yields zero).
+    /// - By one: the dividend itself; remainder zero. By minus one: the
+    ///   generic path, whose `SMALL_INT_MIN` check covers the one
+    ///   overflowing negation.
+    /// - By a power of two (of either sign): shift sequences. A truncating
+    ///   division needs its negative dividends biased toward zero first —
+    ///   `(n + bias) >> k` with `bias = (n >> 63) >>ᵤ (64 - k)`, which is
+    ///   `2^k - 1` for negative `n` and zero otherwise — and the remainder
+    ///   is then `n - (q << k)`, independent of the divisor's sign.
+    /// - Anything else: machine division against the untagged constant.
+    ///
+    /// The results always fit the small range: quotients by `|d| >= 2`
+    /// shrink, and remainder magnitudes stay under `|d|`.
+    fn int_div_rem_constant(
+        &mut self,
+        operator: native_ir::IntOperator,
+        left: Value,
+        divisor: i64,
+    ) -> Result<Value, String> {
+        let divide = matches!(operator, native_ir::IntOperator::Divide);
+        let tagged_divisor = || tag_small_int_constant(divisor);
+        if divisor == 0 || divisor == -1 {
+            let right = self.builder.ins().iconst(types::I64, tagged_divisor());
+            return self.int_div_rem(operator, left, right);
+        }
+        if divisor == 1 {
+            return Ok(match divide {
+                // Works for big integers too: `n / 1` is `n` itself, its
+                // count incremented for the new owner, and `n % 1` is zero.
+                true => self.inc(left),
+                false => self.builder.ins().iconst(types::I64, 1),
+            });
+        }
+
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        // Only the dividend's smallness needs checking: the divisor is a
+        // known non-zero small constant.
+        let small = self.builder.ins().band_imm_u(left, 1);
+        self.builder.ins().brif(small, fast, &[], slow, &[]);
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+
+        self.builder.switch_to_block(fast);
+        let n = self.builder.ins().sshr_imm_u(left, 1);
+        let quotient_or_remainder = match divisor.unsigned_abs().is_power_of_two() {
+            true => {
+                let k = divisor.unsigned_abs().trailing_zeros() as i64;
+                let sign = self.builder.ins().sshr_imm_u(n, 63);
+                let bias = self.builder.ins().ushr_imm_u(sign, 64 - k);
+                let adjusted = self.builder.ins().iadd(n, bias);
+                let quotient = self.builder.ins().sshr_imm_u(adjusted, k);
+                match divide {
+                    true if divisor < 0 => self.builder.ins().ineg(quotient),
+                    true => quotient,
+                    false => {
+                        let taken = self.builder.ins().ishl_imm_u(quotient, k);
+                        self.builder.ins().isub(n, taken)
+                    }
+                }
+            }
+            false => {
+                let constant = self.builder.ins().iconst(types::I64, divisor);
+                match divide {
+                    true => self.builder.ins().sdiv(n, constant),
+                    false => self.builder.ins().srem(n, constant),
+                }
+            }
+        };
+        let shifted = self.builder.ins().ishl_imm_u(quotient_or_remainder, 1);
+        let result = self.builder.ins().bor_imm_u(shifted, 1);
+        self.builder.ins().jump(join, &[result.into()]);
+
+        self.builder.switch_to_block(slow);
+        let function = match divide {
+            true => self.runtime.int_div,
+            false => self.runtime.int_rem,
+        };
+        let function_ref = self
+            .module
+            .declare_func_in_func(function, self.builder.func);
+        let right = self.builder.ins().iconst(types::I64, tagged_divisor());
+        let call = self.builder.ins().call(function_ref, &[left, right]);
+        let slow_result = self.builder.inst_results(call)[0];
+        self.builder.ins().jump(join, &[slow_result.into()]);
+        self.builder.seal_block(join);
+
+        self.builder.switch_to_block(join);
+        Ok(self.builder.block_params(join)[0])
+    }
+}
+
+/// The tagged word of a small integer, as the signed immediate Cranelift
+/// comparisons take.
+fn tag_small_int_constant(value: i64) -> i64 {
+    native_runtime::tag_small_int(value) as i64
 }

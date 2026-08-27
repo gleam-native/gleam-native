@@ -16,7 +16,7 @@ version = "1.0.0"
 # https://gleam.run/writing-gleam/gleam-toml/.
 
 [dependencies]
-gleam_stdlib = { path = "../../gleam-stdlib-native" }
+gleam_stdlib = { path = "../../gleam-native-stdlib" }
 argv = ">= 0.0.0"
 aws4_request = ">= 0.0.0"
 bigi = ">= 0.0.0"

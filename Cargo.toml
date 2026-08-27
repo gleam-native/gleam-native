@@ -59,6 +59,12 @@ flate2 = "1"
 tracing = "0"
 # Macro to work around Rust's traits not working with async. Sigh.
 async-trait = "0"
+# The native target's scheduler substrate: worker threads, reactor, and
+# timer wheel for the fiber-hosted process runtime.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+# Stackful coroutines: each native-target Gleam program (and later each
+# process) runs on its own guard-paged fiber stack, resumed from a future.
+corosensei = "0.3"
 # HTTP types
 http = "1"
 http-serde = "2.1.1"

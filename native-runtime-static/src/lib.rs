@@ -50,6 +50,11 @@ unsafe extern "C" {
     /// [`native_runtime::start`] expects.
     safe fn gleam_native_main_wrapper() -> u64;
 
+    /// The generated literal-init function; the symbol name is
+    /// [`native_runtime::LITERAL_INIT_SYMBOL`]. Builds every interned
+    /// literal (marked permanent) before the program runs.
+    safe fn gleam_native_literal_init() -> u64;
+
     /// The program data blob; the symbol name is
     /// [`native_runtime::PROGRAM_DATA_SYMBOL`].
     static gleam_native_program_data: u8;
@@ -79,6 +84,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const std::ffi::c_char) -
             argv,
             &raw const gleam_native_program_data,
             &raw const gleam_native_frame_table,
+            gleam_native_literal_init,
             gleam_native_main_wrapper,
         )
     }
