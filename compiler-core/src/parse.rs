@@ -1922,7 +1922,7 @@ where
                 let mut unit =
                     match self.parse_record_in_clause_guard(&name, SrcSpan { start, end })? {
                         Some(record) => record,
-                        _ => ClauseGuard::Var {
+                        _ => ClauseGuard::LocalVariable {
                             location: SrcSpan { start, end },
                             type_: (),
                             name,
@@ -2103,7 +2103,7 @@ where
 
     // examples:
     //   ( args )
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn parse_constructor_pattern_arguments(
         &mut self,
         upname_end: u32,

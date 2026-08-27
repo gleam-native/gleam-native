@@ -9,7 +9,7 @@ mod tests;
 use crate::build::Target;
 use crate::erlang::pattern::{AliasedLiteral, PatternGenerator};
 use crate::strings::to_snake_case;
-use crate::type_::{self, is_prelude_module};
+use crate::type_::{self, HasType, is_prelude_module};
 use crate::{
     ast::*,
     type_::{
@@ -27,7 +27,7 @@ use num_bigint::BigInt;
 use num_traits::Signed;
 use regex::Regex;
 use src_span::{LineNumbers, SrcSpan};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
@@ -189,6 +189,15 @@ struct FunctionGenerator<'a, 'generator> {
     /// generate a new name for it in Erlang.
     ///
     taken_names: im::HashMap<String, usize>,
+
+    /// If we're generating a clause guard, this will hold a set with all the
+    /// constants that guards might reference that come from another module.
+    /// Those constants would be function calls, and those are not allowed to
+    /// appear in clause guards; so they are bound to variables right before the
+    /// case expression.
+    /// This map maps from (module_name, constant_name) to the name of the
+    /// variable it has been bound to.
+    guard_remote_constants: Option<im::HashMap<(EcoString, EcoString), EcoString>>,
 }
 
 impl<'a> Generator<'a> {
@@ -217,13 +226,6 @@ impl<'a> Generator<'a> {
     fn module<Output>(&mut self, builder: &mut impl ErlangBuilder<Output>) {
         builder.module_declaration(ErlangModuleName::new(&self.module.name));
 
-        // We need to know which private functions are referenced in importable
-        // constants so that we can export them anyway in the generated Erlang.
-        // This is because otherwise when the constant is used in another module it
-        // would result in an error as it tries to reference this private function.
-        let overridden_publicity =
-            find_private_functions_referenced_in_importable_constants(self.module);
-
         // We add a `-compile` attribute at the top of each module to instruct
         // the Erlang compiler.
         builder.compile_attribute([
@@ -236,10 +238,14 @@ impl<'a> Generator<'a> {
         ]);
 
         // We then need to add an `-export` attribute for all the module's
-        // public functions.
+        // public functions and constants.
         builder.export_attribute(
             (self.module.definitions.functions.iter())
-                .filter_map(|function| function_export(function, &overridden_publicity)),
+                .filter_map(|function| function_export(function))
+                .chain(
+                    (self.module.definitions.constants.iter())
+                        .filter_map(|constant| Some((constant_export(constant)?, 0))),
+                ),
         );
         // We do the same but with types.
         builder.export_type_attribute(self.module.definitions.custom_types.iter().map(type_export));
@@ -257,9 +263,19 @@ impl<'a> Generator<'a> {
             self.type_definition(builder, custom_type);
         }
 
+        // All public constants that might be used by other modules are turned
+        // into 0-arity functions.
+        for constant in &self.module.definitions.constants {
+            FunctionGenerator::new(&constant.name, self).module_constant(builder, constant);
+        }
+
         // And finally generate all the functions that the module defined.
         for function in &self.module.definitions.functions {
-            FunctionGenerator::new(function, self).module_function(builder, function);
+            let (_, function_name) = function
+                .name
+                .as_ref()
+                .expect("module function must have a name");
+            FunctionGenerator::new(function_name, self).module_function(builder, function);
         }
 
         // If echo is needed in this module we also have to add the echo
@@ -445,13 +461,13 @@ fn phantom_type_variables(custom_type: &CustomType<Arc<Type>>) -> Vec<EcoString>
     // itself: any of those that isn't used by any of the constructors is going
     // to be a phantom type variable.
     let mut definition_type_variables =
-        collect_type_var_usages(HashMap::new(), custom_type.typed_parameters.iter());
+        collect_ref_type_var_usages(HashMap::new(), custom_type.typed_parameters.iter());
 
     // So we need to gather all the type variables referenced by all the
     // constructors.
     let mut constructors_type_variables = HashMap::new();
     for constructor in &custom_type.constructors {
-        constructors_type_variables = collect_type_var_usages(
+        constructors_type_variables = collect_ref_type_var_usages(
             constructors_type_variables,
             constructor.arguments.iter().map(|argument| &argument.type_),
         );
@@ -486,21 +502,14 @@ fn type_parameter_name(type_: &Type) -> EcoString {
 }
 
 impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
-    pub fn new(
-        function: &'a TypedFunction,
-        module_generator: &'generator mut Generator<'a>,
-    ) -> Self {
-        let function_name = match function.name.as_ref() {
-            Some((_, function_name)) => function_name,
-            None => panic!("Module functions should have a name"),
-        };
-
+    pub fn new(function_name: &'a str, module_generator: &'generator mut Generator<'a>) -> Self {
         Self {
             function_name,
             module_generator,
             taken_names: im::HashMap::new(),
             variable_names: im::HashMap::new(),
             generated_variables: 0,
+            guard_remote_constants: None,
         }
     }
 
@@ -584,6 +593,37 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         name
     }
 
+    fn module_constant<Output>(
+        &mut self,
+        builder: &mut impl ErlangBuilder<Output>,
+        constant: &'a TypedModuleConstant,
+    ) {
+        if !constant.publicity.is_importable() {
+            return;
+        }
+        if !constant.implementations.supports(Target::Erlang) {
+            return;
+        }
+
+        let function_name = EcoString::from(escape_erlang_existing_name(&constant.name));
+        // Then we add the function's documentation and type annotation.
+        let arguments: &[TypedConstant] = &[];
+        let return_ = constant.type_.clone();
+        self.function_spec_attribute(builder, &function_name, arguments, return_);
+        self.function_doc_attribute(
+            builder,
+            constant.publicity,
+            constant
+                .documentation
+                .as_ref()
+                .map(|(_, documentation)| documentation),
+        );
+
+        let function = builder.start_function::<&str>(constant.location, &function_name, 0, []);
+        self.constant(builder, &constant.value);
+        builder.end_function(function);
+    }
+
     /// Generates code for an Erlang module function. This might return None
     /// if there's no code to be generated at all!
     /// For example if the function is unused, or if the function is a private
@@ -618,8 +658,20 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         let function_name = EcoString::from(escape_erlang_existing_name(self.function_name));
 
         // Then we add the function's documentation and type annotation.
-        self.function_spec_attribute(builder, &function_name, function);
-        self.function_doc_attribute(builder, function);
+        self.function_spec_attribute(
+            builder,
+            &function_name,
+            &function.arguments,
+            function.return_type.clone(),
+        );
+        self.function_doc_attribute(
+            builder,
+            function.publicity,
+            function
+                .documentation
+                .as_ref()
+                .map(|(_, documentation)| documentation),
+        );
 
         // Finally we start generating code for the function itself, how we do
         // it depends if the function is external or not.
@@ -668,33 +720,33 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
 
     /// This generates the `-spec` attribute for a function with the given name.
     ///
-    fn function_spec_attribute<Output>(
+    fn function_spec_attribute<Output, Typed: HasType>(
         &mut self,
         builder: &mut impl ErlangBuilder<Output>,
         function_name: &EcoString,
-        function: &'a Function<Arc<Type>, TypedExpr>,
+        arguments: &[Typed],
+        return_type: Arc<Type>,
     ) {
         // We start by getting all the type variable usages from this function,
         // both in the argument types and return type.
         let module_name = &self.module_generator.module.name;
         let var_usages = &collect_type_var_usages(
             HashMap::new(),
-            function
-                .arguments
+            arguments
                 .iter()
-                .map(|argument| &argument.type_)
-                .chain(std::iter::once(&function.return_type)),
+                .map(|argument| argument.type_())
+                .chain([return_type.clone()]),
         );
         let generator = TypeGenerator::new(module_name).with_var_usages(var_usages);
 
         // We can then start generating the function spec.
-        let spec = builder.start_function_spec(function_name, function.arguments.len());
+        let spec = builder.start_function_spec(function_name, arguments.len());
         let function_type = builder.start_function_type();
-        for argument in &function.arguments {
-            generator.type_(builder, &argument.type_);
+        for argument in arguments {
+            generator.type_(builder, &argument.type_());
         }
         let function_type = builder.end_function_type_arguments(function_type);
-        generator.type_(builder, &function.return_type);
+        generator.type_(builder, &return_type);
         builder.end_function_type(function_type);
         builder.end_function_spec(spec);
     }
@@ -702,17 +754,18 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
     fn function_doc_attribute<Output>(
         &self,
         builder: &mut impl ErlangBuilder<Output>,
-        function: &TypedFunction,
+        function_publicity: Publicity,
+        documentation: Option<&'_ EcoString>,
     ) {
         // If a function is marked as internal or comes from an internal module
         // we want to hide its documentation in the Erlang shell!
         // So the doc directive will look like this: `-doc(false).`
         let is_internal =
-            self.module_generator.module.type_info.is_internal || function.publicity.is_internal();
+            self.module_generator.module.type_info.is_internal || function_publicity.is_internal();
 
         if is_internal {
             builder.doc_attribute(DocContent::False);
-        } else if let Some((_, documentation)) = &function.documentation
+        } else if let Some(documentation) = documentation
             && !documentation.is_empty()
         {
             builder.doc_attribute(DocContent::String(documentation));
@@ -1109,7 +1162,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             TypedExpr::ModuleSelect {
                 constructor: ModuleValueConstructor::Constant { literal, .. },
                 ..
-            } => self.inlined_constant(builder, literal),
+            } => self.constant(builder, literal),
 
             //
             // Control flow.
@@ -1118,8 +1171,9 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                 location,
                 subjects,
                 clauses,
+                remote_constants,
                 ..
-            } => self.case(builder, *location, subjects, clauses),
+            } => self.case(builder, *location, remote_constants, subjects, clauses),
 
             //
             // Something went wrong!
@@ -2071,8 +2125,22 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                 builder.variable(variable_location, &self.local_var_name(location));
             }
 
-            ValueConstructorVariant::ModuleConstant { literal, .. } => {
-                self.inlined_constant(builder, literal);
+            ValueConstructorVariant::ModuleConstant {
+                literal,
+                module,
+                name,
+                location,
+                ..
+            } => {
+                if &self.module_generator.module.name == module {
+                    // If a constant comes from the same module, we always
+                    // inline its value.
+                    self.constant(builder, literal);
+                } else {
+                    // But if it comes from another module, then that's turned
+                    // into a function call of a 0-arity function:
+                    self.remote_constant(builder, *location, module, name);
+                }
             }
 
             ValueConstructorVariant::ModuleFn {
@@ -2255,9 +2323,31 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         &mut self,
         builder: &mut impl ErlangBuilder<Output>,
         case_location: SrcSpan,
+        remote_constants: &'a HashSet<(EcoString, EcoString)>,
         subjects: &'a [TypedExpr],
         clauses: &'a [TypedClause],
     ) {
+        // Before generating code for the case expression, we want to bind all
+        // remote constants needed by its guards to variables.
+        // This way its guards can reference these variables instead of having
+        // to do a function call (which is not allowed in guards)!
+        //
+        // Since these bindings are all auto generated they will have the
+        // default location.
+        let mut clause_guards_remote_constants = im::HashMap::new();
+        let default_location = SrcSpan::default();
+        for (module, constant_name) in remote_constants.iter().sorted() {
+            let variable_name = self.new_generated_variable();
+            let _ = clause_guards_remote_constants.insert(
+                (module.clone(), constant_name.clone()),
+                variable_name.clone(),
+            );
+
+            builder.match_operator(default_location);
+            builder.variable_pattern(default_location, &variable_name);
+            self.remote_constant(builder, default_location, module, constant_name);
+        }
+
         let case = builder.start_case(case_location);
 
         // If there's more than a single subject we will need to wrap those in a
@@ -2284,7 +2374,12 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
 
         for clause in clauses.iter() {
             let taken_names_before_clause = self.taken_names.clone();
-            self.clause_branch(builder, &clause.pattern, clause);
+            self.clause_branch(
+                builder,
+                &clause_guards_remote_constants,
+                &clause.pattern,
+                clause,
+            );
 
             // Erlang doesn't support alternative patterns so we're gonna have
             // to turn those into separate branches!
@@ -2314,7 +2409,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             //
             for pattern in &clause.alternative_patterns {
                 self.taken_names = taken_names_before_clause.clone();
-                self.clause_branch(builder, pattern, clause);
+                self.clause_branch(builder, &clause_guards_remote_constants, pattern, clause);
             }
         }
 
@@ -2326,6 +2421,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
     fn clause_branch<Output>(
         &mut self,
         builder: &mut impl ErlangBuilder<Output>,
+        clause_guards_remote_constants: &im::HashMap<(EcoString, EcoString), EcoString>,
         patterns: &'a Vec<Pattern<Arc<Type>>>,
         clause: &'a Clause<TypedExpr, Arc<Type>>,
     ) {
@@ -2359,7 +2455,9 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         let clause_guards = builder.end_clause_pattern(clause_pattern);
         if let Some(guard) = clause.guard.as_ref() {
             let guard_ender = builder.start_clause_guard();
+            self.guard_remote_constants = Some(clause_guards_remote_constants.clone());
             self.clause_guard(builder, guard, &variables_to_add_later);
+            self.guard_remote_constants = None;
             builder.end_clause_guard(guard_ender);
         }
 
@@ -2378,11 +2476,12 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
     }
 
     /// Erlang doesn't have a special constant declaration syntax; so each Gleam
-    /// constant is simply inlined anywhere it is used.
+    /// constant is simply inlined anywhere it is used inside the same module.
+    /// A constant from a different module is a regular function call.
     ///
     /// This function produces the code of a constant expression.
     ///
-    fn inlined_constant<Output>(
+    fn constant<Output>(
         &mut self,
         builder: &mut impl ErlangBuilder<Output>,
         literal: &'a TypedConstant,
@@ -2393,14 +2492,17 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                 location,
                 ..
             } => builder.int_expression(*location, int_value.clone()),
+
             Constant::Float {
                 float_value,
                 location,
                 ..
             } => builder.float_expression(*location, float_value.value()),
+
             Constant::String {
                 value, location, ..
             } => builder.string(*location, value),
+
             Constant::Var {
                 name,
                 constructor,
@@ -2420,7 +2522,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             } => {
                 let tuple = builder.start_tuple(*location);
                 for element in elements {
-                    self.inlined_constant(builder, element);
+                    self.constant(builder, element);
                 }
                 builder.end_tuple(tuple);
             }
@@ -2433,7 +2535,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             } => {
                 for element in elements {
                     builder.cons_list(element.location());
-                    self.inlined_constant(builder, element);
+                    self.constant(builder, element);
                 }
                 match tail {
                     // If there's no tail we simply add an empty list cell to
@@ -2442,17 +2544,17 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                         start: location.end,
                         end: location.end,
                     }),
-                    Some(tail) => match tail.list_elements() {
+                    Some(tail) => match tail.list_elements(&self.module_generator.module.name) {
                         // If there's a tail and we don't statically know the
                         // elements it's made of, we add it as a regular Erlang
                         // tail and it will be `[1, 2 | Tail]`.
-                        None => self.inlined_constant(builder, tail),
+                        None => self.constant(builder, tail),
                         // But if we can tell it has some fixed amount of
                         // constant elements, then those are inlined too!
                         Some(list_elements) => {
                             for element in list_elements {
                                 builder.cons_list(element.location());
-                                self.inlined_constant(builder, element);
+                                self.constant(builder, element);
                             }
                             builder.empty_list(SrcSpan {
                                 start: location.end,
@@ -2490,7 +2592,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                         let tuple = builder.start_tuple(*location);
                         builder.atom_expression(*location, &to_snake_case(&tag));
                         for argument in arguments {
-                            self.inlined_constant(builder, &argument.value);
+                            self.constant(builder, &argument.value);
                         }
                         builder.end_tuple(tuple);
                     }
@@ -2576,7 +2678,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         segment: &'a TypedConstantBitArraySegment,
     ) {
         builder.bit_array_segment(segment.location);
-        self.inlined_constant(builder, &segment.value);
+        self.constant(builder, &segment.value);
         match segment.size() {
             Some(TypedConstant::Int {
                 int_value,
@@ -2585,7 +2687,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             }) if int_value.is_negative() => {
                 builder.int_expression(*location, BigInt::ZERO);
             }
-            Some(size) => self.inlined_constant(builder, size),
+            Some(size) => self.constant(builder, size),
             None => builder.bit_array_segment_default_size(),
         }
         self.bit_array_segment_specifiers(builder, segment);
@@ -2664,8 +2766,10 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                 Constant::Var {
                     constructor: Some(constructor),
                     ..
-                } if let ValueConstructorVariant::ModuleConstant { literal, .. } =
-                    &constructor.variant =>
+                } if let ValueConstructorVariant::ModuleConstant {
+                    literal, module, ..
+                } = &constructor.variant
+                    && *module == self.module_generator.module.name =>
                 {
                     items.push_front(literal);
                     continue;
@@ -2686,7 +2790,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             }
 
             builder.bit_array_segment(segment.location());
-            self.inlined_constant(builder, segment);
+            self.constant(builder, segment);
             builder.bit_array_segment_default_size();
             builder.bit_array_segment_specifiers([BitArraySegmentSpecifier::Utf8]);
         }
@@ -3092,8 +3196,22 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         match guard {
             ClauseGuard::Invalid { .. } => unreachable!("invalid guard made it to code generation"),
 
-            ClauseGuard::ModuleSelect { literal, .. } => self.inlined_constant(builder, literal),
-            ClauseGuard::Constant(constant) => self.inlined_constant(builder, constant),
+            ClauseGuard::UnqualifiedRemoteConstant {
+                location,
+                module: module_name,
+                name: label,
+                ..
+            }
+            | ClauseGuard::ModuleSelect {
+                module_name,
+                label,
+                location,
+                ..
+            } => {
+                self.remote_constant(builder, *location, module_name, label);
+            }
+
+            ClauseGuard::Constant(constant) => self.constant(builder, constant),
 
             ClauseGuard::Block { value, .. } => self.clause_guard(builder, value, assignments),
 
@@ -3165,7 +3283,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
 
             // Only local variables are supported and the typer ensures that all
             // ClauseGuard::Vars are local variables
-            ClauseGuard::Var {
+            ClauseGuard::LocalVariable {
                 name,
                 definition_location,
                 location,
@@ -3336,6 +3454,41 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                     builder.int_expression(location, value.clone());
                 }
             }
+        }
+    }
+
+    /// Generates the code for a constant that comes from another module.
+    /// Constants from another module are regular function calls!
+    ///
+    /// ```gleam
+    /// wibble.some_constant
+    /// ```
+    ///
+    /// Becomes:
+    ///
+    /// ```erl
+    /// wibble:some_constant().
+    /// ```
+    ///
+    fn remote_constant<Output>(
+        &self,
+        builder: &mut impl ErlangBuilder<Output>,
+        location: SrcSpan,
+        module: &EcoString,
+        name: &EcoString,
+    ) {
+        if let Some(guard_remote_constants) = &self.guard_remote_constants {
+            let name = guard_remote_constants
+                .get(&(module.clone(), name.clone()))
+                .expect("tried generating unbound remote constant");
+            builder.variable(location, name);
+        } else {
+            let call = builder.start_remote_call(
+                location,
+                ErlangModuleName::new(module),
+                escape_erlang_existing_name(name),
+            );
+            builder.end_call(call);
         }
     }
 }
@@ -3594,10 +3747,7 @@ pub fn module<'a, Output>(
 /// this function will return its name and arity to be used when exporting it.
 /// For example: `pub fn wibble(a, b)` will produce `Some(("wibble", 2))`, so
 /// we can export `wibble/2`.
-fn function_export<'a>(
-    function: &'a TypedFunction,
-    overridden_publicity: &im::HashSet<EcoString>,
-) -> Option<(&'a str, usize)> {
+fn function_export(function: &TypedFunction) -> Option<(&str, usize)> {
     let (_, name) = function
         .name
         .as_ref()
@@ -3611,12 +3761,22 @@ fn function_export<'a>(
 
     // If the function is not importable and it's publicity has not been
     // overridden, don't attempt to export it.
-    if !function.publicity.is_importable() && !overridden_publicity.contains(name) {
+    if !function.publicity.is_importable() {
         return None;
     }
 
     let name = escape_erlang_existing_name(name);
     Some((name, function.arguments.len()))
+}
+
+fn constant_export(constant: &TypedModuleConstant) -> Option<&str> {
+    if !constant.implementations.supports(Target::Erlang) {
+        return None;
+    }
+    if !constant.publicity.is_importable() {
+        return None;
+    }
+    Some(escape_erlang_existing_name(&constant.name))
 }
 
 /// Given a custom type this returns the name it should be used to export it and
@@ -3715,16 +3875,15 @@ fn guard_produces_literal_string(guard: &ClauseGuard<Arc<Type>>) -> bool {
     match guard {
         ClauseGuard::Block { value, .. } => guard_produces_literal_string(value),
 
-        ClauseGuard::ModuleSelect {
-            literal: constant, ..
-        }
-        | ClauseGuard::Constant(constant) => constant_produces_literal_string(constant),
+        ClauseGuard::Constant(constant) => constant_produces_literal_string(constant),
 
         ClauseGuard::BinaryOperator { .. }
+        | ClauseGuard::ModuleSelect { .. }
         | ClauseGuard::Not { .. }
-        | ClauseGuard::Var { .. }
+        | ClauseGuard::LocalVariable { .. }
         | ClauseGuard::TupleIndex { .. }
         | ClauseGuard::FieldAccess { .. }
+        | ClauseGuard::UnqualifiedRemoteConstant { .. }
         | ClauseGuard::Invalid { .. } => false,
     }
 }
@@ -3813,6 +3972,23 @@ fn needs_begin_end_wrapping(expression: &TypedExpr) -> bool {
             } => false,
         },
 
+        // A case whose guards depend on constants from other modules has to be
+        // turned into a block that looks like this:
+        //
+        // ```erl
+        // ConstValue = module:constant(),
+        // case ... of
+        //   _ when ConstValue =:= 1 -> todo
+        // end
+        // ```
+        //
+        // All the constants from other modules are function calls which can't
+        // appear in guards, so we have to first bind the constants to variables
+        // that can be referenced in the guards.
+        TypedExpr::Case {
+            remote_constants, ..
+        } => !remote_constants.is_empty(),
+
         TypedExpr::Int { .. }
         | TypedExpr::Float { .. }
         | TypedExpr::String { .. }
@@ -3821,7 +3997,6 @@ fn needs_begin_end_wrapping(expression: &TypedExpr) -> bool {
         | TypedExpr::List { .. }
         | TypedExpr::Call { .. }
         | TypedExpr::BinOp { .. }
-        | TypedExpr::Case { .. }
         | TypedExpr::RecordAccess { .. }
         | TypedExpr::PositionalAccess { .. }
         | TypedExpr::Block { .. }
@@ -4023,12 +4198,22 @@ pub fn escape_erlang_existing_name(name: &str) -> &str {
 ///     fn(a) -> String       // `a` is `any()`
 ///     fn() -> Result(a, b)  // `a` and `b` are `any()`
 ///     fn(a) -> a            // `a` is a type var
-fn collect_type_var_usages<'a>(
+fn collect_ref_type_var_usages<'a>(
     mut ids: HashMap<u64, u64>,
     types: impl IntoIterator<Item = &'a Arc<Type>>,
 ) -> HashMap<u64, u64> {
     for type_ in types {
         type_var_ids(type_, &mut ids);
+    }
+    ids
+}
+
+fn collect_type_var_usages(
+    mut ids: HashMap<u64, u64>,
+    types: impl IntoIterator<Item = Arc<Type>>,
+) -> HashMap<u64, u64> {
+    for type_ in types {
+        type_var_ids(&type_, &mut ids);
     }
     ids
 }
@@ -4340,70 +4525,5 @@ impl<'a> TypeGenerator<'a> {
             }
             builder.end_remote_named_type(type_);
         };
-    }
-}
-
-fn find_private_functions_referenced_in_importable_constants(
-    module: &TypedModule,
-) -> im::HashSet<EcoString> {
-    let mut overridden_publicity = im::HashSet::new();
-
-    for constant in &module.definitions.constants {
-        if constant.publicity.is_importable() {
-            find_referenced_private_functions(&constant.value, &mut overridden_publicity);
-        }
-    }
-    overridden_publicity
-}
-
-fn find_referenced_private_functions(
-    constant: &TypedConstant,
-    already_found: &mut im::HashSet<EcoString>,
-) {
-    match constant {
-        Constant::Todo { .. } => panic!("todo constants should not reach code generation"),
-        Constant::Invalid { .. } => panic!("invalid constants should not reach code generation"),
-        Constant::RecordUpdate { .. } => {
-            panic!("record updates should not reach code generation")
-        }
-
-        Constant::Int { .. }
-        | Constant::Float { .. }
-        | Constant::String { .. }
-        | Constant::BitArray { .. } => (),
-
-        TypedConstant::Var {
-            name, constructor, ..
-        } => {
-            if let Some(ValueConstructor { type_, .. }) = constructor.as_deref()
-                && let Type::Fn { .. } = **type_
-            {
-                let _ = already_found.insert(name.clone());
-            }
-        }
-
-        TypedConstant::Record { arguments, .. } => arguments
-            .iter()
-            .flatten()
-            .for_each(|argument| find_referenced_private_functions(&argument.value, already_found)),
-
-        TypedConstant::BinaryOperator { left, right, .. } => {
-            find_referenced_private_functions(left, already_found);
-            find_referenced_private_functions(right, already_found);
-        }
-
-        Constant::Tuple { elements, .. } => elements
-            .iter()
-            .for_each(|element| find_referenced_private_functions(element, already_found)),
-
-        Constant::List { elements, tail, .. } => {
-            elements
-                .iter()
-                .for_each(|element| find_referenced_private_functions(element, already_found));
-
-            if let Some(tail) = tail {
-                find_referenced_private_functions(tail, already_found);
-            }
-        }
     }
 }

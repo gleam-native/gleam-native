@@ -321,7 +321,11 @@ impl<'a, 'doc> Generator<'a> {
             self.register_prelude_usage(arena, &mut imports, "sizedFloat", None);
         }
 
-        for (variant, alias) in self.tracker.variant_constants_used.iter() {
+        // Sorted so that the imports we generate are the same on every
+        // compilation.
+        let variant_constants = self.tracker.variant_constants_used.iter().sorted();
+
+        for (variant, alias) in variant_constants {
             let path = self.import_path(&variant.package, &variant.module);
             let member = Member {
                 name: eco_format!("{}${}$const", variant.type_name, variant.name),
@@ -1599,7 +1603,7 @@ pub(crate) struct UsageTracker {
     pub variants_used_in_instanceof: HashSet<TypeVariant>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeVariant {
     package: EcoString,
     module: EcoString,
