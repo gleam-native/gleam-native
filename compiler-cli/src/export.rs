@@ -329,6 +329,7 @@ impl NativePlatform {
 /// other platforms use `zig cc` or an explicit `--linker` command.
 pub(crate) fn native(
     paths: &ProjectPaths,
+    module: Option<String>,
     platform: Option<NativePlatform>,
     runtime_lib: Option<Utf8PathBuf>,
     linker: Option<String>,
@@ -356,26 +357,33 @@ pub(crate) fn native(
         crate::build::download_dependencies(paths, crate::cli::Reporter::new())?,
     )?;
     let package_name = &built.root_package.config.name;
+    // The executable's entry: the requested module's `main`, or the
+    // package's own. The executable is named after it.
+    let main_module = match &module {
+        Some(module) => module.as_str(),
+        None => package_name.as_str(),
+    };
 
     // The main function must exist for the executable to call. This will
     // return an error if it could not be found.
-    let _: ModuleFunction = built.get_main_function(package_name, target)?;
+    let _: ModuleFunction = built.get_main_function(&main_module.into(), target)?;
 
     let fail = |error: String| Error::NativeExecutableGeneration { error };
 
     let modules = crate::run::load_native_modules(&build).map_err(fail)?;
     let object = native_generation::object::compile(
         &modules,
-        package_name,
+        main_module,
         built.root_package.config.native.stack_size_megabytes,
         platform.map(NativePlatform::triple),
     )
     .map_err(fail)?;
-    let object_path = build.join(format!("{package_name}.o"));
+    let executable_name = main_module.replace('/', "_");
+    let object_path = build.join(format!("{executable_name}.o"));
     fs::write_bytes(&object_path, &object)?;
 
     let runtime_library = runtime_static_library(platform, runtime_lib).map_err(fail)?;
-    let executable_path = paths.root().join(package_name.as_str());
+    let executable_path = paths.root().join(&executable_name);
     let linker_command = select_linker(platform, linker).map_err(|error| {
         let (mut example, example_program) = match platform {
             Some(platform) => (format!("zig cc -target {}", platform.zig_target()), "zig"),

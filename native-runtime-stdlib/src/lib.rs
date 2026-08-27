@@ -875,6 +875,49 @@ fn cons(head: u64, tail: u64) -> u64 {
     cell
 }
 
+/// `list.append`. When every cell of the left spine is exclusively owned
+/// (count exactly one — literals, atomic leaves, and shared spines all
+/// fail the test), the last cell's tail is spliced onto the right list
+/// in place: no allocation, no copying, the moved-in spine simply
+/// continues into `right`. That is what lets a message-forwarding actor
+/// circulate the same cells indefinitely once the incoming container has
+/// been released. A shared spine falls back to building fresh cells over
+/// the shared heads, exactly like the Gleam implementation. Both
+/// arguments are borrowed; the result is owned.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_list_append(left: u64, right: u64) -> u64 {
+    if left == EMPTY_LIST {
+        return gleam_native_inc(right);
+    }
+    // One pass over the spine: is every cell exclusively owned, and
+    // where is the last one?
+    let mut last = left;
+    let mut unique = unsafe { *((left - 8) as *const u64) } == 1;
+    while unique {
+        let tail = record_field(last, 1);
+        if tail == EMPTY_LIST {
+            break;
+        }
+        unique = unsafe { *((tail - 8) as *const u64) } == 1;
+        last = tail;
+    }
+    if unique {
+        unsafe { *((last as *mut u64).add(2)) = gleam_native_inc(right) };
+        return gleam_native_inc(left);
+    }
+    let mut heads = Vec::new();
+    let mut cell = left;
+    while cell != EMPTY_LIST {
+        heads.push(record_field(cell, 0));
+        cell = record_field(cell, 1);
+    }
+    let mut result = gleam_native_inc(right);
+    for head in heads.into_iter().rev() {
+        result = cons(gleam_native_inc(head), result);
+    }
+    result
+}
+
 /// Whether the comparator orders `a` at or before `b`: `Lt` and `Eq`
 /// keep the pair's order, which is what makes the merge below stable.
 fn ordered(compare: u64, a: u64, b: u64) -> bool {
@@ -1306,6 +1349,10 @@ fn percent_decode_bytes(text: &str, query: bool) -> Option<String> {
 pub fn symbols() -> Vec<(&'static str, *const u8)> {
     vec![
         ("gleam_native_identity", gleam_native_identity as *const u8),
+        (
+            "gleam_native_list_append",
+            gleam_native_list_append as *const u8,
+        ),
         (
             "gleam_native_inspect_value",
             gleam_native_inspect_value as *const u8,

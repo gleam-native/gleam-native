@@ -31,12 +31,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::{
     NIL, ProcessContext, TRUE, box_string, deep_copy, gleam_native_dec, is_small_int, make_error,
-    make_ok, make_tuple2, subject_payload, tag_small_int,
+    make_ok, make_tuple2, subject_payload, tag_small_int, transfer_for_send,
 };
 
 /// The stack size (in bytes) every process fiber reserves, set from the
@@ -46,30 +46,49 @@ use crate::{
 pub(crate) static PROCESS_STACK_SIZE: AtomicUsize = AtomicUsize::new(1024 * 1024);
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
-static NEXT_TAG: AtomicU64 = AtomicU64::new(1);
 
-/// Live processes by pid, for `link`/`monitor` lookups. A process is
-/// removed when it finishes; senders holding a subject reach the mailbox
-/// directly and never consult the table.
-static PROCESS_TABLE: Mutex<Option<std::collections::HashMap<u64, Arc<Shared>>>> =
+/// Subject tags below [`FIRST_FREE_TAG`] are reserved: tag 0 never carries
+/// a message (parking forever), tag 1 carries trapped exit signals as
+/// `#(pid, reason)` tuples, and tag 2 carries OTP-style system messages
+/// (used by the `gleam/otp` port; the runtime itself never sends them).
+const EXIT_TAG: u64 = 1;
+const FIRST_FREE_TAG: u64 = 16;
+static NEXT_TAG: AtomicU64 = AtomicU64::new(FIRST_FREE_TAG);
+
+/// Registered process names: the name's tag to the pid currently holding
+/// it. A name outlives its holder — a new process can register under the
+/// same name and receive messages tagged with it. Named sends look names
+/// up under a read lock; registration and release write.
+static NAMES: RwLock<Option<std::collections::HashMap<u64, u64>>> = RwLock::new(None);
+
+/// Armed message timers, by timer id: the abort handle and the deadline
+/// (for reporting the remaining time when cancelled).
+static TIMERS: Mutex<Option<std::collections::HashMap<u64, (tokio::task::AbortHandle, Instant)>>> =
     Mutex::new(None);
+static NEXT_TIMER: AtomicU64 = AtomicU64::new(1);
+
+/// Live processes by pid: the send path resolves every pid-addressed
+/// message through here, so lookups take a read lock that sending
+/// processes can hold concurrently; only spawn and death write.
+static PROCESS_TABLE: RwLock<Option<std::collections::HashMap<u64, Arc<Shared>>>> =
+    RwLock::new(None);
 
 fn table_insert(shared: &Arc<Shared>) {
-    let mut table = PROCESS_TABLE.lock().expect("process table");
+    let mut table = PROCESS_TABLE.write().expect("process table");
     table
         .get_or_insert_with(std::collections::HashMap::new)
         .insert(shared.pid, shared.clone());
 }
 
 fn table_remove(pid: u64) {
-    let mut table = PROCESS_TABLE.lock().expect("process table");
+    let mut table = PROCESS_TABLE.write().expect("process table");
     if let Some(table) = table.as_mut() {
         let _ = table.remove(&pid);
     }
 }
 
 fn table_lookup(pid: u64) -> Option<Arc<Shared>> {
-    let table = PROCESS_TABLE.lock().expect("process table");
+    let table = PROCESS_TABLE.read().expect("process table");
     table.as_ref().and_then(|table| table.get(&pid).cloned())
 }
 
@@ -114,9 +133,11 @@ pub struct Shared {
     /// An exit signal delivered but not yet acted on: the process dies
     /// with this reason at its next suspension point.
     killed: Mutex<Option<String>>,
-    /// Zero when exits are not trapped; otherwise the subject tag exit
-    /// messages are delivered under instead of killing the process.
+    /// Zero when exits are not trapped; otherwise [`EXIT_TAG`], the tag
+    /// exit messages are delivered under instead of killing the process.
     trap_tag: AtomicU64,
+    /// The name tag this process is registered under, or zero.
+    name: AtomicU64,
     mailbox: Mutex<MailboxInner>,
     /// Processes linked to this one (bidirectional; both sides hold an
     /// entry).
@@ -139,6 +160,7 @@ impl Shared {
             alive: AtomicBool::new(true),
             killed: Mutex::new(None),
             trap_tag: AtomicU64::new(0),
+            name: AtomicU64::new(0),
             mailbox: Mutex::new(MailboxInner {
                 queue: VecDeque::new(),
                 version: 0,
@@ -190,7 +212,7 @@ type Coroutine = corosensei::Coroutine<(), Suspension, ()>;
 type Yielder = corosensei::Yielder<(), Suspension>;
 
 /// The scheduler-side state of one process, owned by its future. The
-/// fiber reaches it through [`CURRENT_PROCESS`] while running.
+/// fiber reaches it through the thread's context pointer while running.
 pub(crate) struct ProcessState {
     pub(crate) shared: Arc<Shared>,
     pub(crate) context: ProcessContext,
@@ -203,16 +225,23 @@ pub(crate) struct ProcessState {
     root: bool,
 }
 
-thread_local! {
-    /// The process currently running on this thread, set by its future
-    /// around every resume.
-    static CURRENT_PROCESS: Cell<*const ProcessState> = const { Cell::new(std::ptr::null()) };
+/// The running process's state, recovered from the thread's context
+/// pointer (the context is a field of the state, and the only non-null
+/// setter is the scheduler, which always points it at a state's field).
+/// One thread-local thus serves both generated code and the runtime.
+fn current_pointer() -> *const ProcessState {
+    let context = crate::current_context_pointer();
+    if context.is_null() {
+        return std::ptr::null();
+    }
+    (context as *const u8).wrapping_sub(std::mem::offset_of!(ProcessState, context))
+        as *const ProcessState
 }
 
 /// The running process's state. Must only be called from a fiber (any
 /// process external reaching here from outside one is a runtime bug).
 fn current() -> &'static ProcessState {
-    let state = CURRENT_PROCESS.with(|current| current.get());
+    let state = current_pointer();
     assert!(
         !state.is_null(),
         "process operation outside a Gleam process"
@@ -223,7 +252,7 @@ fn current() -> &'static ProcessState {
 /// Whether the caller is inside a non-root process fiber — where a crash
 /// should kill the process, not the program.
 pub fn in_child_process() -> bool {
-    let state = CURRENT_PROCESS.with(|current| current.get());
+    let state = current_pointer();
     !state.is_null() && !unsafe { &*state }.root
 }
 
@@ -258,7 +287,7 @@ fn die(state: &ProcessState, reason: String) -> ! {
 /// process; exits the program otherwise. The tail of every runtime error
 /// report (`panic`, failed asserts, bit array errors).
 pub fn exit_current_abnormally(reason: String) -> ! {
-    let state = CURRENT_PROCESS.with(|current| current.get());
+    let state = current_pointer();
     if !state.is_null() && !unsafe { &*state }.root {
         die(unsafe { &*state }, reason);
     }
@@ -288,8 +317,9 @@ fn send_raw(shared: &Shared, tag: u64, value: u64) {
 }
 
 /// Delivers an exit signal to a process: if it traps exits, an
-/// `#(pid, reason)` message on its trap subject; otherwise it is killed —
-/// marked to die at its next suspension point, and woken if parked.
+/// `#(pid, reason)` message under [`EXIT_TAG`]; otherwise it is killed —
+/// marked to die (with the same reason, which its own watchers then see)
+/// at its next suspension point, and woken if parked.
 fn deliver_exit(target: &Shared, from_pid: u64, reason: &str) {
     let trap_tag = target.trap_tag.load(Ordering::Acquire);
     if trap_tag != 0 {
@@ -301,7 +331,14 @@ fn deliver_exit(target: &Shared, from_pid: u64, reason: &str) {
         // A normal exit kills no one; only trapping processes observe it.
         return;
     }
-    *target.killed.lock().expect("kill flag") = Some(format!("killed: {reason}"));
+    kill_with(target, reason.to_string());
+}
+
+/// Marks a process to die with the given reason at its next suspension
+/// point, waking it if parked. Bypasses exit trapping — the untrappable
+/// path behind `kill`, and the tail of exit-signal delivery.
+fn kill_with(target: &Shared, reason: String) {
+    *target.killed.lock().expect("kill flag") = Some(reason);
     let waker = target.mailbox.lock().expect("mailbox").waker.take();
     if let Some(waker) = waker {
         waker.wake();
@@ -315,6 +352,17 @@ fn finish(state: &ProcessState, reason: &str) {
     let shared = &state.shared;
     shared.alive.store(false, Ordering::Release);
     table_remove(shared.pid);
+    // Release the process's registered name, if any, so another process
+    // can take it over.
+    let name = shared.name.swap(0, Ordering::AcqRel);
+    if name != 0 {
+        let mut names = NAMES.write().expect("name registry");
+        if let Some(names) = names.as_mut()
+            && names.get(&name) == Some(&shared.pid)
+        {
+            let _ = names.remove(&name);
+        }
+    }
     // Drain the mailbox under its lock: a sender that saw `alive` just
     // before the store has either pushed already (drained here) or will
     // find `alive` false. Envelopes release their values on drop.
@@ -372,12 +420,10 @@ impl std::future::Future for ProcessFuture {
         this.timer = None;
         this.state.context.pool = crate::current_pool();
         crate::set_current_context(&raw mut this.state.context);
-        CURRENT_PROCESS.with(|current| current.set(&raw const *this.state));
         let coroutine = this.coroutine.as_mut().expect("live coroutine");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             coroutine.resume(())
         }));
-        CURRENT_PROCESS.with(|current| current.set(std::ptr::null()));
         crate::set_current_context(std::ptr::null_mut());
         match result {
             Ok(corosensei::CoroutineResult::Return(())) => {
@@ -520,6 +566,25 @@ pub fn spawn_child(body: impl FnOnce() + 'static) -> Arc<Shared> {
     shared
 }
 
+/// Spawns a child process with a monitor from the current process already
+/// in place, returning the child's handle and the tag its down message
+/// will arrive under. Registering the monitor before the child is
+/// scheduled closes the race where a fast child finishes before a
+/// separate `monitor` call, which would report `noproc` instead of the
+/// child's actual exit reason.
+pub fn spawn_child_monitored(body: impl FnOnce() + 'static) -> (Arc<Shared>, u64) {
+    let state = current();
+    let (shared, future) = new_process(false, body).expect("spawn a process");
+    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+    shared
+        .monitors
+        .lock()
+        .expect("monitors")
+        .push((tag, state.shared.clone()));
+    drop(tokio::spawn(future));
+    (shared, tag)
+}
+
 /// Registers a monitor on the given process from the current one,
 /// returning the tag its down message (the exit reason as a string) will
 /// arrive under. An already-finished process is reported down
@@ -564,14 +629,26 @@ pub fn monitor_arc(target: &Arc<Shared>) -> u64 {
 /// save queue then the mailbox and parking until a match or the timeout.
 /// Returns `None` on timeout.
 pub fn receive_tags(tags: &[u64], timeout: Option<Duration>) -> Option<Envelope> {
+    receive_matching(tags, false, timeout)
+}
+
+/// [`receive_tags`], with `catch_all` making every message a match — the
+/// substrate for selector catch-all handlers.
+pub fn receive_matching(
+    tags: &[u64],
+    catch_all: bool,
+    timeout: Option<Duration>,
+) -> Option<Envelope> {
     let state = current();
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    // The deadline is computed lazily, so a receive whose message is
+    // already waiting never reads the clock.
+    let mut deadline: Option<Instant> = None;
+    let matches = |envelope: &Envelope| catch_all || tags.contains(&envelope.tag);
     loop {
         check_killed(state);
         {
             let mut saved = state.save_queue.borrow_mut();
-            if let Some(position) = saved.iter().position(|envelope| tags.contains(&envelope.tag))
-            {
+            if let Some(position) = saved.iter().position(&matches) {
                 return saved.remove(position);
             }
         }
@@ -579,17 +656,19 @@ pub fn receive_tags(tags: &[u64], timeout: Option<Duration>) -> Option<Envelope>
             let mut mailbox = state.shared.mailbox.lock().expect("mailbox");
             loop {
                 match mailbox.queue.pop_front() {
-                    Some(envelope) if tags.contains(&envelope.tag) => return Some(envelope),
+                    Some(envelope) if matches(&envelope) => return Some(envelope),
                     Some(envelope) => state.save_queue.borrow_mut().push_back(envelope),
                     None => break,
                 }
             }
             mailbox.version
         };
-        if let Some(deadline) = deadline
-            && Instant::now() >= deadline
-        {
-            return None;
+        if let Some(timeout) = timeout {
+            let now = Instant::now();
+            let expiry = *deadline.get_or_insert(now + timeout);
+            if now >= expiry {
+                return None;
+            }
         }
         fiber_suspend(
             state,
@@ -599,6 +678,17 @@ pub fn receive_tags(tags: &[u64], timeout: Option<Duration>) -> Option<Envelope>
             },
         );
     }
+}
+
+/// Drops every message with the given tag from the mailbox and save
+/// queue: how a demonitor flushes an already-delivered down message.
+fn flush_tag(state: &ProcessState, tag: u64) {
+    state
+        .save_queue
+        .borrow_mut()
+        .retain(|envelope| envelope.tag != tag);
+    let mut mailbox = state.shared.mailbox.lock().expect("mailbox");
+    mailbox.queue.retain(|envelope| envelope.tag != tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +810,37 @@ pub extern "C" fn gleam_native_process_select(subjects: u64, timeout_ms: u64) ->
     }
 }
 
+/// Parks the current process forever: tag zero is reserved and never
+/// carries a message.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_sleep_forever() -> u64 {
+    let _ = receive_tags(&[0], None);
+    NIL
+}
+
+/// Sends a message to a pid under a tag after a delay, returning a timer
+/// id for [`gleam_native_process_cancel_timer`]. The pid is resolved when
+/// the timer fires (a message for a finished process is dropped), as
+/// `erlang:send_after` does.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_send_after_tagged(
+    pid: u64,
+    tag: u64,
+    delay_ms: u64,
+    message: u64,
+) -> u64 {
+    let pid = (pid as i64 >> 1) as u64;
+    let envelope = Envelope {
+        tag: (tag as i64 >> 1) as u64,
+        value: deep_copy(message),
+    };
+    arm_timer(delay_ms, move |envelope: Envelope| {
+        if let Some(target) = table_lookup(pid) {
+            send_raw(&target, envelope.tag, envelope.take_value());
+        }
+    }, envelope)
+}
+
 /// Suspends the current process for the given number of milliseconds.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_process_sleep(milliseconds: u64) -> u64 {
@@ -740,7 +861,7 @@ pub extern "C" fn gleam_native_process_yield() -> u64 {
     NIL
 }
 
-/// Monitors the process with the given pid: returns a subject on which a
+/// Monitors the process with the given pid: returns the tag under which a
 /// single down message (the exit reason as a string) arrives when it
 /// finishes — immediately, with reason `"noproc"`, if it already has.
 #[unsafe(no_mangle)]
@@ -755,15 +876,30 @@ pub extern "C" fn gleam_native_process_monitor(pid: u64) -> u64 {
             tag
         }
     };
-    crate::box_subject(SubjectPayload {
-        shared: state.shared.clone(),
-        tag,
-    })
+    tag_small_int(tag as i64)
 }
 
-/// Links the current process to the one with the given pid (idempotent
-/// per call; both sides record the link). Linking to a finished process
-/// delivers an immediate `noproc` exit signal.
+/// Removes a monitor (identified by its pid and tag) and flushes any
+/// already-delivered down message for it, so no down message is observed
+/// after a demonitor.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_demonitor(pid: u64, tag: u64) -> u64 {
+    let state = current();
+    let tag = (tag as i64 >> 1) as u64;
+    if let Some(target) = table_lookup((pid as i64 >> 1) as u64) {
+        target
+            .monitors
+            .lock()
+            .expect("monitors")
+            .retain(|(entry, _)| *entry != tag);
+    }
+    flush_tag(state, tag);
+    NIL
+}
+
+/// Links the current process to the one with the given pid (both sides
+/// record the link). Returns `True` when the link was made, `False` when
+/// the target process is no longer alive.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_process_link(pid: u64) -> u64 {
     let state = current();
@@ -775,13 +911,10 @@ pub extern "C" fn gleam_native_process_link(pid: u64) -> u64 {
                 .lock()
                 .expect("links")
                 .push(state.shared.clone());
+            TRUE
         }
-        None => {
-            deliver_exit(&state.shared, (pid as i64 >> 1) as u64, "noproc");
-            check_killed(state);
-        }
+        None => crate::FALSE,
     }
-    NIL
 }
 
 /// Removes any link between the current process and the given pid.
@@ -805,28 +938,351 @@ pub extern "C" fn gleam_native_process_unlink(pid: u64) -> u64 {
     NIL
 }
 
-/// Makes the current process trap exits: instead of being killed by a
-/// linked process's death, it receives `#(pid, reason)` messages on the
-/// returned subject.
+/// Sets whether the current process traps exits. While trapping, a linked
+/// process's death arrives as a `#(pid, reason)` message under the
+/// reserved exit tag instead of killing this process.
 #[unsafe(no_mangle)]
-pub extern "C" fn gleam_native_process_trap_exits() -> u64 {
+pub extern "C" fn gleam_native_process_trap_exits(flag: u64) -> u64 {
     let state = current();
-    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+    let tag = if flag == TRUE { EXIT_TAG } else { 0 };
     state.shared.trap_tag.store(tag, Ordering::Release);
-    crate::box_subject(SubjectPayload {
-        shared: state.shared.clone(),
-        tag,
-    })
+    NIL
 }
 
-/// Whether the process with the given pid is still running.
+/// The reserved tag trapped exit messages arrive under.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_exit_tag() -> u64 {
+    tag_small_int(EXIT_TAG as i64)
+}
+
+/// Sends an exit signal to the process with the given pid, with the given
+/// reason (a string). Trapping processes receive it as a message; a
+/// `"normal"` reason kills no one.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_exit_signal(pid: u64, reason: u64) -> u64 {
+    let state = current();
+    if let Some(target) = table_lookup((pid as i64 >> 1) as u64) {
+        deliver_exit(&target, state.shared.pid, crate::string_value(reason));
+        // A process can signal itself; act on it at the next suspension
+        // point as usual.
+        check_killed(state);
+    }
+    NIL
+}
+
+/// Kills the process with the given pid: an untrappable exit signal, as
+/// `erlang:exit(Pid, kill)`. The killed process's watchers see the reason
+/// `"killed"`.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_kill(pid: u64) -> u64 {
+    let state = current();
+    if let Some(target) = table_lookup((pid as i64 >> 1) as u64) {
+        kill_with(&target, "killed".to_string());
+        check_killed(state);
+    }
+    NIL
+}
+
+/// A fresh unique tag, for names and other identities.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_fresh_tag() -> u64 {
+    tag_small_int(NEXT_TAG.fetch_add(1, Ordering::Relaxed) as i64)
+}
+
+/// Registers the process with the given pid under a name tag. Fails
+/// (returning `False`) when the name is taken, the process already has a
+/// name, or the process is not alive.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_register(pid: u64, name: u64) -> u64 {
+    let name = (name as i64 >> 1) as u64;
+    let Some(target) = table_lookup((pid as i64 >> 1) as u64) else {
+        return crate::FALSE;
+    };
+    let mut names = NAMES.write().expect("name registry");
+    let names = names.get_or_insert_with(std::collections::HashMap::new);
+    if names.contains_key(&name) {
+        return crate::FALSE;
+    }
+    if target
+        .name
+        .compare_exchange(0, name, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return crate::FALSE;
+    }
+    let _ = names.insert(name, target.pid);
+    TRUE
+}
+
+/// Removes a name registration, if present.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_unregister(name: u64) -> u64 {
+    let name = (name as i64 >> 1) as u64;
+    let mut names = NAMES.write().expect("name registry");
+    let removed = names
+        .as_mut()
+        .and_then(|names| names.remove(&name));
+    match removed {
+        Some(pid) => {
+            if let Some(target) = table_lookup(pid) {
+                let _ = target.name.compare_exchange(
+                    name,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            TRUE
+        }
+        None => crate::FALSE,
+    }
+}
+
+/// The pid registered under a name tag, or zero when the name is free.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_named(name: u64) -> u64 {
+    let name = (name as i64 >> 1) as u64;
+    let names = NAMES.read().expect("name registry");
+    let pid = names
+        .as_ref()
+        .and_then(|names| names.get(&name).copied())
+        .unwrap_or(0);
+    tag_small_int(pid as i64)
+}
+
+/// Sends a message to the process registered under a name tag, tagged
+/// with the name itself (so re-registrations keep old selectors working).
+/// Returns `False` when no process holds the name.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_send_named(name: u64, message: u64) -> u64 {
+    let name = (name as i64 >> 1) as u64;
+    let pid = {
+        let names = NAMES.read().expect("name registry");
+        names.as_ref().and_then(|names| names.get(&name).copied())
+    };
+    match pid.and_then(table_lookup) {
+        Some(target) => {
+            send_raw(&target, name, deep_copy(message));
+            TRUE
+        }
+        None => crate::FALSE,
+    }
+}
+
+/// [`gleam_native_process_send`], but *consuming* the message: the code
+/// generator calls this when the message argument is a binding's final
+/// use, skipping its usual after-call release. An exclusively-owned
+/// message moves into the mailbox without a copy.
+///
+/// Never use this external through a function value: the wrapper the
+/// code generator makes for function values releases every argument,
+/// which would double-release the consumed message.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_send_owned(pid: u64, tag: u64, message: u64) -> u64 {
+    match table_lookup((pid as i64 >> 1) as u64) {
+        Some(target) => {
+            let value = transfer_for_send(message);
+            send_raw(&target, (tag as i64 >> 1) as u64, value);
+        }
+        None => {
+            let _ = gleam_native_dec(message);
+        }
+    }
+    NIL
+}
+
+/// [`gleam_native_process_send_named`], but *consuming* the message; see
+/// [`gleam_native_process_send_owned`].
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_send_named_owned(name: u64, message: u64) -> u64 {
+    let name = (name as i64 >> 1) as u64;
+    let pid = {
+        let names = NAMES.read().expect("name registry");
+        names.as_ref().and_then(|names| names.get(&name).copied())
+    };
+    match pid.and_then(table_lookup) {
+        Some(target) => {
+            let value = transfer_for_send(message);
+            send_raw(&target, name, value);
+            TRUE
+        }
+        None => {
+            let _ = gleam_native_dec(message);
+            crate::FALSE
+        }
+    }
+}
+
+/// Sends a message to a pid under an explicit tag; how system messages
+/// (and other name-independent tagged sends) are delivered. Returns
+/// `False` when the process is not alive.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_send_tagged(pid: u64, tag: u64, message: u64) -> u64 {
+    match table_lookup((pid as i64 >> 1) as u64) {
+        Some(target) => {
+            send_raw(&target, (tag as i64 >> 1) as u64, deep_copy(message));
+            TRUE
+        }
+        None => crate::FALSE,
+    }
+}
+
+/// Receives the next message whose tag is in the given list — or any
+/// message at all when `catch_all` is true — within the timeout:
+/// `Ok(#(tag, message))`, or `Error(Nil)` on timeout.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_receive_any(
+    tags: u64,
+    timeout_ms: u64,
+    catch_all: u64,
+) -> u64 {
+    let mut wanted = Vec::new();
+    let mut list = tags;
+    while !crate::is_immediate(list) {
+        let tag = crate::record_field(list, 0);
+        wanted.push((tag as i64 >> 1) as u64);
+        list = crate::record_field(list, 1);
+    }
+    match receive_matching(&wanted, catch_all == TRUE, untag_timeout(timeout_ms)) {
+        Some(envelope) => {
+            let tag = envelope.tag;
+            make_ok(make_tuple2(
+                tag_small_int(tag as i64),
+                envelope.take_value(),
+            ))
+        }
+        None => make_error(NIL),
+    }
+}
+
+/// Discards every message waiting in the current process's mailbox and
+/// save queue.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_flush() -> u64 {
+    let state = current();
+    state.save_queue.borrow_mut().clear();
+    state.shared.mailbox.lock().expect("mailbox").queue.clear();
+    NIL
+}
+
+/// The pid of the process a subject delivers to.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_subject_owner(subject: u64) -> u64 {
+    tag_small_int(subject_payload(subject).shared.pid as i64)
+}
+
+/// The tag a subject's messages carry.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_subject_tag(subject: u64) -> u64 {
+    tag_small_int(subject_payload(subject).tag as i64)
+}
+
+/// Sends a message on a subject after a delay, returning a timer id for
+/// [`gleam_native_process_cancel_timer`]. The message is copied now; the
+/// send happens on the scheduler after the delay.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_send_after(subject: u64, delay_ms: u64, message: u64) -> u64 {
+    let payload = subject_payload(subject).clone();
+    let envelope = Envelope {
+        tag: payload.tag,
+        value: deep_copy(message),
+    };
+    arm_timer(delay_ms, move |envelope| {
+        send_raw(&payload.shared, envelope.tag, envelope.take_value());
+    }, envelope)
+}
+
+/// [`gleam_native_process_send_after`] for a named subject: the name is
+/// resolved when the timer fires, so a re-registered process receives it.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_send_after_named(
+    name: u64,
+    delay_ms: u64,
+    message: u64,
+) -> u64 {
+    let name = (name as i64 >> 1) as u64;
+    let envelope = Envelope {
+        tag: name,
+        value: deep_copy(message),
+    };
+    arm_timer(delay_ms, move |envelope: Envelope| {
+        let pid = {
+            let names = NAMES.read().expect("name registry");
+            names.as_ref().and_then(|names| names.get(&name).copied())
+        };
+        if let Some(target) = pid.and_then(table_lookup) {
+            send_raw(&target, envelope.tag, envelope.take_value());
+        }
+    }, envelope)
+}
+
+/// Arms a timer task that delivers the envelope after the delay; the
+/// envelope releases its value if the timer is cancelled first.
+fn arm_timer(delay_ms: u64, deliver: impl FnOnce(Envelope) + Send + 'static, envelope: Envelope) -> u64 {
+    let ms = ((delay_ms as i64) >> 1).max(0) as u64;
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let id = NEXT_TIMER.fetch_add(1, Ordering::Relaxed);
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        {
+            let mut timers = TIMERS.lock().expect("timers");
+            if let Some(timers) = timers.as_mut() {
+                let _ = timers.remove(&id);
+            }
+        }
+        deliver(envelope);
+    });
+    let mut timers = TIMERS.lock().expect("timers");
+    let _ = timers
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(id, (task.abort_handle(), deadline));
+    tag_small_int(id as i64)
+}
+
+/// Cancels a timer: the remaining milliseconds when it was still armed,
+/// or `-1` when it had already fired (or never existed).
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_cancel_timer(id: u64) -> u64 {
+    let id = (id as i64 >> 1) as u64;
+    let entry = {
+        let mut timers = TIMERS.lock().expect("timers");
+        timers.as_mut().and_then(|timers| timers.remove(&id))
+    };
+    match entry {
+        Some((handle, deadline)) => {
+            handle.abort();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tag_small_int(remaining.as_millis() as i64)
+        }
+        None => tag_small_int(-1),
+    }
+}
+
+/// Whether the process with the given pid is still running. A process
+/// with an undelivered kill already counts as dead: the kill signal is
+/// ordered before this check, as on the BEAM.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_process_is_alive(pid: u64) -> u64 {
-    if table_lookup((pid as i64 >> 1) as u64).is_some() {
-        TRUE
-    } else {
-        crate::FALSE
+    match table_lookup((pid as i64 >> 1) as u64) {
+        Some(target) if target.killed.lock().expect("kill flag").is_none() => TRUE,
+        _ => crate::FALSE,
     }
+}
+
+/// Milliseconds of monotonic time since the program started: the clock
+/// restart-intensity windows are measured on.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    tag_small_int(start.elapsed().as_millis() as i64)
+}
+
+/// Terminates the current process abnormally with the given reason (a
+/// string), as `erlang:exit(Reason)` would. Never returns.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_process_exit_self(reason: u64) -> u64 {
+    exit_current_abnormally(crate::string_value(reason).to_string());
 }
 
 /// A small integer identifying the worker thread currently running the
@@ -875,6 +1331,14 @@ pub fn process_symbols() -> Vec<(&'static str, *const u8)> {
             gleam_native_process_sleep as *const u8,
         ),
         (
+            "gleam_native_process_sleep_forever",
+            gleam_native_process_sleep_forever as *const u8,
+        ),
+        (
+            "gleam_native_process_send_after_tagged",
+            gleam_native_process_send_after_tagged as *const u8,
+        ),
+        (
             "gleam_native_process_yield",
             gleam_native_process_yield as *const u8,
         ),
@@ -901,6 +1365,90 @@ pub fn process_symbols() -> Vec<(&'static str, *const u8)> {
         (
             "gleam_native_process_scheduler_id",
             gleam_native_process_scheduler_id as *const u8,
+        ),
+        (
+            "gleam_native_process_demonitor",
+            gleam_native_process_demonitor as *const u8,
+        ),
+        (
+            "gleam_native_process_exit_tag",
+            gleam_native_process_exit_tag as *const u8,
+        ),
+        (
+            "gleam_native_process_exit_signal",
+            gleam_native_process_exit_signal as *const u8,
+        ),
+        (
+            "gleam_native_process_kill",
+            gleam_native_process_kill as *const u8,
+        ),
+        (
+            "gleam_native_process_fresh_tag",
+            gleam_native_process_fresh_tag as *const u8,
+        ),
+        (
+            "gleam_native_process_register",
+            gleam_native_process_register as *const u8,
+        ),
+        (
+            "gleam_native_process_unregister",
+            gleam_native_process_unregister as *const u8,
+        ),
+        (
+            "gleam_native_process_named",
+            gleam_native_process_named as *const u8,
+        ),
+        (
+            "gleam_native_process_send_named",
+            gleam_native_process_send_named as *const u8,
+        ),
+        (
+            "gleam_native_process_send_owned",
+            gleam_native_process_send_owned as *const u8,
+        ),
+        (
+            "gleam_native_process_send_named_owned",
+            gleam_native_process_send_named_owned as *const u8,
+        ),
+        (
+            "gleam_native_process_send_tagged",
+            gleam_native_process_send_tagged as *const u8,
+        ),
+        (
+            "gleam_native_process_receive_any",
+            gleam_native_process_receive_any as *const u8,
+        ),
+        (
+            "gleam_native_process_flush",
+            gleam_native_process_flush as *const u8,
+        ),
+        (
+            "gleam_native_process_subject_owner",
+            gleam_native_process_subject_owner as *const u8,
+        ),
+        (
+            "gleam_native_process_subject_tag",
+            gleam_native_process_subject_tag as *const u8,
+        ),
+        (
+            "gleam_native_process_send_after",
+            gleam_native_process_send_after as *const u8,
+        ),
+        (
+            "gleam_native_process_send_after_named",
+            gleam_native_process_send_after_named as *const u8,
+        ),
+        (
+            "gleam_native_process_cancel_timer",
+            gleam_native_process_cancel_timer as *const u8,
+        ),
+        (
+            "gleam_native_process_monotonic_ms",
+            gleam_native_process_monotonic_ms as *const u8,
+        ),
+        (
+            "gleam_native_process_exit_self",
+            gleam_native_process_exit_self as *const u8,
         ),
     ]
 }

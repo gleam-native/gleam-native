@@ -1533,26 +1533,20 @@ pub fn run_program_fiber_with(
         .build()
         .map_err(|error| format!("could not start the scheduler: {error}"))?;
     let (_shared, future) = process::new_process(true, body)?;
-    match runtime.block_on(runtime.spawn(future)) {
+    let result = runtime.block_on(runtime.spawn(future));
+    if std::env::var_os("GLEAM_DEBUG_SEND").is_some() {
+        eprintln!(
+            "sends: {} moved roots, {} copied roots",
+            TRANSFER_MOVED.load(std::sync::atomic::Ordering::Relaxed),
+            TRANSFER_COPIED.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+    match result {
         Ok(()) => Ok(()),
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => Err(format!("the program crashed: {error}")),
     }
 }
-
-/// The state of a `gleam test` run: the discovered tests and the run's
-/// progress. Present only while tests are executing; its presence is what
-/// makes [`gleam_native_panic`] print the failing test's name.
-struct TestRun {
-    /// Test display names and their C-convention entry wrappers.
-    tests: Vec<(String, extern "C" fn() -> u64)>,
-    /// The index of the next test to start.
-    next: std::sync::atomic::AtomicUsize,
-    /// How many tests have failed so far.
-    failed: std::sync::atomic::AtomicUsize,
-}
-
-static TEST_RUN: std::sync::OnceLock<TestRun> = std::sync::OnceLock::new();
 
 /// Runs the given tests in order — each as its own process, monitored by
 /// this one — reporting each outcome, then exits: 0 if every test passed,
@@ -1560,38 +1554,33 @@ static TEST_RUN: std::sync::OnceLock<TestRun> = std::sync::OnceLock::new();
 ///
 /// A failing test panics into [`gleam_native_panic`], which reports the
 /// failure and terminates the test's process; its fiber is abandoned
-/// without unwinding and the runner moves on — the same mechanism any
-/// crashing process uses. A stack overflow still aborts the whole run.
+/// without unwinding and the runner (observing the abnormal exit through
+/// its monitor) records the failure and moves on — the same mechanism any
+/// crashing process uses. A test process's *descendants* may crash freely
+/// without failing the test, as long as the test process itself finishes
+/// normally. A stack overflow still aborts the whole run.
 pub fn run_tests(tests: Vec<(String, extern "C" fn() -> u64)>) -> ! {
-    use std::sync::atomic::Ordering;
-    let _ = TEST_RUN.set(TestRun {
-        tests,
-        next: std::sync::atomic::AtomicUsize::new(0),
-        failed: std::sync::atomic::AtomicUsize::new(0),
-    });
-    let run = TEST_RUN.get().expect("the test run was just stored");
-    loop {
-        let index = run.next.fetch_add(1, Ordering::SeqCst);
-        let Some((name, function)) = run.tests.get(index) else {
-            break;
-        };
+    let mut failed = 0usize;
+    for (name, function) in &tests {
         let function = *function;
-        let test_process = spawn_child(move || {
+        let (_test_process, down) = process::spawn_child_monitored(move || {
             let _ = function();
         });
-        let down = monitor_arc(&test_process);
         let envelope = receive_tags(&[down], None).expect("a monitored test reports down");
         let reason = envelope.take_value();
         let passed = string_value(reason) == "normal";
-        let _ = gleam_native_dec(reason);
         if passed {
             println!("  PASS {name}");
+        } else {
+            failed += 1;
+            println!("  FAIL {name}");
+            // The reason names what ended the process when it wasn't a
+            // reported panic (a kill, or an exit signal from a link).
+            eprintln!("  (test process exited with reason: {})", string_value(reason));
         }
-        // A failure printed its own FAIL line and report from the panic,
-        // and counted itself in `run.failed`.
+        let _ = gleam_native_dec(reason);
     }
-    let total = run.tests.len();
-    let failed = run.failed.load(Ordering::SeqCst);
+    let total = tests.len();
     let plural = if failed == 1 { "failure" } else { "failures" };
     println!();
     println!("Ran {total} tests, {failed} {plural}");
@@ -2073,23 +2062,24 @@ pub extern "C" fn gleam_native_closure_new(captures: u64, arity: u64) -> u64 {
 /// Recycles a freed allocation of the same size from the pool when one is
 /// available, falling back to the system allocator.
 pub(crate) fn allocate_words(words: usize) -> u64 {
+    POOL.with(|pool| allocate_words_in(pool, words))
+}
+
+/// [`allocate_words`] against an already-resolved pool, so a walk
+/// allocating many objects (a deep copy) looks the thread-local up once.
+pub(crate) fn allocate_words_in(pool: &Pool, words: usize) -> u64 {
     if rc_stats() {
         let _ = RC_ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let total = 1 + words;
     if total < POOL_CLASSES {
-        let recycled = POOL.with(|pool| {
-            let head = pool.heads[total].get();
-            if head != 0 {
-                // The count word of a pooled block holds the next block.
-                pool.heads[total].set(unsafe { *(head as *const u64) });
-                pool.counts[total].set(pool.counts[total].get() - 1);
-            }
-            head
-        });
-        if recycled != 0 {
-            unsafe { *(recycled as *mut u64) = 1 };
-            return recycled + 8;
+        let head = pool.heads[total].get();
+        if head != 0 {
+            // The count word of a pooled block holds the next block.
+            pool.heads[total].set(unsafe { *(head as *const u64) });
+            pool.counts[total].set(pool.counts[total].get() - 1);
+            unsafe { *(head as *mut u64) = 1 };
+            return head + 8;
         }
     }
     let layout = word_layout(words);
@@ -2185,6 +2175,13 @@ pub(crate) fn set_current_context(context: *mut ProcessContext) {
     CURRENT_CONTEXT.with(|current| current.set(context));
 }
 
+/// The thread's running context pointer, or null. The process module
+/// recovers the whole process state from it by field offset, so one
+/// thread-local serves both generated code and the runtime.
+pub(crate) fn current_context_pointer() -> *mut ProcessContext {
+    CURRENT_CONTEXT.with(|current| current.get())
+}
+
 /// The calling thread's allocation pool, for pinning a process context to
 /// the worker about to run it.
 pub(crate) fn current_pool() -> *const Pool {
@@ -2209,9 +2206,86 @@ fn current_stack_top() -> usize {
 /// share across scheduler threads without atomics.
 pub const PERMANENT_COUNT: u64 = 1 << 63;
 
-/// Whether a heap value's count word marks it permanent.
+/// Whether a heap value's count word marks it permanent. A relaxed
+/// atomic load: atomically counted words (which also carry the sign bit)
+/// are modified concurrently, and the flag bits themselves never change
+/// after marking.
 fn is_permanent(value: u64) -> bool {
-    unsafe { *((value - 8) as *const u64) & PERMANENT_COUNT != 0 }
+    atomic_count(value).load(std::sync::atomic::Ordering::Relaxed) & PERMANENT_COUNT != 0
+}
+
+/// Bit 62 of a count word marks an atomically counted *leaf* — a value
+/// whose fields are all immediates or permanents, shared across process
+/// boundaries by reference instead of being copied per send (subjects
+/// are the motivating case). The sign bit is set as well, so every
+/// inline fast-path check that skips plain counting still applies; the
+/// cold negative-count path tests this bit and performs the count
+/// operation atomically instead of skipping it. The real count lives in
+/// the low bits and the object is freed normally when it reaches zero —
+/// unlike permanents, atomic values do not leak.
+pub const ATOMIC_COUNT: u64 = 1 << 62;
+
+/// The low bits of an atomic count word: the actual reference count.
+pub const ATOMIC_COUNT_MASK: u64 = ATOMIC_COUNT - 1;
+
+/// Whether a heap value's count word marks it atomically counted; a
+/// relaxed load, as in [`is_permanent`].
+fn is_atomic(value: u64) -> bool {
+    atomic_count(value).load(std::sync::atomic::Ordering::Relaxed) & ATOMIC_COUNT != 0
+}
+
+/// The count word as an atomic, for values marked [`ATOMIC_COUNT`].
+fn atomic_count(value: u64) -> &'static std::sync::atomic::AtomicU64 {
+    unsafe { &*((value - 8) as *const std::sync::atomic::AtomicU64) }
+}
+
+/// Adds one reference to an atomically counted value.
+fn atomic_inc(value: u64) {
+    let _ = atomic_count(value).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drops one reference from an atomically counted value, destroying it
+/// when the count reaches zero (the release/acquire pair orders the
+/// dropping thread's writes before the free, as `Arc` does).
+fn atomic_dec(value: u64) -> bool {
+    let previous = atomic_count(value).fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if previous & ATOMIC_COUNT_MASK == 1 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        return true;
+    }
+    false
+}
+
+/// Marks a heap value atomically counted so it can be shared across
+/// process boundaries by reference: sends deliver the same box instead
+/// of a copy, and it is freed when its last reference anywhere drops.
+/// Only a *leaf* qualifies — every field an immediate or permanent —
+/// since sharing must not drag plainly counted children across threads;
+/// anything else (or an already marked value) is left as it was, which
+/// is always correct, just copied on send. Returns a new reference,
+/// since externals borrow their argument.
+#[unsafe(no_mangle)]
+pub extern "C" fn gleam_native_make_shared(value: u64) -> u64 {
+    if is_immediate(value) {
+        return value;
+    }
+    let count = unsafe { *((value - 8) as *const u64) };
+    if count & (PERMANENT_COUNT | ATOMIC_COUNT) == 0 {
+        let header = heap_header(value);
+        let leaf = match header_kind(header) {
+            KIND_RECORD => (0..record_arity(header)).all(|index| {
+                let field = record_field(value, index);
+                is_immediate(field) || is_permanent(field)
+            }),
+            _ => false,
+        };
+        if leaf {
+            unsafe {
+                *((value - 8) as *mut u64) = PERMANENT_COUNT | ATOMIC_COUNT | count;
+            }
+        }
+    }
+    gleam_native_inc(value)
 }
 
 /// Marks a heap value permanent: its count operations become no-ops and it
@@ -2281,6 +2355,7 @@ fn rc_check(value: u64, operation: &str) {
     let header = heap_header(value);
     if header_kind(header) == POISON_KIND {
         eprintln!("RC BUG: {operation} of freed (pooled) value {value:#x}, count word {count:#x}");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
         std::process::abort();
     }
     if count == 0 || count > 1 << 40 {
@@ -2295,6 +2370,7 @@ fn rc_check(value: u64, operation: &str) {
             "TRACE {operation} {value:#x} kind {} count {count}",
             header_kind(header)
         );
+
     }
 }
 
@@ -2363,6 +2439,12 @@ thread_local! {
 /// pool when its size class has room, back to the system allocator
 /// otherwise.
 fn free_words(base: *mut u64, total: usize) {
+    POOL.with(|pool| free_words_in(pool, base, total))
+}
+
+/// [`free_words`] against an already-resolved pool, so a walk freeing
+/// many objects (a destroy) looks the thread-local up once.
+fn free_words_in(pool: &Pool, base: *mut u64, total: usize) {
     if rc_stats() {
         let _ = RC_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2370,17 +2452,17 @@ fn free_words(base: *mut u64, total: usize) {
         // Poison the header so a stale reference reads as freed.
         unsafe { *base.add(1) = POISON_KIND };
     }
-    let pooled = total < POOL_CLASSES
-        && POOL.with(|pool| {
-            let count = pool.counts[total].get();
-            if count >= POOL_CLASS_CAPACITY {
-                return false;
-            }
+    let pooled = total < POOL_CLASSES && {
+        let count = pool.counts[total].get();
+        if count >= POOL_CLASS_CAPACITY {
+            false
+        } else {
             unsafe { *base = pool.heads[total].get() };
             pool.heads[total].set(base as u64);
             pool.counts[total].set(count + 1);
             true
-        });
+        }
+    };
     if !pooled {
         unsafe {
             std::alloc::dealloc(
@@ -2395,7 +2477,14 @@ fn free_words(base: *mut u64, total: usize) {
 /// permanent objects.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
-    if !is_immediate(value) && !is_permanent(value) {
+    if is_immediate(value) {
+        return value;
+    }
+    if is_atomic(value) {
+        atomic_inc(value);
+        return value;
+    }
+    if !is_permanent(value) {
         if rc_debug() {
             rc_check(value, "inc");
         }
@@ -2410,7 +2499,16 @@ pub extern "C" fn gleam_native_inc(value: u64) -> u64 {
 /// but the count word.
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_native_dec(value: u64) -> u64 {
-    if is_immediate(value) || is_permanent(value) {
+    if is_immediate(value) {
+        return NIL;
+    }
+    if is_atomic(value) {
+        if atomic_dec(value) {
+            destroy(value);
+        }
+        return NIL;
+    }
+    if is_permanent(value) {
         return NIL;
     }
     if rc_debug() {
@@ -2452,37 +2550,49 @@ fn destroy(first: u64) {
     // must walk; everything else — strings and other leaf payloads, dicts
     // (whose entries release through their `Drop`), and field-less records
     // — frees directly. The empty vector never allocates: nothing is
-    // pushed onto it.
-    let header = heap_header(first);
-    let kind = header_kind(header);
-    if (kind != KIND_RECORD && kind != KIND_CLOSURE) || record_arity(header) == 0 {
-        free_object(first, &mut Vec::new());
-        return;
-    }
-    let mut worklist = WORKLIST.take();
-    free_object(first, &mut worklist);
-    while let Some(value) = worklist.pop() {
-        if is_immediate(value) || is_permanent(value) {
-            continue;
+    // pushed onto it. The thread's pool is resolved once for the whole
+    // walk.
+    POOL.with(|pool| {
+        let header = heap_header(first);
+        let kind = header_kind(header);
+        if (kind != KIND_RECORD && kind != KIND_CLOSURE) || record_arity(header) == 0 {
+            free_object(pool, first, &mut Vec::new());
+            return;
         }
-        if rc_debug() {
-            rc_check(value, "dec (destroy)");
-        }
-        let count = (value - 8) as *mut u64;
-        unsafe {
-            *count -= 1;
-            if *count > 0 {
+        let mut worklist = WORKLIST.take();
+        free_object(pool, first, &mut worklist);
+        while let Some(value) = worklist.pop() {
+            if is_immediate(value) {
                 continue;
             }
+            if is_atomic(value) {
+                if atomic_dec(value) {
+                    free_object(pool, value, &mut worklist);
+                }
+                continue;
+            }
+            if is_permanent(value) {
+                continue;
+            }
+            if rc_debug() {
+                rc_check(value, "dec (destroy)");
+            }
+            let count = (value - 8) as *mut u64;
+            unsafe {
+                *count -= 1;
+                if *count > 0 {
+                    continue;
+                }
+            }
+            free_object(pool, value, &mut worklist);
         }
-        free_object(value, &mut worklist);
-    }
-    WORKLIST.set(worklist);
+        WORKLIST.set(worklist);
+    })
 }
 
 /// Frees one object whose count has reached zero, pushing the children it
 /// owned onto the worklist.
-fn free_object(value: u64, worklist: &mut Vec<u64>) {
+fn free_object(pool: &Pool, value: u64, worklist: &mut Vec<u64>) {
     let count = (value - 8) as *mut u64;
     let header = heap_header(value);
     match header_kind(header) {
@@ -2491,7 +2601,7 @@ fn free_object(value: u64, worklist: &mut Vec<u64>) {
             for index in 0..arity {
                 worklist.push(record_field(value, index));
             }
-            free_words(count, 2 + arity as usize);
+            free_words_in(pool, count, 2 + arity as usize);
         }
         KIND_CLOSURE => {
             let captures = record_arity(header);
@@ -2499,11 +2609,11 @@ fn free_object(value: u64, worklist: &mut Vec<u64>) {
                 // Captures sit one word past the code pointer.
                 worklist.push(record_field(value, 1 + index));
             }
-            free_words(count, 3 + captures as usize);
+            free_words_in(pool, count, 3 + captures as usize);
         }
         KIND_BIGINT => free_payload::<BigInt>(value),
         // A float box is count, header, and payload: the three-word class.
-        KIND_FLOAT => free_words(count, 3),
+        KIND_FLOAT => free_words_in(pool, count, 3),
         KIND_STRING => free_payload::<StringPayload>(value),
         KIND_BITARRAY => free_payload::<BitArrayPayload>(value),
         KIND_DICT => {
@@ -2829,13 +2939,92 @@ pub(crate) fn subject_payload(value: u64) -> &'static SubjectPayload {
 /// internally-synchronized process handles inside subjects. Record and
 /// list spines copy iteratively, so long lists cannot overflow the stack;
 /// recursion happens only through dict entries.
+/// Prepares a message this caller *owns* for delivery to another process:
+/// a single walk that moves every exclusively-owned node (reference count
+/// one) as it stands — the receiver inherits the memory — and replaces
+/// each shared subtree with a deep copy, releasing the shared reference.
+/// Either way the caller's reference is consumed and the result is
+/// reachable only by the receiver.
+///
+/// Moving is sound because a count of one proves nothing else can ever
+/// observe the node: any live binding or borrowed read in the sender
+/// shows up as an extra count (or prevents consumption at the call site
+/// altogether), which routes that subtree through the copy branch. Dicts
+/// always copy — their persistent maps share tree nodes through
+/// non-atomic `Rc`s that box counts cannot see. A moved node was
+/// allocated from this thread's pool and will be freed into the
+/// receiver's; pools recycle free memory, not live values, so that is
+/// already sound. String views keep their parent reference, so the
+/// parent slot is walked like a child; every other kind is a leaf whose
+/// internals (system allocations, atomically counted process handles)
+/// move safely between threads.
+pub static TRANSFER_MOVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TRANSFER_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The reused slot buffer for [`transfer_for_send`], so a send
+    /// performs no allocation of its own (mirroring [`destroy`]'s
+    /// worklist). A transfer never re-enters itself.
+    static TRANSFER_SLOTS: Cell<Vec<*mut u64>> = const { Cell::new(Vec::new()) };
+}
+
+pub fn transfer_for_send(value: u64) -> u64 {
+    if !is_immediate(value) && !is_permanent(value) {
+        let counter = if unsafe { *((value - 8) as *const u64) } == 1 {
+            &TRANSFER_MOVED
+        } else {
+            &TRANSFER_COPIED
+        };
+        let _ = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut root = value;
+    let mut slots = TRANSFER_SLOTS.take();
+    slots.push(&mut root);
+    while let Some(slot) = slots.pop() {
+        let value = unsafe { *slot };
+        if is_immediate(value) || is_permanent(value) {
+            continue;
+        }
+        let header = heap_header(value);
+        let kind = header_kind(header);
+        if unsafe { *((value - 8) as *const u64) } != 1 || kind == KIND_DICT {
+            let copy = deep_copy(value);
+            let _ = gleam_native_dec(value);
+            unsafe { *slot = copy };
+            continue;
+        }
+        match kind {
+            KIND_RECORD => {
+                for index in 0..record_arity(header) as usize {
+                    slots.push((value as *mut u64).wrapping_add(1 + index));
+                }
+            }
+            KIND_CLOSURE => {
+                for index in 0..record_arity(header) as usize {
+                    slots.push((value as *mut u64).wrapping_add(2 + index));
+                }
+            }
+            KIND_STRING => {
+                if let StringPayload::View(view) =
+                    unsafe { &mut (*container::<StringPayload>(value)).value }
+                {
+                    slots.push(&mut view.parent);
+                }
+            }
+            _ => {}
+        }
+    }
+    TRANSFER_SLOTS.set(slots);
+    root
+}
+
 pub fn deep_copy(value: u64) -> u64 {
-    fn copy_node(value: u64, worklist: &mut Vec<u64>) -> u64 {
+    fn copy_node(pool: &Pool, value: u64, worklist: &mut Vec<u64>) -> u64 {
         let header = heap_header(value);
         match header_kind(header) {
             KIND_RECORD => {
                 let arity = record_arity(header) as usize;
-                let copy = allocate_words(1 + arity);
+                let copy = allocate_words_in(pool, 1 + arity);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         value as *const u64,
@@ -2852,7 +3041,7 @@ pub fn deep_copy(value: u64) -> u64 {
             }
             KIND_CLOSURE => {
                 let captures = record_arity(header) as usize;
-                let copy = allocate_words(2 + captures);
+                let copy = allocate_words_in(pool, 2 + captures);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         value as *const u64,
@@ -2891,28 +3080,44 @@ pub fn deep_copy(value: u64) -> u64 {
         }
     }
 
-    if is_immediate(value) || is_permanent(value) {
+    if is_immediate(value) {
         return value;
     }
-    let mut worklist = Vec::new();
-    let root = copy_node(value, &mut worklist);
-    while let Some(node) = worklist.pop() {
-        let header = heap_header(node);
-        let (first, count) = match header_kind(header) {
-            KIND_RECORD => (1, record_arity(header) as usize),
-            KIND_CLOSURE => (2, record_arity(header) as usize),
-            _ => unreachable!("only records and closures carry child slots"),
-        };
-        for index in first..first + count {
-            let slot = (node as *mut u64).wrapping_add(index);
-            let child = unsafe { *slot };
-            if is_immediate(child) || is_permanent(child) {
-                continue;
-            }
-            unsafe { *slot = copy_node(child, &mut worklist) };
+    if is_permanent(value) {
+        // An atomically counted value is shared, not copied: the copy is
+        // one more reference to the same box.
+        if is_atomic(value) {
+            atomic_inc(value);
         }
+        return value;
     }
-    root
+    POOL.with(|pool| {
+        let mut worklist = Vec::new();
+        let root = copy_node(pool, value, &mut worklist);
+        while let Some(node) = worklist.pop() {
+            let header = heap_header(node);
+            let (first, count) = match header_kind(header) {
+                KIND_RECORD => (1, record_arity(header) as usize),
+                KIND_CLOSURE => (2, record_arity(header) as usize),
+                _ => unreachable!("only records and closures carry child slots"),
+            };
+            for index in first..first + count {
+                let slot = (node as *mut u64).wrapping_add(index);
+                let child = unsafe { *slot };
+                if is_immediate(child) {
+                    continue;
+                }
+                if is_permanent(child) {
+                    if is_atomic(child) {
+                        atomic_inc(child);
+                    }
+                    continue;
+                }
+                unsafe { *slot = copy_node(pool, child, &mut worklist) };
+            }
+        }
+        root
+    })
 }
 
 pub fn box_dict(payload: DictPayload) -> u64 {
@@ -3247,19 +3452,6 @@ pub unsafe extern "C" fn gleam_native_panic(
     } else {
         string_value(message)
     };
-    // Under `gleam test` the panic is a test failure: name the test on
-    // standard output alongside the PASS lines before the report.
-    let failed_test = TEST_RUN.get().and_then(|run| {
-        let index = run
-            .next
-            .load(std::sync::atomic::Ordering::SeqCst)
-            .checked_sub(1)?;
-        let (test_name, _) = run.tests.get(index)?;
-        Some((run, test_name))
-    });
-    if let Some((_, test_name)) = &failed_test {
-        println!("  FAIL {test_name}");
-    }
     eprintln!("runtime error: {name}");
     eprintln!();
     eprintln!("{message}");
@@ -3276,9 +3468,6 @@ pub unsafe extern "C" fn gleam_native_panic(
         eprintln!("  {module}.{function}:{line}");
     } else {
         eprint!("{trace}");
-    }
-    if let Some((run, _)) = failed_test {
-        let _ = run.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     // Inside a child process (a test, or a spawned process) the crash
     // kills just that process — its fiber is abandoned without unwinding
@@ -3542,6 +3731,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         (
             MAKE_PERMANENT_SYMBOL,
             gleam_native_make_permanent as *const u8,
+        ),
+        (
+            "gleam_native_make_shared",
+            gleam_native_make_shared as *const u8,
         ),
         ("gleam_native_echo", gleam_native_echo as *const u8),
         ("gleam_native_panic", gleam_native_panic as *const u8),

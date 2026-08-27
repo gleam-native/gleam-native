@@ -650,12 +650,13 @@ impl Command {
                 export::escript(&paths)
             }
             Self::Export(ExportTarget::Native {
+                module,
                 platform,
                 runtime_lib,
                 linker,
             }) => {
                 let paths = find_project_paths(directory)?;
-                export::native(&paths, platform, runtime_lib, linker)
+                export::native(&paths, module, platform, runtime_lib, linker)
             }
             Self::Export(ExportTarget::HexTarball) => {
                 let paths = find_project_paths(directory)?;
@@ -700,6 +701,11 @@ pub enum ExportTarget {
     ErlangShipment,
     /// An ahead-of-time compiled native executable
     Native {
+        /// The module to compile the `main` function of, defaulting to
+        /// the package's main module. The executable is named after it.
+        #[arg(long = "module", short = 'm')]
+        module: Option<String>,
+
         /// The platform to compile for, defaulting to this machine
         #[arg(long, value_enum)]
         platform: Option<export::NativePlatform>,
