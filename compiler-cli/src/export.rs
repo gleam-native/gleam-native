@@ -659,6 +659,12 @@ fn runtime_static_library(
         .parent()
         .ok_or("could not locate the gleam executable's directory")?;
 
+    // A host-targeted export from a development checkout rebuilds the
+    // library first, so it can never silently link a stale runtime.
+    if platform.is_none_or(NativePlatform::matches_host) {
+        refresh_development_runtime_library(directory)?;
+    }
+
     let mut candidates = vec![];
     match platform {
         None => candidates.push(directory.join("libnative_runtime_static.a")),
@@ -716,6 +722,50 @@ or point at an existing one with --runtime-lib (also settable as \
 GLEAM_NATIVE_RUNTIME_LIB).",
         searched.join("\n")
     ))
+}
+
+/// Rebuilds `libnative_runtime_static.a` before an export links it, when
+/// this `gleam` runs out of a development checkout's `target/<profile>`
+/// directory. `cargo build -p gleam` does not rebuild the library (the
+/// binary must not depend on it — its C `main` would clash), so without
+/// this an export would silently link whatever a previous manual build
+/// left behind. Cargo decides whether anything actually needs compiling;
+/// a clean tree costs a fraction of a second. Does nothing outside the
+/// development layout (a released `gleam` ships the library next to the
+/// binary), when the profile directory is not `debug` or `release`, or
+/// when `cargo` itself cannot be found; a failed build is an error, since
+/// linking the leftover library is exactly the staleness this prevents.
+fn refresh_development_runtime_library(directory: &std::path::Path) -> Result<(), String> {
+    let profile = match directory.file_name().and_then(|name| name.to_str()) {
+        Some("release") => Some("--release"),
+        Some("debug") => None,
+        _ => return Ok(()),
+    };
+    let Some(workspace) = directory.parent().and_then(std::path::Path::parent) else {
+        return Ok(());
+    };
+    if !workspace
+        .join("native-runtime-static")
+        .join("Cargo.toml")
+        .is_file()
+    {
+        return Ok(());
+    }
+    let mut command = std::process::Command::new("cargo");
+    let _ = command
+        .args(["build", "-p", "native-runtime-static"])
+        .args(profile)
+        .current_dir(workspace);
+    match command.output() {
+        // No cargo on this machine: leave the existing library candidates
+        // to the search below.
+        Err(_) => Ok(()),
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "building the native runtime library failed:\n\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
 }
 
 pub fn hex_tarball(paths: &ProjectPaths) -> Result<()> {
