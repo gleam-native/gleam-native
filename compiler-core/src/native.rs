@@ -23,6 +23,123 @@ use crate::{
     type_::{ModuleValueConstructor, PRELUDE_MODULE_NAME, Type, ValueConstructorVariant},
 };
 
+/// Corrects a decision tree for switches whose checks can overlap.
+///
+/// The tree builder gives every specialized choice subtree the switch's
+/// own fallback as its default. For disjoint checks (variants, literals)
+/// that is harmless, but string-prefix and bit-array checks overlap:
+/// after `"res" <> _` matched and a later check inside that subtree
+/// failed, a following `"" <> _` choice must still be tried — the naive
+/// tree instead falls straight through to the switch's fallback, skipping
+/// clauses that Gleam's first-match semantics require. (The JavaScript
+/// backend masks the same flaw as a side effect of merging nested
+/// conditions with `&&`, which routes the inner failure back into the
+/// sibling chain.) Wherever such a choice's subtree would take the
+/// switch's fallback, substitute a switch over the remaining choices —
+/// exactly the continuation a correct compilation of the remaining
+/// pattern rows would have produced.
+fn correct_overlapping_switches(decision: &exhaustiveness::Decision) -> exhaustiveness::Decision {
+    use exhaustiveness::{Decision, RuntimeCheck};
+    match decision {
+        Decision::Run { .. } | Decision::Fail => decision.clone(),
+        Decision::Guard {
+            guard,
+            if_true,
+            if_false,
+        } => Decision::Guard {
+            guard: *guard,
+            if_true: if_true.clone(),
+            if_false: Box::new(correct_overlapping_switches(if_false)),
+        },
+        Decision::Switch {
+            var,
+            choices,
+            fallback,
+            fallback_check,
+        } => {
+            let overlapping = choices.iter().any(|(check, _)| {
+                matches!(
+                    check,
+                    RuntimeCheck::StringPrefix { .. } | RuntimeCheck::BitArray { .. }
+                )
+            });
+            let choices: Vec<_> = choices
+                .iter()
+                .enumerate()
+                .map(|(index, (check, subtree))| {
+                    let subtree = if overlapping {
+                        let remaining = &choices[index + 1..];
+                        let continuation = if remaining.is_empty() {
+                            (**fallback).clone()
+                        } else {
+                            Decision::Switch {
+                                var: var.clone(),
+                                choices: remaining.to_vec(),
+                                fallback: fallback.clone(),
+                                fallback_check: fallback_check.clone(),
+                            }
+                        };
+                        substitute_decision(subtree, fallback, &continuation)
+                    } else {
+                        subtree.clone()
+                    };
+                    (check.clone(), correct_overlapping_switches(&subtree))
+                })
+                .collect();
+            Decision::Switch {
+                var: var.clone(),
+                choices,
+                fallback: Box::new(correct_overlapping_switches(fallback)),
+                fallback_check: fallback_check.clone(),
+            }
+        }
+    }
+}
+
+/// The decision with every node equal to `target` replaced by
+/// `replacement`, recursively.
+fn substitute_decision(
+    decision: &exhaustiveness::Decision,
+    target: &exhaustiveness::Decision,
+    replacement: &exhaustiveness::Decision,
+) -> exhaustiveness::Decision {
+    use exhaustiveness::Decision;
+    if decision == target {
+        return replacement.clone();
+    }
+    match decision {
+        Decision::Run { .. } | Decision::Fail => decision.clone(),
+        Decision::Guard {
+            guard,
+            if_true,
+            if_false,
+        } => Decision::Guard {
+            guard: *guard,
+            if_true: if_true.clone(),
+            if_false: Box::new(substitute_decision(if_false, target, replacement)),
+        },
+        Decision::Switch {
+            var,
+            choices,
+            fallback,
+            fallback_check,
+        } => Decision::Switch {
+            var: var.clone(),
+            choices: choices
+                .iter()
+                .map(|(check, subtree)| {
+                    (
+                        check.clone(),
+                        substitute_decision(subtree, target, replacement),
+                    )
+                })
+                .collect(),
+            fallback: Box::new(substitute_decision(fallback, target, replacement)),
+            fallback_check: fallback_check.clone(),
+        },
+    }
+}
+
 fn lower_int(value: &BigInt) -> native_ir::Expression {
     match value
         .to_i64()
@@ -175,7 +292,8 @@ impl Lowerer<'_> {
                     .id as u32;
                 let mut prefix_slices = HashMap::new();
                 let enclosing = self.match_location.replace(assignment.pattern.location());
-                let tree = self.decision(&assignment.compiled_case.tree, None, &mut prefix_slices);
+                let corrected = correct_overlapping_switches(&assignment.compiled_case.tree);
+                let tree = self.decision(&corrected, None, &mut prefix_slices);
                 self.match_location.set(enclosing);
                 let tree = tree?;
                 let on_failure = match &assignment.kind {
@@ -618,8 +736,12 @@ impl Lowerer<'_> {
                     .map(|variable| variable.id as u32)
                     .collect();
                 let mut prefix_slices = HashMap::new();
+                let corrected = correct_overlapping_switches(&compiled_case.tree);
+                if std::env::var_os("GLEAM_DEBUG_TREE").is_some() {
+                    eprintln!("UPSTREAM TREE: {:#?}", compiled_case.tree);
+                }
                 let enclosing = self.match_location.replace(expression.location());
-                let tree = self.decision(&compiled_case.tree, Some(clauses), &mut prefix_slices);
+                let tree = self.decision(&corrected, Some(clauses), &mut prefix_slices);
                 self.match_location.set(enclosing);
                 let tree = tree?;
                 let subjects = subjects
@@ -1714,7 +1836,7 @@ mod tests {
 
     use crate::{analyse::TargetSupport, build::Target, type_::tests::compile_module_with_opts};
 
-    fn lower(src: &str) -> native_ir::Module {
+    pub(crate) fn lower(src: &str) -> native_ir::Module {
         let module = compile_module_with_opts(
             "test_module",
             src,
@@ -2875,6 +2997,51 @@ pub fn main() {
                 function: "main".into(),
                 line: 3,
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod overlapping_prefix_tests {
+    /// A failed check on a later subject inside a string-prefix branch
+    /// must fall back to the switch's remaining overlapping choices (the
+    /// always-matching `"" <> _` clause here), not to the final
+    /// catch-all: erlang prints 2 for this program, and the naive tree
+    /// printed 3 (found by the differential fuzzer, seeds 2494-5966).
+    #[test]
+    fn dump_utf8_discard() {
+        let module = super::tests::lower(
+            r#"pub fn main() {
+  echo case <<"b":utf8>> {
+    <<_:utf8>> -> 1
+    _ -> 3
+  }
+}
+"#,
+        );
+        println!("{}", serde_json::to_string_pretty(&module).unwrap());
+    }
+
+    #[test]
+    fn failed_second_subject_falls_back_to_empty_prefix() {
+        let module = super::tests::lower(
+            r#"pub fn main() {
+  echo case "res", "constructor" {
+    "res" <> _, "data" <> _ -> 1
+    "" <> _, _ -> 2
+    _, _ -> 3
+  }
+}
+"#,
+        );
+        let rendered = serde_json::to_string(&module).unwrap();
+        // The corrected inner fallback re-tests the empty prefix and runs
+        // clause 2; the buggy tree contained no second empty-prefix check
+        // reachable from the "res" branch.
+        let empty_prefix_checks = rendered.matches(r#""prefix":"""#).count();
+        assert!(
+            empty_prefix_checks >= 2,
+            "expected the empty-prefix check inside the res-branch fallback:\n{rendered}"
         );
     }
 }

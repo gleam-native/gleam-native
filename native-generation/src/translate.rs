@@ -448,9 +448,12 @@ impl<'a, M: Module> Translator<'a, M> {
     /// Second pass: translate and define the body of every Gleam function.
     pub fn define_module(&mut self, module: &native_ir::Module) -> Result<(), String> {
         // Optimized at code-generation time, so cached IR files stay
-        // plain lowerings.
+        // plain lowerings. `GLEAM_NATIVE_NO_SCALAR` bypasses the pass,
+        // for bisecting miscompilation suspects.
         let mut module = module.clone();
-        native_ir::scalar_replace(&mut module);
+        if std::env::var_os("GLEAM_NATIVE_NO_SCALAR").is_none() {
+            native_ir::scalar_replace(&mut module);
+        }
         let module = &module;
         for function in &module.functions {
             let native_ir::Function::Defined {
@@ -2545,6 +2548,12 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             native_ir::Expression::BigInt(bytes) => {
                 // Built once by the literal-init function; every
                 // evaluation is a plain load of the permanent instance.
+                // `GLEAM_NATIVE_NO_INTERN` bypasses interning, for
+                // bisecting miscompilation suspects.
+                if std::env::var_os("GLEAM_NATIVE_NO_INTERN").is_some() {
+                    return self
+                        .construct_from_constant_bytes(bytes, self.runtime.bigint_from_bytes);
+                }
                 self.interned(|slot| InternedLiteral::BigInt {
                     slot,
                     bytes: bytes.clone(),
@@ -2566,6 +2575,10 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                 // evaluation is a plain load of the permanent instance.
                 // In-place float updates skip permanent boxes (their
                 // count word is negative), so sharing stays unobservable.
+                if std::env::var_os("GLEAM_NATIVE_NO_INTERN").is_some() {
+                    let bits = self.builder.ins().iconst(types::I64, value.to_bits() as i64);
+                    return self.box_float_bits(bits);
+                }
                 self.interned(|slot| InternedLiteral::Float {
                     slot,
                     bits: value.to_bits(),
