@@ -3394,13 +3394,33 @@ pub unsafe extern "C" fn gleam_native_echo(
     };
     let rendered = inspect(value);
     // The location is greyed with the same ANSI codes the other targets
-    // use, matching their output exactly.
-    eprint!("\u{1b}[90m{path}:{line}\u{1b}[39m");
-    if message != 0 {
-        eprint!(" {}", string_value(message));
+    // use, matching their output exactly. The whole report is assembled
+    // first and written with a single `write_all`: stderr is unbuffered,
+    // so separate `eprint!` calls would each be their own write syscall —
+    // several per `echo` — which dominated echo-heavy programs' runtime.
+    // One write also keeps the report atomic between processes.
+    let mut report = String::with_capacity(rendered.len() + path.len() + 32);
+    report.push_str("\u{1b}[90m");
+    report.push_str(path);
+    report.push(':');
+    {
+        use std::fmt::Write;
+        let _ = write!(report, "{line}");
     }
-    eprintln!();
-    eprintln!("{rendered}");
+    report.push_str("\u{1b}[39m");
+    if message != 0 {
+        report.push(' ');
+        report.push_str(&string_value(message));
+    }
+    report.push('\n');
+    report.push_str(&rendered);
+    report.push('\n');
+    {
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut handle = stderr.lock();
+        let _ = handle.write_all(report.as_bytes());
+    }
     value
 }
 
