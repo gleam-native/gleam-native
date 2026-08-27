@@ -907,3 +907,520 @@ fn bound_free(value: &Bound, bound: &mut HashSet<String>, sink: &mut dyn FnMut(&
         }
     }
 }
+
+// -- Scalar replacement ------------------------------------------------
+
+/// Replaces `let`-bound constructors whose every later mention is a field
+/// access with one binding per field, so no record is built at all — the
+/// optimization V8 calls scalar replacement, applied here at the IR level
+/// before code generation. Conservative by construction: a candidate is
+/// dropped if its name is ever re-bound anywhere in the rest of its
+/// sequence (so rewriting needs no scope tracking), or if any mention is
+/// anything but a field access. Field bindings are named `name@index`,
+/// which no source-level identifier can collide with.
+pub fn scalar_replace(module: &mut Module) {
+    for function in &mut module.functions {
+        if let Function::Defined { body, .. } = function {
+            scalar_replace_statements(body);
+        }
+    }
+}
+
+fn scalar_replace_statements(statements: &mut Vec<Statement>) {
+    // Inner sequences first, so a nested candidate does not hide behind
+    // an outer rewrite (and vice versa the outer pass sees final shapes).
+    for statement in statements.iter_mut() {
+        match statement {
+            Statement::Let { value, .. } => scalar_replace_expression(value),
+            Statement::Expression { expression, .. } => scalar_replace_expression(expression),
+            Statement::Destructure {
+                subject,
+                tree,
+                on_failure,
+                ..
+            } => {
+                scalar_replace_expression(subject);
+                scalar_replace_decision(tree);
+                if let Some(failure) = on_failure
+                    && let Some(message) = &mut failure.message
+                {
+                    scalar_replace_expression(message);
+                }
+            }
+        }
+    }
+
+    let mut index = 0;
+    while index < statements.len() {
+        let candidate = match &statements[index] {
+            Statement::Let {
+                name,
+                value: Expression::Constructor { arguments, .. },
+                ..
+            } if !arguments.is_empty()
+                && !region_binds(&statements[index + 1..], name)
+                && uses_are_field_accesses(
+                    &statements[index + 1..],
+                    name,
+                    arguments.len() as u32,
+                ) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        };
+        let Some(name) = candidate else {
+            index += 1;
+            continue;
+        };
+        let Statement::Let {
+            value: Expression::Constructor { arguments, .. },
+            line,
+            ..
+        } = statements.remove(index)
+        else {
+            unreachable!("candidate shape checked above");
+        };
+        let arity = arguments.len() as u32;
+        for (offset, argument) in arguments.into_iter().enumerate() {
+            statements.insert(
+                index + offset,
+                Statement::Let {
+                    name: format!("{name}@{offset}"),
+                    value: argument,
+                    line,
+                },
+            );
+        }
+        let after = index + arity as usize;
+        rewrite_field_accesses(&mut statements[after..], &name, arity);
+        // The freshly inserted field bindings may themselves be
+        // constructors with field-access-only uses (nested tuples), so
+        // the scan resumes at the first of them rather than after.
+    }
+}
+
+fn scalar_replace_expression(expression: &mut Expression) {
+    visit_expression(expression, &mut |inner| {
+        match inner {
+            Expression::Block(statements) | Expression::Lambda { body: statements, .. } => {
+                scalar_replace_statements(statements);
+                false
+            }
+            Expression::Case { subjects, tree, .. } => {
+                for subject in subjects {
+                    scalar_replace_expression(subject);
+                }
+                scalar_replace_decision(tree);
+                false
+            }
+            _ => true,
+        }
+    });
+}
+
+fn scalar_replace_decision(decision: &mut Decision) {
+    match decision {
+        Decision::Run { body, .. } => scalar_replace_statements(body),
+        Decision::Switch {
+            choices, fallback, ..
+        } => {
+            for (_, choice) in choices {
+                scalar_replace_decision(choice);
+            }
+            scalar_replace_decision(fallback);
+        }
+        Decision::Guard {
+            guard,
+            if_true,
+            if_false,
+            ..
+        } => {
+            scalar_replace_expression(guard);
+            scalar_replace_statements(if_true);
+            scalar_replace_decision(if_false);
+        }
+        Decision::Fail => {}
+    }
+}
+
+/// Whether any construct in these statements (or anything nested in them)
+/// binds `name`: a `let`, a lambda parameter, a pattern or guard binding,
+/// or a materialized bit segment read.
+fn region_binds(statements: &[Statement], name: &str) -> bool {
+    statements.iter().any(|statement| match statement {
+        Statement::Let {
+            name: bound,
+            value,
+            ..
+        } => bound == name || expression_binds(value, name),
+        Statement::Expression { expression, .. } => expression_binds(expression, name),
+        Statement::Destructure {
+            subject,
+            tree,
+            on_failure,
+            ..
+        } => {
+            expression_binds(subject, name)
+                || decision_binds(tree, name)
+                || on_failure.as_ref().is_some_and(|failure| {
+                    failure
+                        .message
+                        .as_ref()
+                        .is_some_and(|message| expression_binds(message, name))
+                })
+        }
+    })
+}
+
+fn expression_binds(expression: &Expression, name: &str) -> bool {
+    let mut found = false;
+    // The visitor takes `&mut` for the rewriter's sake; this check only
+    // reads.
+    let mut expression = expression.clone();
+    visit_expression(&mut expression, &mut |inner| {
+        if found {
+            return false;
+        }
+        match inner {
+            Expression::Block(statements) => {
+                found |= region_binds(statements, name);
+                false
+            }
+            Expression::Lambda { parameters, body } => {
+                found |= parameters.iter().any(|parameter| parameter == name)
+                    || region_binds(body, name);
+                false
+            }
+            Expression::Case { subjects, tree, .. } => {
+                found |= subjects
+                    .iter()
+                    .any(|subject| expression_binds(subject, name))
+                    || decision_binds(tree, name);
+                false
+            }
+            _ => true,
+        }
+    });
+    found
+}
+
+fn decision_binds(decision: &Decision, name: &str) -> bool {
+    let bindings_bind = |bindings: &[(String, Bound)]| {
+        bindings.iter().any(|(bound_name, bound)| {
+            bound_name == name
+                || match bound {
+                    Bound::Value(expression) => expression_binds(expression, name),
+                    Bound::Variable(_) | Bound::StringSlice { .. } => false,
+                    Bound::BitsReadInt { offset, bits, .. }
+                    | Bound::BitsReadFloat { offset, bits, .. } => {
+                        expression_binds(offset, name) || expression_binds(bits, name)
+                    }
+                    Bound::BitsSlice { offset, bits, .. } => {
+                        expression_binds(offset, name)
+                            || bits.as_ref().is_some_and(|bits| expression_binds(bits, name))
+                    }
+                }
+        })
+    };
+    match decision {
+        Decision::Run { bindings, body } => bindings_bind(bindings) || region_binds(body, name),
+        Decision::Switch {
+            choices, fallback, ..
+        } => {
+            choices.iter().any(|(check, choice)| {
+                check_binds(check, name) || decision_binds(choice, name)
+            }) || decision_binds(fallback, name)
+        }
+        Decision::Guard {
+            bindings,
+            guard,
+            if_true,
+            if_false,
+        } => {
+            bindings_bind(bindings)
+                || expression_binds(guard, name)
+                || region_binds(if_true, name)
+                || decision_binds(if_false, name)
+        }
+        Decision::Fail => false,
+    }
+}
+
+fn check_binds(check: &Check, name: &str) -> bool {
+    match check {
+        Check::BitArray { reads, .. } => reads.iter().any(|read| read.name == name),
+        Check::Int(_)
+        | Check::BigInt(_)
+        | Check::Float(_)
+        | Check::String(_)
+        | Check::Bool(_)
+        | Check::Nil
+        | Check::EmptyList
+        | Check::Variant { .. }
+        | Check::Always { .. }
+        | Check::NonEmptyList { .. }
+        | Check::StringPrefix { .. } => false,
+    }
+}
+
+/// Whether every mention of `name` in these statements is a field access
+/// with an index inside the arity. Assumes `name` is not re-bound in the
+/// region ([`region_binds`] is checked first).
+fn uses_are_field_accesses(statements: &[Statement], name: &str, arity: u32) -> bool {
+    let mut ok = true;
+    // Cloning to reuse the mutable walker; this check only reads.
+    let mut statements = statements.to_vec();
+    visit_statements(&mut statements, &mut |expression| {
+        if !ok {
+            return false;
+        }
+        match expression {
+            Expression::FieldAccess { record, index } => {
+                if let Expression::Variable(mentioned) = record.as_ref()
+                    && mentioned == name
+                {
+                    ok &= *index < arity;
+                    return false;
+                }
+                true
+            }
+            Expression::Variable(mentioned) => {
+                if mentioned == name {
+                    ok = false;
+                }
+                false
+            }
+            _ => true,
+        }
+    });
+    ok
+}
+
+/// Replaces every `name.index` with the variable `name@index`. Assumes
+/// [`uses_are_field_accesses`] held, so no other mention exists.
+fn rewrite_field_accesses(statements: &mut [Statement], name: &str, arity: u32) {
+    visit_statements(statements, &mut |expression| {
+        if let Expression::FieldAccess { record, index } = expression
+            && let Expression::Variable(mentioned) = record.as_ref()
+            && mentioned == name
+        {
+            debug_assert!(*index < arity);
+            *expression = Expression::Variable(format!("{name}@{index}"));
+            return false;
+        }
+        true
+    });
+}
+
+/// Calls `visit` on every expression in the statements, recursively —
+/// decision trees, bindings, bit segments, and failure messages included.
+/// The visitor returns whether to descend into the expression's children.
+fn visit_statements(statements: &mut [Statement], visit: &mut dyn FnMut(&mut Expression) -> bool) {
+    for statement in statements {
+        match statement {
+            Statement::Let { value, .. } => visit_expression(value, visit),
+            Statement::Expression { expression, .. } => visit_expression(expression, visit),
+            Statement::Destructure {
+                subject,
+                tree,
+                on_failure,
+                ..
+            } => {
+                visit_expression(subject, visit);
+                visit_decision(tree, visit);
+                if let Some(failure) = on_failure
+                    && let Some(message) = &mut failure.message
+                {
+                    visit_expression(message, visit);
+                }
+            }
+        }
+    }
+}
+
+fn visit_expression(expression: &mut Expression, visit: &mut dyn FnMut(&mut Expression) -> bool) {
+    if !visit(expression) {
+        return;
+    }
+    match expression {
+        Expression::Int(_)
+        | Expression::BigInt(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Nil
+        | Expression::Bool(_)
+        | Expression::Variable(_)
+        | Expression::EmptyList
+        | Expression::FunctionReference { .. } => {}
+        Expression::Block(statements) | Expression::Lambda { body: statements, .. } => {
+            visit_statements(statements, visit)
+        }
+        Expression::Call { arguments, .. } | Expression::Constructor { arguments, .. } => {
+            for argument in arguments {
+                visit_expression(argument, visit);
+            }
+        }
+        Expression::CallValue { callee, arguments } => {
+            visit_expression(callee, visit);
+            for argument in arguments {
+                visit_expression(argument, visit);
+            }
+        }
+        Expression::IntBinary { left, right, .. }
+        | Expression::IntCompare { left, right, .. }
+        | Expression::FloatBinary { left, right, .. }
+        | Expression::FloatCompare { left, right, .. }
+        | Expression::Equality { left, right, .. }
+        | Expression::StringConcat(left, right) => {
+            visit_expression(left, visit);
+            visit_expression(right, visit);
+        }
+        Expression::BoolBinary { left, right, .. } => {
+            visit_expression(left, visit);
+            visit_expression(right, visit);
+        }
+        Expression::BoolNot(inner) => visit_expression(inner, visit),
+        Expression::FieldAccess { record, .. } => visit_expression(record, visit),
+        Expression::Case { subjects, tree, .. } => {
+            for subject in subjects {
+                visit_expression(subject, visit);
+            }
+            visit_decision(tree, visit);
+        }
+        Expression::List { elements, tail } => {
+            for element in elements {
+                visit_expression(element, visit);
+            }
+            if let Some(tail) = tail {
+                visit_expression(tail, visit);
+            }
+        }
+        Expression::BitArray(segments) => {
+            for segment in segments {
+                visit_expression(&mut segment.value, visit);
+                match &mut segment.kind {
+                    BitSegmentKind::Int { bits, .. } | BitSegmentKind::Float { bits, .. } => {
+                        visit_expression(bits, visit)
+                    }
+                    BitSegmentKind::BitArraySplice { bits } => {
+                        if let Some(bits) = bits {
+                            visit_expression(bits, visit);
+                        }
+                    }
+                    BitSegmentKind::String { .. } | BitSegmentKind::Codepoint { .. } => {}
+                }
+            }
+        }
+        Expression::Echo { value, message, .. } => {
+            visit_expression(value, visit);
+            if let Some(message) = message {
+                visit_expression(message, visit);
+            }
+        }
+        Expression::Panic { message, .. } => {
+            if let Some(message) = message {
+                visit_expression(message, visit);
+            }
+        }
+    }
+}
+
+fn visit_decision(decision: &mut Decision, visit: &mut dyn FnMut(&mut Expression) -> bool) {
+    let visit_bindings = |bindings: &mut Vec<(String, Bound)>,
+                          visit: &mut dyn FnMut(&mut Expression) -> bool| {
+        for (_, bound) in bindings {
+            match bound {
+                Bound::Value(expression) => visit_expression(expression, visit),
+                Bound::Variable(_) | Bound::StringSlice { .. } => {}
+                Bound::BitsReadInt { offset, bits, .. }
+                | Bound::BitsReadFloat { offset, bits, .. } => {
+                    visit_expression(offset, visit);
+                    visit_expression(bits, visit);
+                }
+                Bound::BitsSlice { offset, bits, .. } => {
+                    visit_expression(offset, visit);
+                    if let Some(bits) = bits {
+                        visit_expression(bits, visit);
+                    }
+                }
+            }
+        }
+    };
+    match decision {
+        Decision::Run { bindings, body } => {
+            visit_bindings(bindings, visit);
+            visit_statements(body, visit);
+        }
+        Decision::Switch {
+            choices, fallback, ..
+        } => {
+            for (check, choice) in choices {
+                visit_check(check, visit);
+                visit_decision(choice, visit);
+            }
+            visit_decision(fallback, visit);
+        }
+        Decision::Guard {
+            bindings,
+            guard,
+            if_true,
+            if_false,
+        } => {
+            visit_bindings(bindings, visit);
+            visit_expression(guard, visit);
+            visit_statements(if_true, visit);
+            visit_decision(if_false, visit);
+        }
+        Decision::Fail => {}
+    }
+}
+
+fn visit_check(check: &mut Check, visit: &mut dyn FnMut(&mut Expression) -> bool) {
+    match check {
+        Check::BitArray { reads, test } => {
+            for read in reads {
+                visit_expression(&mut read.offset, visit);
+                visit_expression(&mut read.bits, visit);
+            }
+            visit_bits_test(test, visit);
+        }
+        Check::Int(_)
+        | Check::BigInt(_)
+        | Check::Float(_)
+        | Check::String(_)
+        | Check::Bool(_)
+        | Check::Nil
+        | Check::EmptyList
+        | Check::Variant { .. }
+        | Check::Always { .. }
+        | Check::NonEmptyList { .. }
+        | Check::StringPrefix { .. } => {}
+    }
+}
+
+fn visit_bits_test(test: &mut BitsTest, visit: &mut dyn FnMut(&mut Expression) -> bool) {
+    match test {
+        BitsTest::Size { bits, .. } => visit_expression(bits, visit),
+        BitsTest::NonNegative { value } => visit_expression(value, visit),
+        BitsTest::Bytes { offset, .. } | BitsTest::RestIsBytes { offset } => {
+            visit_expression(offset, visit)
+        }
+        BitsTest::IsFiniteFloat { offset, bits, .. }
+        | BitsTest::FloatEquals { offset, bits, .. } => {
+            visit_expression(offset, visit);
+            visit_expression(bits, visit);
+        }
+        BitsTest::IntEquals {
+            offset,
+            bits,
+            value,
+            ..
+        } => {
+            visit_expression(offset, visit);
+            visit_expression(bits, visit);
+            visit_expression(value, visit);
+        }
+        BitsTest::AlwaysTrue => {}
+    }
+}

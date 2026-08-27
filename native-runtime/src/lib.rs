@@ -2121,7 +2121,7 @@ pub const POOL_CLASSES: usize = 35;
 /// The most blocks a size class retains. Frees beyond this go back to the
 /// system allocator, bounding how much freed memory the pool can hold onto
 /// after a large working set shrinks.
-const POOL_CLASS_CAPACITY: u64 = 4096;
+pub const POOL_CLASS_CAPACITY: u64 = 4096;
 
 /// The per-execution context generated code reaches through its hidden
 /// leading `env` parameter: every tail-convention function receives a

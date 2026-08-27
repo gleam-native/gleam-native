@@ -10,3 +10,7 @@ node_modules/
 compiler-cli/build/
 gleam-licences.html
 test-fuzz/failures/
+test-fuzz/bench-results.json
+fuzzing-cli/bench-results.json
+fuzzing-cli/corpus/
+fuzzing-cli/artifacts/

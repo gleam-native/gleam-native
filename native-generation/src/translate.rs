@@ -445,6 +445,11 @@ impl<'a, M: Module> Translator<'a, M> {
 
     /// Second pass: translate and define the body of every Gleam function.
     pub fn define_module(&mut self, module: &native_ir::Module) -> Result<(), String> {
+        // Optimized at code-generation time, so cached IR files stay
+        // plain lowerings.
+        let mut module = module.clone();
+        native_ir::scalar_replace(&mut module);
+        let module = &module;
         for function in &module.functions {
             let native_ir::Function::Defined {
                 name,
@@ -606,18 +611,18 @@ impl<'a, M: Module> Translator<'a, M> {
             // this wrapper owns — minus any argument the external consumes.
             let call = builder.ins().call(target_ref, &arguments);
             let result = builder.inst_results(call)[0];
-            emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
+            emit_dec(self.module, self.runtime.destroy, &mut builder, env, closure);
             let consumed = self.consuming.get(&target).copied().unwrap_or(&[]);
             for (index, argument) in arguments.iter().enumerate() {
                 if !consumed.contains(&index) {
-                    emit_dec(self.module, self.runtime.destroy, &mut builder, *argument);
+                    emit_dec(self.module, self.runtime.destroy, &mut builder, env, *argument);
                 }
             }
             builder.ins().return_(&[result]);
         } else {
             // Gleam functions own their arguments: release the closure and
             // transfer the rest (with the env) as a genuine tail call.
-            emit_dec(self.module, self.runtime.destroy, &mut builder, closure);
+            emit_dec(self.module, self.runtime.destroy, &mut builder, env, closure);
             let mut values = vec![env];
             values.extend(&arguments);
             builder.ins().return_call(target_ref, &values);
@@ -1270,12 +1275,16 @@ fn emit_inc(builder: &mut FunctionBuilder<'_>, value: Value) {
 
 /// Emits an inline reference count decrement: nothing for immediates and
 /// permanent objects (count word sign bit set), one subtracted from the
-/// count word for ordinary heap values, and a cold runtime destroy call
-/// when the count reaches zero.
+/// count word for ordinary heap values, and — when the count reaches
+/// zero — an inline pool push for a dead float box (the common garbage of
+/// arithmetic-heavy code, and the one heap kind with no children and no
+/// payload drop), with a cold runtime destroy call for everything else.
+/// `env` is the context pointer carrying the running worker's pool.
 fn emit_dec<M: Module>(
     module: &mut M,
     destroy: FuncId,
     builder: &mut FunctionBuilder<'_>,
+    env: Value,
     value: Value,
 ) {
     let heap = builder.create_block();
@@ -1332,6 +1341,66 @@ fn emit_dec<M: Module>(
     builder.set_cold_block(dead);
 
     builder.switch_to_block(dead);
+    let float_free = builder.create_block();
+    let fallback = builder.create_block();
+    // A dead float box frees inline: no children to release, no payload
+    // to drop, and its size class is a compile-time constant. The header
+    // of a float is exactly `KIND_FLOAT` (floats carry no tag, arity, or
+    // display bits), so one word comparison decides.
+    let header = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), value, 0);
+    let is_float = builder.ins().icmp_imm(
+        IntCC::Equal,
+        header,
+        native_runtime::KIND_FLOAT as i64,
+    );
+    builder.ins().brif(is_float, float_free, &[], fallback, &[]);
+    builder.seal_block(float_free);
+
+    builder.switch_to_block(float_free);
+    // Push the block onto the pool's size-class list, mirroring the
+    // runtime's `free_words_in`: the count word becomes the next-free
+    // link. Beyond the class capacity the runtime path returns the
+    // memory to the system allocator instead.
+    const FLOAT_TOTAL: usize = 3;
+    let head_offset = (8 * FLOAT_TOTAL) as i32;
+    let blocks_offset = (8 * (native_runtime::POOL_CLASSES + FLOAT_TOTAL)) as i32;
+    let pool = builder.ins().load(
+        types::I64,
+        MemFlagsData::trusted(),
+        env,
+        CONTEXT_POOL_OFFSET,
+    );
+    let blocks = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), pool, blocks_offset);
+    let full = builder.ins().icmp_imm(
+        IntCC::SignedGreaterThanOrEqual,
+        blocks,
+        native_runtime::POOL_CLASS_CAPACITY as i64,
+    );
+    let push = builder.create_block();
+    builder.ins().brif(full, fallback, &[], push, &[]);
+    builder.seal_block(push);
+    builder.seal_block(fallback);
+
+    builder.switch_to_block(push);
+    let base = builder.ins().iadd_imm_s(value, -8);
+    let next = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), pool, head_offset);
+    let _ = builder.ins().store(MemFlagsData::trusted(), next, base, 0);
+    let _ = builder
+        .ins()
+        .store(MemFlagsData::trusted(), base, pool, head_offset);
+    let incremented = builder.ins().iadd_imm_s(blocks, 1);
+    let _ = builder
+        .ins()
+        .store(MemFlagsData::trusted(), incremented, pool, blocks_offset);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(fallback);
     let destroy_ref = module.declare_func_in_func(destroy, builder.func);
     let _ = builder.ins().call(destroy_ref, &[value]);
     builder.ins().jump(done, &[]);
@@ -1724,7 +1793,7 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             let _ = self.runtime_call("gleam_native_dec", &[value]);
             return;
         }
-        emit_dec(self.module, self.runtime.destroy, self.builder, value);
+        emit_dec(self.module, self.runtime.destroy, self.builder, self.env, value);
     }
 
     /// Emits a call to a named C-convention runtime function; used by the
@@ -3115,10 +3184,63 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
                         self.builder.ins().select(divisor_is_zero, zero, quotient)
                     }
                 };
-                let result = self.box_float(result)?;
-                self.release_read(left_boxed, left_borrowed);
-                self.release_read(right_boxed, right_borrowed);
-                Ok(result)
+                let bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), result);
+                // An owned operand whose box this operation is the sole
+                // owner of (count exactly one — shared, permanent, and
+                // atomic boxes all fail that test) is updated in place
+                // instead of being freed while a fresh box is allocated:
+                // float arithmetic chains then run allocation-free. The
+                // checked-RC build keeps the plain path so the runtime's
+                // bookkeeping sees every allocation.
+                let reuse = if debug_rc() {
+                    None
+                } else if !left_borrowed {
+                    Some((left_boxed, right_boxed, right_borrowed))
+                } else if !right_borrowed {
+                    Some((right_boxed, left_boxed, left_borrowed))
+                } else {
+                    None
+                };
+                match reuse {
+                    None => {
+                        let result = self.box_float_bits(bits)?;
+                        self.release_read(left_boxed, left_borrowed);
+                        self.release_read(right_boxed, right_borrowed);
+                        Ok(result)
+                    }
+                    Some((own, other, other_borrowed)) => {
+                        let in_place = self.builder.create_block();
+                        let fresh = self.builder.create_block();
+                        let join = self.builder.create_block();
+                        self.builder.append_block_param(join, types::I64);
+                        let count =
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlagsData::trusted(), own, -8);
+                        let unique = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
+                        self.builder.ins().brif(unique, in_place, &[], fresh, &[]);
+                        self.builder.seal_block(in_place);
+                        self.builder.seal_block(fresh);
+
+                        self.builder.switch_to_block(in_place);
+                        let _ = self.builder.ins().store(MemFlagsData::trusted(), bits, own, 8);
+                        self.builder.ins().jump(join, &[own.into()]);
+
+                        self.builder.switch_to_block(fresh);
+                        let boxed = self.box_float_bits(bits)?;
+                        self.dec(own);
+                        self.builder.ins().jump(join, &[boxed.into()]);
+                        self.builder.seal_block(join);
+
+                        self.builder.switch_to_block(join);
+                        let result = self.builder.block_params(join)[0];
+                        self.release_read(other, other_borrowed);
+                        Ok(result)
+                    }
+                }
             }
 
             native_ir::Expression::FloatCompare {
@@ -3946,6 +4068,11 @@ impl<M: Module> FunctionTranslator<'_, '_, M> {
             .builder
             .ins()
             .bitcast(types::I64, MemFlagsData::new(), value);
+        self.box_float_bits(bits)
+    }
+
+    /// [`Self::box_float`] for a payload already bitcast to an i64.
+    fn box_float_bits(&mut self, bits: Value) -> Result<Value, String> {
         let boxed = self.pool_alloc(2, native_runtime::KIND_FLOAT, |this| {
             let from_bits_ref = this
                 .module
