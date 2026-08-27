@@ -1,0 +1,3 @@
+nodejs: erlang exit 101 vs exit 0
+native: erlang exit 101 vs exit 1
+checked: erlang exit 101 vs exit 1

@@ -1,0 +1,114 @@
+  Compiling fuzzing_case
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:16:11
+   │
+16 │ fn static(delete: #(String, String)) -> Float {
+   │           ^^^^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_delete`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:24:7
+   │
+24 │       item -> {
+   │       ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_item`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:29:7
+   │
+29 │       rest -> 0.1
+   │       ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_rest`.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:29:7
+   │
+29 │       rest -> 0.1
+   │       ^^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:31:19
+   │
+31 │     <<_:utf8>> as whole -> 1.0
+   │                   ^^^^^ This variable is never used
+
+Hint: You can safely remove it.
+
+warning: Unused private function
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:36:1
+   │
+36 │ fn default(v5: Int, z: String) -> Bool {
+   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:36:12
+   │
+36 │ fn default(v5: Int, z: String) -> Bool {
+   │            ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v5`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:36:21
+   │
+36 │ fn default(v5: Int, z: String) -> Bool {
+   │                     ^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_z`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:42:11
+   │
+42 │       let pi_value = []
+   │           ^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_pi_value`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:43:11
+   │
+43 │       let n = limit_value
+   │           ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_n`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:48:8
+   │
+48 │     _, v6 -> fn(v7, v8) { #("", "abc") }(True, "b")
+   │        ^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v6`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:48:17
+   │
+48 │     _, v6 -> fn(v7, v8) { #("", "abc") }(True, "b")
+   │                 ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v7`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpJ8U3sc/src/main.gleam:48:21
+   │
+48 │     _, v6 -> fn(v7, v8) { #("", "abc") }(True, "b")
+   │                     ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v8`.
+
+   Compiled in 0.00s
+    Running main.main
+[90msrc/main.gleam:41[39m
+3.14
+[90msrc/main.gleam:50[39m
+0

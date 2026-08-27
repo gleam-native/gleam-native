@@ -1,0 +1,165 @@
+warning: Unused private function
+  ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:5:1
+  │
+5 │ fn spin(n: Int, acc: Int) -> Int {
+  │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused private function
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:12:1
+   │
+12 │ fn constructor(n: Int) -> List(Int) {
+   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:12:16
+   │
+12 │ fn constructor(n: Int) -> List(Int) {
+   │                ^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_n`.
+
+warning: Unused private function
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:16:1
+   │
+16 │ fn f1(v0: String) -> Bool {
+   │ ^^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:16:7
+   │
+16 │ fn f1(v0: String) -> Bool {
+   │       ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v0`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:17:4
+   │
+17 │ fn(v1, v2) { !{
+   │    ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v1`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:17:8
+   │
+17 │ fn(v1, v2) { !{
+   │        ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v2`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:18:8
+   │
+18 │     fn(v3, v4) { True }(4, "constructor")
+   │        ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v3`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:18:12
+   │
+18 │     fn(v3, v4) { True }(4, "constructor")
+   │            ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v4`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:30:13
+   │
+30 │         let tag_value = []
+   │             ^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_tag_value`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:31:13
+   │
+31 │         let pi_value = euler_value
+   │             ^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_pi_value`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:40:24
+   │
+40 │     let pair = case fn(v5, v6) { "a" }("x", True) {
+   │                        ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v5`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:40:28
+   │
+40 │     let pair = case fn(v5, v6) { "a" }("x", True) {
+   │                            ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v6`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:42:7
+   │
+42 │       a -> fn(v7) { [] }(2.0)
+   │       ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_a`.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:42:7
+   │
+42 │       a -> fn(v7) { [] }(2.0)
+   │       ^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:42:15
+   │
+42 │       a -> fn(v7) { [] }(2.0)
+   │               ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v7`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:44:9
+   │
+44 │     let l = {
+   │         ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_l`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:46:13
+   │
+46 │         let pair = tag_value
+   │             ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_pair`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpGetDPm/src/main.gleam:53:9
+   │
+53 │     let constructor = 10
+   │         ^^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_constructor`.
+
+   Compiled in 0.00s
+    Running main.main
+[90msrc/main.gleam:23[39m
+False
+[90msrc/main.gleam:38[39m
+"constructor"
+[90msrc/main.gleam:39[39m
+"constructor"
+[90msrc/main.gleam:52[39m
+100.0

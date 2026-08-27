@@ -1,0 +1,223 @@
+  Resolving versions
+  Compiling fuzzing_case
+warning: Unused private function
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:12:1
+   │
+12 │ fn class(y: Int) -> Bool {
+   │ ^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:12:10
+   │
+12 │ fn class(y: Int) -> Bool {
+   │          ^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_y`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:13:4
+   │
+13 │ fn(v1, v2) { False }(False, 0.5)
+   │    ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v1`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:13:8
+   │
+13 │ fn(v1, v2) { False }(False, 0.5)
+   │        ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v2`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:16:7
+   │
+16 │ fn f1(acc: List(Int), item: Int, v3: Int) -> String {
+   │       ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_acc`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:16:23
+   │
+16 │ fn f1(acc: List(Int), item: Int, v3: Int) -> String {
+   │                       ^^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_item`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:16:34
+   │
+16 │ fn f1(acc: List(Int), item: Int, v3: Int) -> String {
+   │                                  ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v3`.
+
+warning: Unused private function
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:20:1
+   │
+20 │ fn constructor(x: String, v4: Int) -> Bool {
+   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:20:16
+   │
+20 │ fn constructor(x: String, v4: Int) -> Bool {
+   │                ^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_x`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:20:27
+   │
+20 │ fn constructor(x: String, v4: Int) -> Bool {
+   │                           ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v4`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:21:4
+   │
+21 │ fn(v5) { True }("x")
+   │    ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v5`.
+
+warning: Redundant comparison
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:27:7
+   │
+27 │       "res" != "res"
+   │       ^^^^^^^^^^^^^^ This is always `False`
+
+This comparison is redundant since it always fails.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:30:8
+   │
+30 │     fn(v6, v7) { True }("a", True)
+   │        ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v6`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:30:12
+   │
+30 │     fn(v6, v7) { True }("a", True)
+   │            ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v7`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:34:37
+   │
+34 │     <<this_:16, _:utf8>> -> case fn(v8, v9) { [1] }(0.25, 42) {
+   │                                     ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v8`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:34:41
+   │
+34 │     <<this_:16, _:utf8>> -> case fn(v8, v9) { [1] }(0.25, 42) {
+   │                                         ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v9`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:36:13
+   │
+36 │         let constructor = True
+   │             ^^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_constructor`.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:41:7
+   │
+41 │       [] -> [] |> walk(7)
+   │       ^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:42:15
+   │
+42 │       _ -> fn(v10) { this_ }("x")
+   │               ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v10`.
+
+warning: Redundant list
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:44:24
+   │
+44 │     <<_:utf8>> -> case [2, 4] {
+   │                        ^^^^^^ You can remove this list wrapper
+
+Instead of building a list and matching on it, you can match on its
+contents directly.
+A case expression can take multiple subjects separated by commas like this:
+
+    case one_subject, another_subject {
+      _, _ -> todo
+    }
+
+See: https://tour.gleam.run/flow-control/multiple-subjects/
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:46:11
+   │
+46 │       [x, constructor, ..] -> fn(v11) { x }("")
+   │           ^^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_constructor`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:46:34
+   │
+46 │       [x, constructor, ..] -> fn(v11) { x }("")
+   │                                  ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v11`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:50:5
+   │
+50 │     v12 -> 1
+   │     ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v12`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:57:9
+   │
+57 │     let this_ = "ab"
+   │         ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_this_`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmphsGjM4/src/main.gleam:58:9
+   │
+58 │     let this_ = True
+   │         ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_this_`.
+
+   Compiled in 0.20s
+    Running main.main
+[90msrc/main.gleam:25[39m
+True
+[90msrc/main.gleam:32[39m
+[]
+[90msrc/main.gleam:33[39m
+1
+[90msrc/main.gleam:52[39m
+"aaxconstructorx"

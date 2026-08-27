@@ -1,0 +1,524 @@
+warning: Unused function argument
+  ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:9:7
+  │
+9 │ fn f0(v4: Bool, acc: Bool, class: Int) -> List(Int) {
+  │       ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v4`.
+
+warning: Match on a literal value
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:10:6
+   │
+10 │ case 0, "bc" <> "x" {
+   │      ^ There's no need to pattern match on this value
+
+Matching on a literal value is redundant since you can already tell which
+branch is going to match with this value.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:12:13
+   │
+12 │         let v4 = class
+   │             ^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v4`.
+
+warning: Redundant list
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:14:10
+   │
+14 │       }, [7, 4] {
+   │          ^^^^^^ You can remove this list wrapper
+
+Instead of building a list and matching on it, you can match on its
+contents directly.
+A case expression can take multiple subjects separated by commas like this:
+
+    case one_subject, another_subject {
+      _, _ -> todo
+    }
+
+See: https://tour.gleam.run/flow-control/multiple-subjects/
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:15:14
+   │
+15 │       [2] as whole, [5] -> [3]
+   │              ^^^^^ This variable is never used
+
+Hint: You can safely remove it.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:16:25
+   │
+16 │       [6, b, ..], [_, ..rest] if b > 5 -> fn(v5, v6) { [] }("abc", 3.14)
+   │                         ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_rest`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:16:46
+   │
+16 │       [6, b, ..], [_, ..rest] if b > 5 -> fn(v5, v6) { [] }("abc", 3.14)
+   │                                              ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v5`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:16:50
+   │
+16 │       [6, b, ..], [_, ..rest] if b > 5 -> fn(v5, v6) { [] }("abc", 3.14)
+   │                                                  ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v6`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:17:8
+   │
+17 │       [b, 5, ..], [8, ..rest] -> [7, 0]
+   │        ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_b`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:17:25
+   │
+17 │       [b, 5, ..], [8, ..rest] -> [7, 0]
+   │                         ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_rest`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:22:13
+   │
+22 │         let default = acc
+   │             ^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_default`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:23:13
+   │
+23 │         let acc = []
+   │             ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_acc`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:26:11
+   │
+26 │       let rest = 0
+   │           ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_rest`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:28:13
+   │
+28 │         let v = class
+   │             ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:29:13
+   │
+29 │         let m = class
+   │             ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_m`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:33:25
+   │
+33 │     _, "constructor" <> rest -> {
+   │                         ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_rest`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:34:11
+   │
+34 │       let z = acc
+   │           ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_z`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:35:11
+   │
+35 │       let acc = "res"
+   │           ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_acc`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:38:8
+   │
+38 │     _, v7 -> {
+   │        ^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v7`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:39:11
+   │
+39 │       let m = {
+   │           ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_m`.
+
+warning: Unused private function
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:49:1
+   │
+49 │ fn export(v8: Bool, v9: Int) -> Int {
+   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:49:11
+   │
+49 │ fn export(v8: Bool, v9: Int) -> Int {
+   │           ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v8`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:49:21
+   │
+49 │ fn export(v8: Bool, v9: Int) -> Int {
+   │                     ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v9`.
+
+warning: Redundant tuple
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:54:26
+   │
+54 │ case m <> "constructor", #(False, 2.0) {
+   │                          ^^^^^^^^^^^^^ You can remove this tuple wrapper
+
+Instead of building a tuple and matching on it, you can match on its
+contents directly.
+A case expression can take multiple subjects separated by commas like this:
+
+    case one_subject, another_subject {
+      _, _ -> todo
+    }
+
+See: https://tour.gleam.run/flow-control/multiple-subjects/
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:55:5
+   │
+55 │     "data", #(True, 1.0) -> []
+   │     ^^^^^^^^^^^^^^^^^^^^
+
+This pattern cannot be reached as it matches on a variant of a type which
+is never present.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:61:8
+   │
+61 │     _, v11 -> case 42 + 10, {
+   │        ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v11`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:68:13
+   │
+68 │         let constructor = False
+   │             ^^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_constructor`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:69:13
+   │
+69 │         let class = v10
+   │             ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_class`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:72:10
+   │
+72 │       3, m -> [7, 4]
+   │          ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_m`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:74:13
+   │
+74 │         let self_ = 3
+   │             ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_self_`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:82:28
+   │
+82 │   let seed_value = case fn(v12, v13) { Cv3([]) }(False, 42), "bc" <> "a" {
+   │                            ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v12`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:82:33
+   │
+82 │   let seed_value = case fn(v12, v13) { Cv3([]) }(False, 42), "bc" <> "a" {
+   │                                 ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v13`.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:83:5
+   │
+83 │     Cv1, delete if delete != "x" || delete != "res" -> {
+   │     ^^^^^^^^^^^
+
+This pattern cannot be reached as it matches on a variant of a type which
+is never present.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:84:11
+   │
+84 │       let seed_value = seed_value
+   │           ^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_seed_value`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:91:9
+   │
+91 │     let seed_value = {
+   │         ^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_seed_value`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:95:13
+   │
+95 │         let seed_value = [3, 42]
+   │             ^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_seed_value`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:96:13
+   │
+96 │         let new = 0.0
+   │             ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_new`.
+
+warning: Unused function argument
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:101:10
+    │
+101 │       fn(v14) { 0.0 }("abc")
+    │          ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v14`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:104:13
+    │
+104 │         let this_ = 100
+    │             ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_this_`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:105:13
+    │
+105 │         let seed_value = "res"
+    │             ^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_seed_value`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:111:11
+    │
+111 │       let seed_value = 10.0
+    │           ^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_seed_value`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:112:11
+    │
+112 │       let seed_value = 5
+    │           ^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_seed_value`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:116:7
+    │
+116 │       b -> seed_value <> seed_value
+    │       ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_b`.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:117:7
+    │
+117 │       pair | "res" <> pair -> seed_value <> pair
+    │       ^^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:117:14
+    │
+117 │       pair | "res" <> pair -> seed_value <> pair
+    │              ^^^^^^^^^^^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:119:5
+    │
+119 │     a -> case Cv1 {
+    │     ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_a`.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:119:5
+    │
+119 │     a -> case Cv1 {
+    │     ^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Match on a literal value
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:119:15
+    │
+119 │     a -> case Cv1 {
+    │               ^^^ There's no need to pattern match on this value
+
+Matching on a literal value is redundant since you can already tell which
+branch is going to match with this value.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:121:13
+    │
+121 │         let class = []
+    │             ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_class`.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:124:7
+    │
+124 │       Cv1 -> fn(v15, v16) { seed_value }(7, 100)
+    │       ^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused function argument
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:124:17
+    │
+124 │       Cv1 -> fn(v15, v16) { seed_value }(7, 100)
+    │                 ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v15`.
+
+warning: Unused function argument
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:124:22
+    │
+124 │       Cv1 -> fn(v15, v16) { seed_value }(7, 100)
+    │                      ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v16`.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:125:7
+    │
+125 │       _ -> {
+    │       ^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:126:13
+    │
+126 │         let a = 0.1
+    │             ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_a`.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:130:5
+    │
+130 │     _ -> "" <> {
+    │     ^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused function argument
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:131:10
+    │
+131 │       fn(v17) { seed_value }(0.1)
+    │          ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v17`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:136:11
+    │
+136 │       let seed_value = fn(v18, v19) { 7 }(True, "bc")
+    │           ^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_seed_value`.
+
+warning: Unused function argument
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:136:27
+    │
+136 │       let seed_value = fn(v18, v19) { 7 }(True, "bc")
+    │                           ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v18`.
+
+warning: Unused function argument
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpTbwckx/src/main.gleam:136:32
+    │
+136 │       let seed_value = fn(v18, v19) { 7 }(True, "bc")
+    │                                ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v19`.
+
+   Compiled in 0.00s
+    Running main.main
+[90msrc/main.gleam:90[39m
+0.0
+runtime error: stack overflow
+
+The program recursed too deeply. Gleam tail calls run in constant stack space, but deeply nested non-tail recursion exhausted the stack.
+
+stacktrace:
+  main.main[90m src/main.gleam:113[0m

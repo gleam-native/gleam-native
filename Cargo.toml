@@ -26,6 +26,8 @@ members = [
   "native-runtime-stdlib",
   "src-span",
   "test-fuzz",
+  "fuzzing-core",
+  "fuzzing-cli",
 ]
 
 # common dependencies

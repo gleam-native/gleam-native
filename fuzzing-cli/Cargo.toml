@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+[package]
+name = "fuzzing-cli"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+fuzzing-core = { path = "../fuzzing-core" }
+gleam-core = { path = "../compiler-core" }
+tempfile = "3"

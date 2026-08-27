@@ -1,0 +1,413 @@
+  Compiling fuzzing_case
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:17:13
+   │
+17 │         let class = rest
+   │             ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_class`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:21:13
+   │
+21 │         let delete = self_
+   │             ^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_delete`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:22:13
+   │
+22 │         let v = 1.0
+   │             ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v`.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:25:7
+   │
+25 │       Cv1 | Cv1 -> 4 % 6
+   │       ^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:25:13
+   │
+25 │       Cv1 | Cv1 -> 4 % 6
+   │             ^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused private function
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:30:1
+   │
+30 │ fn f1(new: #(String, Int), v4: Bool) -> Bool {
+   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ This private function is never used
+
+Hint: You can safely remove it.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:30:7
+   │
+30 │ fn f1(new: #(String, Int), v4: Bool) -> Bool {
+   │       ^^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_new`.
+
+warning: Match on a literal value
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:31:6
+   │
+31 │ case 4 {
+   │      ^ There's no need to pattern match on this value
+
+Matching on a literal value is redundant since you can already tell which
+branch is going to match with this value.
+
+warning: Match on a literal value
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:32:15
+   │
+32 │     5 -> case "x" {
+   │               ^^^ There's no need to pattern match on this value
+
+Matching on a literal value is redundant since you can already tell which
+branch is going to match with this value.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:34:7
+   │
+34 │       b -> fn(v5) { v4 }(42)
+   │       ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_b`.
+
+warning: Unused function argument
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:34:15
+   │
+34 │       b -> fn(v5) { v4 }(42)
+   │               ^^ This argument is never used
+
+Hint: You can ignore it with an underscore: `_v5`.
+
+warning: Match on a literal value
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:36:15
+   │
+36 │     6 -> case "data", Cv3(False) {
+   │               ^^^^^^ There's no need to pattern match on this value
+
+Matching on a literal value is redundant since you can already tell which
+branch is going to match with this value.
+
+warning: Redundant record
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:36:23
+   │
+36 │     6 -> case "data", Cv3(False) {
+   │                       ^^^^^^^^^^ You can remove this record wrapper
+
+Instead of building a record and matching on it, you can match on its
+contents directly.
+A case expression can take multiple subjects separated by commas like this:
+
+    case one_subject, another_subject {
+      _, _ -> todo
+    }
+
+See: https://tour.gleam.run/flow-control/multiple-subjects/
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:37:18
+   │
+37 │       "abc", Cv3(v6) -> {
+   │                  ^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v6`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:38:13
+   │
+38 │         let s = [5]
+   │             ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_s`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:41:15
+   │
+41 │       "bc" as whole, Cv3(False) -> False
+   │               ^^^^^ This variable is never used
+
+Hint: You can safely remove it.
+
+warning: Redundant comparison
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:42:15
+   │
+42 │       _, _ -> "b" == "abc"
+   │               ^^^^^^^^^^^^ This is always `False`
+
+This comparison is redundant since it always fails.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:45:11
+   │
+45 │       let new = "ab"
+   │           ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_new`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:50:13
+   │
+50 │         let new = []
+   │             ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_new`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:55:13
+   │
+55 │         let new = 2.0
+   │             ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_new`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:56:13
+   │
+56 │         let class = [10]
+   │             ^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_class`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:66:11
+   │
+66 │       let default = golden_value
+   │           ^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_default`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:67:11
+   │
+67 │       let n = ""
+   │           ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_n`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:70:8
+   │
+70 │     _, delete -> limit_value
+   │        ^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_delete`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:71:5
+   │
+71 │     m, Cv3(False) -> limit_value +. limit_value
+   │     ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_m`.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:71:5
+   │
+71 │     m, Cv3(False) -> limit_value +. limit_value
+   │     ^^^^^^^^^^^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:75:11
+   │
+75 │       let constructor = 100
+   │           ^^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_constructor`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:78:11
+   │
+78 │     [] as whole -> "constructor"
+   │           ^^^^^ This variable is never used
+
+Hint: You can safely remove it.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:79:6
+   │
+79 │     [x, 0, ..] as whole -> case Cv3(True) {
+   │      ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_x`.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:79:19
+   │
+79 │     [x, 0, ..] as whole -> case Cv3(True) {
+   │                   ^^^^^ This variable is never used
+
+Hint: You can safely remove it.
+
+warning: Redundant record
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:79:33
+   │
+79 │     [x, 0, ..] as whole -> case Cv3(True) {
+   │                                 ^^^^^^^^^ You can remove this record wrapper
+
+Instead of building a record and matching on it, you can match on its
+contents directly.
+A case expression can take multiple subjects separated by commas like this:
+
+    case one_subject, another_subject {
+      _, _ -> todo
+    }
+
+See: https://tour.gleam.run/flow-control/multiple-subjects/
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:80:7
+   │
+80 │       a -> "ab"
+   │       ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_a`.
+
+warning: Unreachable pattern
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:81:7
+   │
+81 │       Cv3(True) -> "data" <> "bc"
+   │       ^^^^^^^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Redundant record
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:95:21
+   │
+95 │     case tag_value, Cv3(False) {
+   │                     ^^^^^^^^^^ You can remove this record wrapper
+
+Instead of building a record and matching on it, you can match on its
+contents directly.
+A case expression can take multiple subjects separated by commas like this:
+
+    case one_subject, another_subject {
+      _, _ -> todo
+    }
+
+See: https://tour.gleam.run/flow-control/multiple-subjects/
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:97:31
+   │
+97 │       prototype, Cv3(False as whole) -> prototype + prototype
+   │                               ^^^^^ This variable is never used
+
+Hint: You can safely remove it.
+
+warning: Unused variable
+   ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:98:10
+   │
+98 │       8, v7 -> [] |> default()
+   │          ^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v7`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:103:5
+    │
+103 │     v8 -> {
+    │     ^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_v8`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:104:11
+    │
+104 │       let l = 2
+    │           ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_l`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:105:11
+    │
+105 │       let constructor = default([100])
+    │           ^^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_constructor`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:108:5
+    │
+108 │     constructor -> case "a" <> "res" {
+    │     ^^^^^^^^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_constructor`.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:108:5
+    │
+108 │     constructor -> case "a" <> "res" {
+    │     ^^^^^^^^^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:109:15
+    │
+109 │       "ab" <> rest | "bc" <> rest -> [5]
+    │               ^^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_rest`.
+
+warning: Unreachable pattern
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:111:7
+    │
+111 │       "abc" -> [0]
+    │       ^^^^^
+
+This pattern cannot be reached as a previous pattern matches the same
+values.
+
+Hint: It can be safely removed.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:113:13
+    │
+113 │         let new = tag_value
+    │             ^^^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_new`.
+
+warning: Unused variable
+    ┌─ /private/var/folders/h7/x5_nq3390v9654vm_fm53wd40000gn/T/.tmpEScBbW/src/main.gleam:114:13
+    │
+114 │         let y = "ab"
+    │             ^ This variable is never used
+
+Hint: You can ignore it with an underscore: `_y`.
+
+   Compiled in 0.00s
+    Running main.main
+[90msrc/main.gleam:73[39m
+"data"
+runtime error: stack overflow
+
+The program recursed too deeply. Gleam tail calls run in constant stack space, but deeply nested non-tail recursion exhausted the stack.
