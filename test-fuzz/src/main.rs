@@ -14,6 +14,7 @@
 //! cargo run -p test-fuzz --release -- --emit 12345      # print program
 //! ```
 
+mod bench;
 mod generate;
 
 use std::path::{Path, PathBuf};
@@ -31,9 +32,11 @@ fn main() {
     let mut iterations: Option<u64> = None;
     let mut base_seed: Option<u64> = None;
     let mut emit: Option<u64> = None;
+    let mut bench = false;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--bench" => bench = true,
             "--iterations" => {
                 iterations = Some(
                     arguments
@@ -68,14 +71,17 @@ fn main() {
     }
 
     // With an explicit seed the default is a single reproduction run.
-    let iterations = iterations.unwrap_or(if base_seed.is_some() { 1 } else { 100 });
+    let iterations = iterations.unwrap_or(match (base_seed.is_some(), bench) {
+        (true, _) => 1,
+        (false, true) => 10,
+        (false, false) => 100,
+    });
     let base_seed = base_seed.unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos() as u64
     });
-    println!("base seed: {base_seed}");
 
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -83,6 +89,20 @@ fn main() {
         .to_path_buf();
     let gleam = build_gleam(&workspace);
     let project = scratch_project();
+
+    if bench {
+        // `--iterations` is the number of benchmarked programs here.
+        bench::main(
+            &bench::Options {
+                programs: iterations,
+                base_seed,
+            },
+            &gleam,
+            &project,
+        );
+        return;
+    }
+    println!("base seed: {base_seed}");
 
     let mut failures: Vec<u64> = Vec::new();
     let started = Instant::now();

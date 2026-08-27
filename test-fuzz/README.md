@@ -17,6 +17,7 @@ identical; any mismatch, crash, or timeout is saved as a reproducer under
 cargo run -p test-fuzz --release -- --iterations 500   # explore (time-based seed)
 cargo run -p test-fuzz --release -- --seed 12345       # reproduce one program
 cargo run -p test-fuzz --release -- --emit 12345       # print a seed's program
+cargo run -p test-fuzz --release -- --bench            # benchmark 10 programs
 ```
 
 The first iteration of a run uses the base seed directly, so the seed a
@@ -49,3 +50,23 @@ extracted values echoed.
   infinity where native saturates, so float growth must stay linear.
 - Exponential accumulator growth in recursion (`acc <> acc`): recursive
   steps combine the accumulator linearly.
+
+## Benchmark mode
+
+`--bench` reuses the generator's programs as workloads and compares the
+Erlang target, the native JIT (`gleam run`), and the AOT executable
+(`gleam export native`) on three axes: steady-state execution (each
+program's `main` is driven by a repeat loop calibrated on Erlang to run
+about a second, and the per-iteration time is the slope between warm
+runs at repeat counts 1 and N — cancelling VM startup, build-freshness
+checks, and JIT compilation; `echo` formatting and writes are part of
+the workload, with output discarded), cold compile time (the target's
+build directory is deleted before every timed `gleam build`; the AOT
+column is `gleam export native` and includes linking), and warm startup
+of a trivial program. Timed points take the minimum of several runs.
+Results print as tables and are saved to `test-fuzz/bench-results.json`.
+
+```sh
+cargo run -p test-fuzz --release -- --bench                          # 10 programs
+cargo run -p test-fuzz --release -- --bench --iterations 20 --seed 1 # reproducible
+```
