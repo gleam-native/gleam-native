@@ -1909,6 +1909,7 @@ where
             location,
             module,
             name,
+            literal: _,
         } => v.visit_clause_guard_unqualified_remote_constant(
             location,
             definition_location,

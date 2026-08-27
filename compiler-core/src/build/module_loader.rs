@@ -83,7 +83,9 @@ where
             && !self.native_artifact_is_current(&file)
         {
             tracing::debug!(?name, "native_artifact_stale");
-            return read_source(name).map(|module| Input::New(Box::new(module)));
+            return read_source(name).map(|module| Input::New {
+                module: Box::new(module),
+            });
         }
 
         // If the timestamp of the source is newer than the cache entry and

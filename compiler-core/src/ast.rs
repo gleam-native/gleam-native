@@ -2559,6 +2559,9 @@ pub enum ClauseGuard<Type> {
         location: SrcSpan,
         module: EcoString,
         name: EcoString,
+        /// The constant's value, kept (as `ModuleSelect` keeps its
+        /// `literal`) for the native backend, which inlines constants.
+        literal: Constant<Type>,
     },
 }
 

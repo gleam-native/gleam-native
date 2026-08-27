@@ -392,6 +392,7 @@ impl<'expression_typer, 'env, 'module> GuardTyper<'expression_typer, 'env, 'modu
                         module: module.clone(),
                         definition_location: literal.definition_location(),
                         name: name.clone(),
+                        literal: literal.clone(),
                     })
                 }
             }

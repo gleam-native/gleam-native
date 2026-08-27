@@ -1161,8 +1161,24 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             //
             TypedExpr::ModuleSelect {
                 constructor: ModuleValueConstructor::Constant { literal, .. },
+                module_name,
+                label,
+                location,
                 ..
-            } => self.constant(builder, literal),
+            } => {
+                if &self.module_generator.module.name == module_name {
+                    // A constant from the same module is inlined, exactly as
+                    // an unqualified reference to it would be.
+                    self.constant(builder, literal);
+                } else {
+                    // One from another module becomes a call to its 0-arity
+                    // constant function, exactly as an unqualified reference
+                    // does: inlining it here would materialise references to
+                    // the other module's private functions, which are not
+                    // exported.
+                    self.remote_constant(builder, *location, module_name, label);
+                }
+            }
 
             //
             // Control flow.
@@ -2824,7 +2840,8 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         builder.bit_array_segment(value.location());
         self.maybe_block_expr(builder, value);
         builder.bit_array_segment_default_size();
-        builder.bit_array_segment_specifiers(if produces_literal_string(value) {
+        builder.bit_array_segment_specifiers(
+            if produces_literal_string(&self.module_generator.module.name, value) {
             [BitArraySegmentSpecifier::Utf8]
         } else {
             [BitArraySegmentSpecifier::Binary]
@@ -3094,7 +3111,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         //   ```
         //
         if segment.type_.is_string()
-            && !produces_literal_string(&segment.value)
+            && !produces_literal_string(&self.module_generator.module.name, &segment.value)
             && let Some(encoding) = expression_segment_string_encoding(segment)
         {
             let (size, endiannes) = match encoding {
@@ -3791,24 +3808,27 @@ fn type_export(custom_type: &TypedCustomType) -> (EcoString, usize) {
 /// This returns true if the given expression is going to be compiled to a
 /// single literal Erlang string.
 /// This is not only true for literal Gleam strings like `"abc"`, but also for
-/// variables referencing string constants (as those are inlined)
-fn produces_literal_string(value: &TypedExpr) -> bool {
+/// variables referencing string constants of the same module (as those are
+/// inlined). A constant from another module compiles to a call of its
+/// 0-arity constant function, so it is not a literal.
+fn produces_literal_string(current_module: &EcoString, value: &TypedExpr) -> bool {
     match value {
         TypedExpr::String { .. } => true,
-        // Constants are inlined on the Erlang target, so we need to check if
-        // those produce literal strings too!
+        // Same-module constants are inlined on the Erlang target, so we
+        // need to check if those produce literal strings too!
         TypedExpr::ModuleSelect {
             constructor: ModuleValueConstructor::Constant { literal, .. },
+            module_name: module,
             ..
         }
         | TypedExpr::Var {
             constructor:
                 ValueConstructor {
-                    variant: ValueConstructorVariant::ModuleConstant { literal, .. },
+                    variant: ValueConstructorVariant::ModuleConstant { literal, module, .. },
                     ..
                 },
             ..
-        } => constant_produces_literal_string(literal),
+        } => module == current_module && constant_produces_literal_string(literal),
 
         TypedExpr::Int { .. }
         | TypedExpr::Var { .. }

@@ -814,7 +814,7 @@ impl Lowerer<'_> {
                 self.guard(expression)?,
             ))),
 
-            ClauseGuard::Var { name, .. } => {
+            ClauseGuard::LocalVariable { name, .. } => {
                 Ok(native_ir::Expression::Variable(name.clone().into()))
             }
 
@@ -837,7 +837,8 @@ impl Lowerer<'_> {
             ClauseGuard::FieldAccess { index: None, .. } => {
                 Err(self.unsupported("this guard expression", guard.location()))
             }
-            ClauseGuard::ModuleSelect { literal, .. } => self.constant(literal),
+            ClauseGuard::ModuleSelect { literal, .. }
+            | ClauseGuard::UnqualifiedRemoteConstant { literal, .. } => self.constant(literal),
             ClauseGuard::Invalid { .. } => {
                 Err(self.unsupported("this guard expression", guard.location()))
             }
