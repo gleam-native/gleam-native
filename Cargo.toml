@@ -5,6 +5,7 @@
 resolver = "2"
 members = [
   "gleam-bin",
+  "compiler-benches",
   "compiler-cli",
   "compiler-core",
   "compiler-wasm",
@@ -39,7 +40,7 @@ mimalloc = { version = "0.1", default-features = false }
 # Command line interface
 clap = { version = "4", features = ["derive"] }
 # Immutable data structures
-im = { version = "15", features = ["serde"] }
+imbl = { version = "7", features = ["serde"] }
 # Extra iter methods
 itertools = "0"
 # Parsing
@@ -109,3 +110,5 @@ unicode-segmentation = "1.13.2"
 xxhash-rust = { version = "0", features = ["xxh3"] }
 # Source spans and line numbers
 src-span = { path = "./src-span" }
+# Creation of temporary directories
+tempfile = "3"

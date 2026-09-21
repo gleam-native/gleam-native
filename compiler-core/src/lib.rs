@@ -99,7 +99,6 @@ mod call_graph;
 mod dep_tree;
 pub(crate) mod derivation_tree;
 pub mod exhaustiveness;
-pub(crate) mod inline;
 pub mod reference;
 
 #[cfg(test)]

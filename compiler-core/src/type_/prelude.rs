@@ -245,7 +245,6 @@ pub fn build_prelude(ids: &UniqueIdGenerator) -> ModuleInterface {
         documentation: Vec::new(),
         contains_echo: false,
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     for t in PreludeType::iter() {
@@ -273,11 +272,13 @@ pub fn build_prelude(ids: &UniqueIdGenerator) -> ModuleInterface {
                                 name: "True".into(),
                                 parameters: vec![],
                                 documentation: None,
+                                deprecation: NotDeprecated,
                             },
                             TypeValueConstructor {
                                 name: "False".into(),
                                 parameters: vec![],
                                 documentation: None,
+                                deprecation: NotDeprecated,
                             },
                         ],
                         opaque: Opaque::NotOpaque,
@@ -412,6 +413,7 @@ pub fn build_prelude(ids: &UniqueIdGenerator) -> ModuleInterface {
                             name: "Nil".into(),
                             parameters: vec![],
                             documentation: None,
+                            deprecation: NotDeprecated,
                         }],
                         opaque: Opaque::NotOpaque,
                     },
@@ -448,6 +450,7 @@ pub fn build_prelude(ids: &UniqueIdGenerator) -> ModuleInterface {
                                     documentation: None,
                                 }],
                                 documentation: None,
+                                deprecation: NotDeprecated,
                             },
                             TypeValueConstructor {
                                 name: "Error".into(),
@@ -457,6 +460,7 @@ pub fn build_prelude(ids: &UniqueIdGenerator) -> ModuleInterface {
                                     documentation: None,
                                 }],
                                 documentation: None,
+                                deprecation: NotDeprecated,
                             },
                         ],
                         opaque: Opaque::NotOpaque,

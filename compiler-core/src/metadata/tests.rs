@@ -25,10 +25,7 @@ use crate::{
     uid::UniqueIdGenerator,
 };
 use src_span::{LineNumbers, SrcSpan};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use pretty_assertions::assert_eq;
 
@@ -69,7 +66,6 @@ fn constant_module(constant: TypedConstant) -> ModuleInterface {
                         can_run_on_native: true,
                     },
                     name: "one".into(),
-                    remote_constants: HashSet::new(),
                 },
             },
         )]
@@ -82,7 +78,6 @@ fn constant_module(constant: TypedConstant) -> ModuleInterface {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     }
 }
 
@@ -122,7 +117,6 @@ fn empty_module() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -151,7 +145,6 @@ fn with_line_numbers() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -188,7 +181,6 @@ fn module_with_private_type() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -225,7 +217,6 @@ fn module_with_app_type() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -262,7 +253,6 @@ fn module_with_fn_type() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -299,7 +289,6 @@ fn module_with_tuple_type() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -341,7 +330,6 @@ fn module_with_generic_type() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
-            inline_functions: HashMap::new(),
         }
     }
 
@@ -383,7 +371,6 @@ fn module_with_type_links() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
-            inline_functions: HashMap::new(),
         }
     }
 
@@ -425,7 +412,6 @@ fn module_with_type_constructor_documentation() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
-            inline_functions: HashMap::new(),
         }
     }
 
@@ -470,7 +456,6 @@ fn module_with_type_constructor_origin() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
-            inline_functions: HashMap::new(),
         }
     }
 
@@ -494,6 +479,9 @@ fn module_type_to_constructors_mapping() {
                     name: "One".into(),
                     parameters: vec![],
                     documentation: Some("Some documentation".into()),
+                    deprecation: Deprecation::Deprecated {
+                        message: "This is deprecated!".into(),
+                    },
                 }],
                 opaque: Opaque::NotOpaque,
             },
@@ -509,7 +497,6 @@ fn module_type_to_constructors_mapping() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -567,7 +554,6 @@ fn module_fn_value() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -626,7 +612,6 @@ fn deprecated_module_fn_value() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -683,7 +668,6 @@ fn private_module_fn_value() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -742,7 +726,6 @@ fn module_fn_value_regression() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -800,7 +783,6 @@ fn module_fn_value_with_field_map() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -849,7 +831,6 @@ fn record_value() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -905,7 +886,6 @@ fn record_value_with_field_map() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -984,7 +964,6 @@ fn accessors() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1062,7 +1041,6 @@ fn private_accessors() {
         type_aliases: HashMap::new(),
         documentation: Vec::new(),
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1256,7 +1234,6 @@ fn constant_var() {
                     can_run_on_native: true,
                 },
                 name: "one_original".into(),
-                remote_constants: HashSet::new(),
             },
         })),
     };
@@ -1292,7 +1269,6 @@ fn constant_var() {
                             can_run_on_native: true,
                         },
                         name: "one".into(),
-                        remote_constants: HashSet::new(),
                     },
                 },
             ),
@@ -1317,7 +1293,6 @@ fn constant_var() {
                             can_run_on_native: true,
                         },
                         name: "one_original".into(),
-                        remote_constants: HashSet::new(),
                     },
                 },
             ),
@@ -1331,7 +1306,6 @@ fn constant_var() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1529,7 +1503,6 @@ fn deprecated_type() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1585,7 +1558,6 @@ fn module_fn_value_with_external_implementations() {
         documentation: Vec::new(),
         contains_echo: false,
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1610,7 +1582,6 @@ fn module_containing_echo() {
         documentation: Vec::new(),
         contains_echo: true,
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1670,7 +1641,6 @@ fn internal_module_fn() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1733,7 +1703,6 @@ fn internal_annotated_module_fn() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1773,6 +1742,7 @@ fn type_variable_ids_in_constructors_are_shared() {
                         },
                     ],
                     documentation: None,
+                    deprecation: Deprecation::NotDeprecated,
                 }],
                 opaque: Opaque::NotOpaque,
             },
@@ -1787,7 +1757,6 @@ fn type_variable_ids_in_constructors_are_shared() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     let expected = HashMap::from([(
@@ -1814,6 +1783,7 @@ fn type_variable_ids_in_constructors_are_shared() {
                     },
                 ],
                 documentation: None,
+                deprecation: Deprecation::NotDeprecated,
             }],
             opaque: Opaque::NotOpaque,
         },
@@ -1864,7 +1834,6 @@ fn type_with_inferred_variant() {
         type_aliases: HashMap::new(),
         documentation: Vec::new(),
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1902,7 +1871,6 @@ fn module_with_type_aliases() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1931,7 +1899,6 @@ fn module_with_documentation() {
         contains_echo: false,
 
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1953,6 +1920,7 @@ fn module_with_opaque_type() {
                     name: "One".into(),
                     parameters: vec![],
                     documentation: Some("Some documentation".into()),
+                    deprecation: Deprecation::NotDeprecated,
                 }],
                 opaque: Opaque::Opaque,
             },
@@ -1967,7 +1935,6 @@ fn module_with_opaque_type() {
         documentation: Vec::new(),
         contains_echo: false,
         references: References::default(),
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -2089,7 +2056,6 @@ fn module_with_references() {
             label_references: HashMap::new(),
             label_definitions: HashMap::new(),
         },
-        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);

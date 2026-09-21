@@ -10,7 +10,7 @@ use crate::{
         CAPTURE_VARIABLE, CallArg, Clause, Constant, FunctionLiteralKind, HasLocation,
         ImplicitCallArgOrigin, InvalidExpression, Layer, RECORD_UPDATE_VARIABLE,
         RecordBeingUpdated, Statement, TodoKind, TypeAst, TypedArg, TypedAssert, TypedAssignment,
-        TypedClause, TypedConstant, TypedExpr, TypedMultiPattern, TypedStatement,
+        TypedClause, TypedClauseGuard, TypedConstant, TypedExpr, TypedMultiPattern, TypedStatement,
         USE_ASSIGNMENT_VARIABLE, UntypedArg, UntypedAssert, UntypedAssignment, UntypedClause,
         UntypedClauseGuard, UntypedConstant, UntypedExpr, UntypedExprBitArraySegment,
         UntypedMultiPattern, UntypedStatement, UntypedUse, UntypedUseAssignment, Use,
@@ -19,15 +19,12 @@ use crate::{
     build::Target,
     exhaustiveness::{self, CompileCaseResult, CompiledCase, Reachability},
     parse::{LiteralFloatValue, PatternPosition},
-    reference::{LabelSyntax, ReferenceKind},
-    type_::{
-        constant::{ConstantTyper, InferredConstant},
-        guard::{GuardTyper, InferredGuard},
-    },
+    reference::{LabelOwner, LabelSyntax, ReferenceKind},
+    type_::{constant::ConstantTyper, guard::GuardTyper},
 };
 use ecow::eco_format;
 use hexpm::version::{LowestVersion, Version};
-use im::hashmap;
+use imbl::hashmap;
 use itertools::Itertools;
 use num_bigint::BigInt;
 use vec1::Vec1;
@@ -423,7 +420,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
     pub(crate) fn instantiate(
         &mut self,
         t: Arc<Type>,
-        ids: &mut im::HashMap<u64, Arc<Type>>,
+        ids: &mut imbl::HashMap<u64, Arc<Type>>,
     ) -> Arc<Type> {
         self.environment.instantiate(t, ids, &self.hydrator)
     }
@@ -610,7 +607,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             kind,
             location: warning_location,
             type_: type_.clone(),
-            names: self.environment.names.clone(),
+            names: Box::new(self.environment.names.clone()),
         });
 
         self.purity = Purity::Impure;
@@ -1447,9 +1444,12 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 if let TypedExpr::RecordAccess { record, label, .. } = &record_access {
                     // The programmer wrote `record.label`, so register a
                     // reference to the field for the language server.
-                    if let Some(type_name) = record.type_().named_type_name() {
+                    if let Some((type_module, type_name)) = record.type_().named_type_name() {
                         self.environment.references.register_label_reference(
-                            type_name,
+                            LabelOwner::Record {
+                                module: type_module,
+                                name: type_name,
+                            },
                             label.clone(),
                             label_location,
                             LabelSyntax::Longhand,
@@ -2317,7 +2317,6 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     compiled_case: CompiledCase::failure(),
                     subjects: typed_subjects,
                     clauses: Vec::new(),
-                    remote_constants: HashSet::new(),
                 };
             }
         };
@@ -2329,16 +2328,13 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         let mut all_clauses_panic = !clauses.is_empty();
         let mut patterns_typechecked_successfully = true;
 
-        let mut case_remote_constants = HashSet::new();
         for clause in clauses {
             has_a_guard = has_a_guard || clause.guard.is_some();
-            all_patterns_are_discards = all_patterns_are_discards
-                && clause.pattern.iter().all(|pattern| pattern.is_discard());
+            all_patterns_are_discards =
+                all_patterns_are_discards && clause.pattern.iter().all(|p| p.is_discard());
 
             self.previous_panics = false;
-            let (typed_clause, error_typing_patterns, remote_constants) =
-                self.infer_clause(clause, &typed_subjects);
-            case_remote_constants.extend(remote_constants);
+            let (typed_clause, error_typing_patterns) = self.infer_clause(clause, &typed_subjects);
             if error_typing_patterns {
                 patterns_typechecked_successfully = false;
             }
@@ -2389,7 +2385,6 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             type_: return_type,
             subjects: typed_subjects,
             clauses: typed_clauses,
-            remote_constants: case_remote_constants,
         }
     }
 
@@ -2400,7 +2395,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         &mut self,
         clause: UntypedClause,
         subjects: &[TypedExpr],
-    ) -> (TypedClause, bool, HashSet<(EcoString, EcoString)>) {
+    ) -> (TypedClause, bool) {
         let Clause {
             pattern,
             alternative_patterns,
@@ -2412,14 +2407,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             let (typed_pattern, typed_alternatives, error_encountered) =
                 this.infer_clause_pattern(pattern, alternative_patterns, subjects, &location);
 
-            let (guard, remote_constants) = match this.infer_optional_clause_guard(guard) {
-                Some(InferredGuard {
-                    guard,
-                    remote_constants,
-                }) => (Some(guard), remote_constants),
-                None => (None, HashSet::new()),
-            };
-
+            let guard = this.infer_optional_clause_guard(guard);
             let then = this.infer(then);
             let clause = Clause {
                 location,
@@ -2428,7 +2416,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 guard,
                 then,
             };
-            (clause, error_encountered, remote_constants)
+            (clause, error_encountered)
         })
     }
 
@@ -2473,15 +2461,15 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
     fn infer_optional_clause_guard(
         &mut self,
         guard: Option<UntypedClauseGuard>,
-    ) -> Option<InferredGuard> {
+    ) -> Option<TypedClauseGuard> {
         // If there is a guard we type check it and assert that it is of type
         // Bool.
-        let inferred = GuardTyper::new(self).infer(guard?);
-        if let Err(error) = unify(bool(), inferred.guard.type_()) {
+        let guard = GuardTyper::new(self).infer(guard?);
+        if let Err(error) = unify(bool(), guard.type_()) {
             self.problems
-                .error(convert_unify_error(error, inferred.guard.location()));
+                .error(convert_unify_error(error, guard.location()));
         }
-        Some(inferred)
+        Some(guard)
     }
 
     pub(crate) fn infer_module_access(
@@ -2508,17 +2496,31 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                         .suggest_modules(module_alias, Imported::Value(label.clone())),
                 })?;
 
-            let constructor =
-                module
-                    .get_importable_value(&label)
-                    .ok_or_else(|| Error::UnknownModuleValue {
-                        name: label.clone(),
+            let constructor = match module.values.get(&label) {
+                Some(constructor) if constructor.publicity.is_importable() => constructor,
+                // If the value belongs to current package, but isn't importable,
+                // then we produce error message about usage of private value.
+                Some(_) if self.environment.current_package == module.package => {
+                    return Err(Error::PrivateValueUse {
                         location: select_location,
+                        name: label.clone(),
+                        module_name: module.name.clone(),
+                    });
+                }
+                // Otherwise, the value either doesn't exist or is from another
+                // module, where we do not want to expose information, we produce
+                // error message about usage of unknown value.
+                Some(_) | None => {
+                    return Err(Error::UnknownModuleValue {
+                        location: select_location,
+                        name: label.clone(),
                         module_name: module.name.clone(),
                         value_constructors: module.public_value_names(),
                         type_with_same_name: module.get_importable_type(&label).is_some(),
-                        context: ModuleValueUsageContext::ModuleAccess,
-                    })?;
+                        context: ModuleValueUsageContext::UnqualifiedImport,
+                    });
+                }
+            };
 
             // Emit a warning if the value being used is deprecated.
             if let Deprecation::Deprecated { message } = &constructor.deprecation {
@@ -2851,9 +2853,12 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     self.problems.error(convert_unify_error(error, *location));
                 }
 
-                if let Some(type_name) = return_type.named_type_name() {
+                if let Some((type_module, type_name)) = return_type.named_type_name() {
                     self.environment.references.register_label_reference(
-                        type_name,
+                        LabelOwner::Record {
+                            module: type_module,
+                            name: type_name,
+                        },
                         label.clone(),
                         argument.label_location(),
                         argument.label_syntax(),
@@ -3008,7 +3013,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     continue;
                 };
 
-                let mut type_vars = im::HashMap::new();
+                let mut type_vars = imbl::HashMap::new();
                 let accessor_type = self.instantiate(accessor_type, &mut type_vars);
                 let type_ = self.instantiate(type_, &mut type_vars);
                 unify(accessor_type, record_type.clone()).map_err(|error| {
@@ -3483,7 +3488,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         &mut self,
         annotation: &Option<TypeAst>,
         value: UntypedConstant,
-    ) -> InferredConstant {
+    ) -> TypedConstant {
         let inferred = ConstantTyper::new(self).infer(value);
 
         match annotation
@@ -3498,17 +3503,10 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             // If there's an annotation we try and unify it with the inferred
             // type.
             Some(Ok(annotated_type)) => {
-                if let Err(error) = unify(annotated_type.clone(), inferred.constant.type_()) {
+                if let Err(error) = unify(annotated_type.clone(), inferred.type_()) {
                     self.problems
-                        .error(convert_unify_error(error, inferred.constant.location()));
-
-                    InferredConstant {
-                        constant: invalid_constant_with_annotated_type(
-                            inferred.constant,
-                            annotated_type,
-                        ),
-                        remote_constants: HashSet::new(),
-                    }
+                        .error(convert_unify_error(error, inferred.location()));
+                    invalid_constant_with_annotated_type(inferred, annotated_type)
                 } else {
                     inferred
                 }
@@ -3868,21 +3866,31 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             })
             .collect();
 
-        // Register a reference to each labelled field so the language server can
-        // offer go-to-definition, find-references and rename on record fields. We
-        // do this before adding back the ignored arguments below, as those are
-        // synthetic placeholders without a real value: their labels are
-        // registered using the locations captured before the values were
-        // discarded.
-        if fun.is_record_constructor_function()
-            && let Some(type_name) = return_type.named_type_name()
-        {
+        let label_owner = if fun.is_record_constructor_function() {
+            return_type
+                .named_type_name()
+                .map(|(module, name)| LabelOwner::Record { module, name })
+        } else {
+            fun.module_function_name()
+                .map(|(module, name)| LabelOwner::Function {
+                    module: module.clone(),
+                    name: name.clone(),
+                })
+        };
+
+        // Register a reference to each labelled argument so the language server
+        // can offer go-to-definition, find-references and rename on record
+        // fields and function argument labels. We do this before adding back
+        // the ignored arguments below, as those are synthetic placeholders
+        // without a real value: their labels are registered using the locations
+        // captured before the values were discarded.
+        if let Some(label_owner) = label_owner {
             for argument in &typed_arguments {
                 if let Some(label) = &argument.label
                     && let Some(label_location) = argument.label_location()
                 {
                     self.environment.references.register_label_reference(
-                        type_name.clone(),
+                        label_owner.clone(),
                         label.clone(),
                         label_location,
                         argument.label_syntax(),
@@ -3896,7 +3904,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     && argument.implicit.is_none()
                 {
                     self.environment.references.register_label_reference(
-                        type_name.clone(),
+                        label_owner.clone(),
                         label.clone(),
                         label_location,
                         argument.syntax,
@@ -5029,7 +5037,19 @@ fn static_compare(one: &TypedExpr, other: &TypedExpr) -> StaticComparison {
 
         (TypedExpr::Float { float_value: n, .. }, TypedExpr::Float { float_value: m, .. }) => {
             if n == m {
-                StaticComparison::CertainlyEqual
+                // In Erlang, -0.0 =:= 0.0 will return False.
+                // This is because starting from OTP 27,
+                // the behavior of zero comparison changes.
+                // This removes the redundant comparison warning,
+                // as n == m already detects ±0.0 == ±0.0, so if we have
+                // alternating signs, then we do not send any guarantee of equality.
+                //
+                // https://erlangforums.com/t/in-erlang-otp-27-0-0-will-no-longer-be-exactly-equal-to-0-0/2586
+                if n.value().is_sign_negative() != m.value().is_sign_negative() {
+                    StaticComparison::CantTell
+                } else {
+                    StaticComparison::CertainlyEqual
+                }
             } else {
                 StaticComparison::CertainlyDifferent
             }

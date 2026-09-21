@@ -60,7 +60,7 @@ pub fn compile_package(
     src: &str,
     dep: Option<(&str, &str, &str)>,
 ) -> String {
-    let mut modules = im::HashMap::new();
+    let mut modules = imbl::HashMap::new();
     let ids = UniqueIdGenerator::new();
     // DUPE: preludeinsertion
     // TODO: Currently we do this here and also in the tests. It would be better
@@ -142,7 +142,7 @@ pub fn compile_package(
     let package: Package = package_from_module(module);
     serde_json::to_string_pretty(&PackageInterface::from_package(
         &package,
-        &im::HashMap::new(),
+        &imbl::HashMap::new(),
     ))
     .expect("to json")
 }
@@ -350,4 +350,17 @@ pub fn type_alias_with_two_parameters() {
 #[test]
 pub fn type_alias_with_two_parameters_in_reverse() {
     assert_package_interface!("pub type Wibble(a, b) = Result(b, a)");
+}
+
+#[test]
+pub fn deprecated_constructor() {
+    assert_package_interface!(
+        r#"
+pub type Wibble {
+  @deprecated("Use `Wobble` instead")
+  Wibble
+  Wobble
+}
+"#
+    );
 }

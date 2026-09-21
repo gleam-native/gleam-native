@@ -103,6 +103,7 @@ pub fn case<'a, 'doc>(
 }
 
 /// The generated code for a decision tree.
+#[derive(Debug)]
 enum CaseBody<'a, 'doc> {
     /// A JavaScript `if`` statement by itself. This can be merged with any
     /// preceding `else` statements to form an `else if` construct.
@@ -840,7 +841,7 @@ impl<'a, 'doc> CasePrinter<'_, '_, 'a, '_, 'doc> {
                 .current_scope
                 .user_variables()
                 .clone(),
-            DecisionKind::LetAssert { .. } => im::HashMap::new(),
+            DecisionKind::LetAssert { .. } => imbl::HashMap::new(),
         };
         let old_names = self.variables.scoped_variable_names.clone();
         let old_segments = self.variables.segment_values.clone();
@@ -853,7 +854,7 @@ impl<'a, 'doc> CasePrinter<'_, '_, 'a, '_, 'doc> {
                 .variables
                 .expression_generator
                 .current_scope
-                .restore_user_variables(&old_user_variables),
+                .restore_user_variables(old_user_variables),
             DecisionKind::LetAssert { .. } => {}
         }
 
@@ -1059,7 +1060,7 @@ fn derived_variables(
         .iter()
         .map(|(check, _decision)| check)
         .chain(match fallback_check {
-            FallbackCheck::RuntimeCheck { check } => Some(check),
+            FallbackCheck::RuntimeCheck { check } => Some(check.as_ref()),
             FallbackCheck::InfiniteCatchAll | FallbackCheck::CatchAll { .. } => None,
         });
 

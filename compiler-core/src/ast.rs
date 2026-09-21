@@ -285,14 +285,23 @@ pub enum ArgNames {
 }
 
 impl ArgNames {
-    pub fn get_label(&self) -> Option<&EcoString> {
+    pub fn get_label(&self) -> Option<(&EcoString, &SrcSpan)> {
         match self {
             ArgNames::Discard { .. } | ArgNames::Named { .. } => None,
-            ArgNames::LabelledDiscard { label, .. } | ArgNames::NamedLabelled { label, .. } => {
-                Some(label)
+
+            ArgNames::LabelledDiscard {
+                label,
+                label_location,
+                ..
             }
+            | ArgNames::NamedLabelled {
+                label,
+                label_location,
+                ..
+            } => Some((label, label_location)),
         }
     }
+
     pub fn get_variable_name(&self) -> Option<&EcoString> {
         match self {
             ArgNames::Discard { .. } | ArgNames::LabelledDiscard { .. } => None,
@@ -907,12 +916,26 @@ impl TypedFunction {
             return Some(found);
         }
 
-        if let Some(found_arg) = self
+        if let Some(argument) = self
             .arguments
             .iter()
-            .find_map(|arg| arg.find_node(byte_index))
+            .find(|argument| argument.location.contains(byte_index))
         {
-            return Some(found_arg);
+            if let Some((_, function_name)) = &self.name
+                && let Some((label, label_location)) = argument.names.get_label()
+                && label_location.contains(byte_index)
+            {
+                return Some(Located::FunctionLabelDefinition {
+                    location: *label_location,
+                    field_type: argument.type_.clone(),
+                    label: label.clone(),
+                    function_name: function_name.clone(),
+                });
+            }
+
+            if let Some(found_argument) = argument.find_node(byte_index) {
+                return Some(found_argument);
+            }
         }
 
         if let Some(found_statement) = self
@@ -1765,9 +1788,12 @@ impl CallArg<TypedExpr> {
                     }
                     let label = self.label.as_ref()?;
 
-                    if let Some(variant) = called_function.record_constructor_variant_name()
-                        && let Some(label_location) = self.label_location()
-                        && label_location.contains(byte_index)
+                    let label_location = self
+                        .label_location()
+                        .filter(|location| location.contains(byte_index));
+
+                    if let Some(label_location) = label_location
+                        && let Some(variant) = called_function.record_constructor_variant_name()
                     {
                         let record_type = called_function
                             .type_()
@@ -1779,6 +1805,17 @@ impl CallArg<TypedExpr> {
                             label: label.clone(),
                             record_type,
                             variant: variant.clone(),
+                        })
+                    } else if let Some(label_location) = label_location
+                        && let Some((function_module, function_name)) =
+                            called_function.module_function_name()
+                    {
+                        Some(Located::FunctionLabelUsage {
+                            location: label_location,
+                            field_type: self.value.type_(),
+                            label: label.clone(),
+                            function_module: function_module.clone(),
+                            function_name: function_name.clone(),
                         })
                     } else {
                         Some(Located::Label {
@@ -2497,7 +2534,7 @@ pub enum ClauseGuard<Type> {
         expression: Box<Self>,
     },
 
-    LocalVariable {
+    Var {
         location: SrcSpan,
         type_: Type,
         name: EcoString,
@@ -2537,32 +2574,6 @@ pub enum ClauseGuard<Type> {
         location: SrcSpan,
         type_: Type,
     },
-
-    /// This appears after typing the clause guard, for references to
-    /// unqualified constants from other modules. For example:
-    ///
-    /// ```gleam
-    /// import module.{a_constant}
-    ///
-    /// pub fn go(x) {
-    ///   case x {
-    ///     _ if a_constant -> Nil
-    /// //       ^^^^^^^^^^ This one here!
-    ///   }
-    /// }
-    /// ```
-    ///
-    UnqualifiedRemoteConstant {
-        type_: Type,
-        /// The definition location of the constant this is referencing, if any.
-        definition_location: Option<DefinitionLocation>,
-        location: SrcSpan,
-        module: EcoString,
-        name: EcoString,
-        /// The constant's value, kept (as `ModuleSelect` keeps its
-        /// `literal`) for the native backend, which inlines constants.
-        literal: Constant<Type>,
-    },
 }
 
 impl<A> ClauseGuard<A> {
@@ -2571,11 +2582,10 @@ impl<A> ClauseGuard<A> {
             ClauseGuard::Constant(constant) => constant.location(),
             ClauseGuard::BinaryOperator { location, .. }
             | ClauseGuard::Not { location, .. }
-            | ClauseGuard::LocalVariable { location, .. }
+            | ClauseGuard::Var { location, .. }
             | ClauseGuard::TupleIndex { location, .. }
             | ClauseGuard::ModuleSelect { location, .. }
             | ClauseGuard::Invalid { location, .. }
-            | ClauseGuard::UnqualifiedRemoteConstant { location, .. }
             | ClauseGuard::Block { location, .. } => *location,
             ClauseGuard::FieldAccess {
                 label_location,
@@ -2599,12 +2609,11 @@ impl<A> ClauseGuard<A> {
 
             ClauseGuard::Constant(_)
             | ClauseGuard::Invalid { .. }
-            | ClauseGuard::LocalVariable { .. }
+            | ClauseGuard::Var { .. }
             | ClauseGuard::Not { .. }
             | ClauseGuard::TupleIndex { .. }
             | ClauseGuard::FieldAccess { .. }
             | ClauseGuard::ModuleSelect { .. }
-            | ClauseGuard::UnqualifiedRemoteConstant { .. }
             | ClauseGuard::Block { .. } => None,
         }
     }
@@ -2613,15 +2622,13 @@ impl<A> ClauseGuard<A> {
 impl TypedClauseGuard {
     pub fn type_(&self) -> Arc<Type> {
         match self {
+            ClauseGuard::Var { type_, .. } => type_.clone(),
+            ClauseGuard::TupleIndex { type_, .. } => type_.clone(),
+            ClauseGuard::FieldAccess { type_, .. } => type_.clone(),
+            ClauseGuard::ModuleSelect { type_, .. } => type_.clone(),
             ClauseGuard::Constant(constant) => constant.type_(),
             ClauseGuard::Block { value, .. } => value.type_(),
-
-            ClauseGuard::LocalVariable { type_, .. }
-            | ClauseGuard::TupleIndex { type_, .. }
-            | ClauseGuard::FieldAccess { type_, .. }
-            | ClauseGuard::ModuleSelect { type_, .. }
-            | ClauseGuard::Invalid { type_, .. }
-            | ClauseGuard::UnqualifiedRemoteConstant { type_, .. } => type_.clone(),
+            ClauseGuard::Invalid { type_, .. } => type_.clone(),
 
             ClauseGuard::Not { .. } => type_::bool(),
 
@@ -2690,28 +2697,23 @@ impl TypedClauseGuard {
                 container: value, ..
             }
             | ClauseGuard::Block { value, .. } => value.find_node(byte_index),
-
             ClauseGuard::Constant(constant) => constant.find_node(byte_index),
-
-            ClauseGuard::LocalVariable { .. }
-            | ClauseGuard::Invalid { .. }
-            | ClauseGuard::UnqualifiedRemoteConstant { .. } => Some(Located::ClauseGuard(self)),
+            ClauseGuard::Var { .. } => Some(Located::ClauseGuard(self)),
+            ClauseGuard::Invalid { .. } => Some(Located::ClauseGuard(self)),
         }
     }
 
-    pub(crate) fn referenced_variables(&self) -> im::HashSet<&EcoString> {
+    pub(crate) fn referenced_variables(&self) -> imbl::HashSet<&EcoString> {
         match self {
-            ClauseGuard::LocalVariable { name, .. } => im::hashset![name],
+            ClauseGuard::Var { name, .. } => imbl::hashset![name],
 
             ClauseGuard::Block { value, .. } => value.referenced_variables(),
             ClauseGuard::Not { expression, .. } => expression.referenced_variables(),
             ClauseGuard::TupleIndex { tuple, .. } => tuple.referenced_variables(),
             ClauseGuard::FieldAccess { container, .. } => container.referenced_variables(),
             ClauseGuard::Constant(constant) => constant.referenced_variables(),
-
-            ClauseGuard::ModuleSelect { .. }
-            | ClauseGuard::Invalid { .. }
-            | ClauseGuard::UnqualifiedRemoteConstant { .. } => im::HashSet::new(),
+            ClauseGuard::ModuleSelect { .. } => imbl::HashSet::new(),
+            ClauseGuard::Invalid { .. } => imbl::HashSet::new(),
 
             ClauseGuard::BinaryOperator { left, right, .. } => left
                 .referenced_variables()
@@ -2728,17 +2730,6 @@ impl TypedClauseGuard {
                 },
             ) => value.syntactically_eq(other_value),
             (ClauseGuard::Block { .. }, _) => false,
-
-            (
-                ClauseGuard::UnqualifiedRemoteConstant { name, .. },
-                ClauseGuard::UnqualifiedRemoteConstant {
-                    name: other_name, ..
-                }
-                | ClauseGuard::LocalVariable {
-                    name: other_name, ..
-                },
-            ) => name == other_name,
-            (ClauseGuard::UnqualifiedRemoteConstant { .. }, _) => false,
 
             (
                 ClauseGuard::BinaryOperator { left, right, .. },
@@ -2760,15 +2751,12 @@ impl TypedClauseGuard {
             (ClauseGuard::Not { .. }, _) => false,
 
             (
-                ClauseGuard::LocalVariable { name, .. },
-                ClauseGuard::LocalVariable {
-                    name: other_name, ..
-                }
-                | ClauseGuard::UnqualifiedRemoteConstant {
+                ClauseGuard::Var { name, .. },
+                ClauseGuard::Var {
                     name: other_name, ..
                 },
             ) => name == other_name,
-            (ClauseGuard::LocalVariable { .. }, _) => false,
+            (ClauseGuard::Var { .. }, _) => false,
 
             (
                 ClauseGuard::TupleIndex { index, tuple, .. },
@@ -2824,13 +2812,8 @@ impl TypedClauseGuard {
             | ClauseGuard::TupleIndex { .. }
             | ClauseGuard::Invalid { .. }
             | ClauseGuard::FieldAccess { .. } => None,
-
-            ClauseGuard::UnqualifiedRemoteConstant {
-                definition_location,
-                ..
-            } => definition_location.clone(),
             ClauseGuard::Constant(constant) => constant.definition_location(),
-            ClauseGuard::LocalVariable {
+            ClauseGuard::Var {
                 definition_location,
                 ..
             } => Some(DefinitionLocation {
@@ -4356,7 +4339,7 @@ impl<A> BitArrayOption<A> {
 }
 
 impl BitArrayOption<TypedConstant> {
-    fn referenced_variables(&self) -> im::HashSet<&EcoString> {
+    fn referenced_variables(&self) -> imbl::HashSet<&EcoString> {
         match self {
             BitArrayOption::Bytes { .. }
             | BitArrayOption::Int { .. }
@@ -4373,7 +4356,7 @@ impl BitArrayOption<TypedConstant> {
             | BitArrayOption::Big { .. }
             | BitArrayOption::Little { .. }
             | BitArrayOption::Unit { .. }
-            | BitArrayOption::Native { .. } => im::hashset![],
+            | BitArrayOption::Native { .. } => imbl::hashset![],
 
             BitArrayOption::Size { value, .. } => value.referenced_variables(),
         }

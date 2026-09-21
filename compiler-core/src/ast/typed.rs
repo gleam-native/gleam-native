@@ -99,32 +99,6 @@ pub enum TypedExpr {
         subjects: Vec<Self>,
         clauses: Vec<Clause<Self, Arc<Type>>>,
         compiled_case: CompiledCase,
-
-        /// These are all the remote constants that are referenced by guards of
-        /// this case.
-        /// Remote constants (constants from other modules) are turned into
-        /// function calls on the Erlang target, and those are not allowed in
-        /// clause guards.
-        /// This will be used by code generation to actually bind those needed
-        /// values to variables that come before the case expression so the
-        /// guards can reference these variables.
-        ///
-        /// For example, in this case:
-        ///
-        /// ```gleam
-        /// import other_module.{some_constant}
-        ///
-        /// case wibble {
-        ///   1 if some_constant -> todo
-        ///   2 if other_module.some_other_constant || wibble -> todo
-        ///   _ -> todo
-        /// }
-        /// ```
-        ///
-        /// We need to keep track of `(other_module, some_constant)` and
-        /// `(other_module.some_other_constant)`.
-        ///
-        remote_constants: HashSet<(EcoString, EcoString)>,
     },
 
     RecordAccess {
@@ -1240,9 +1214,8 @@ impl TypedExpr {
                         ..
                     },
                 ..
-            } => *arity > 0,
-
-            TypedExpr::ModuleSelect {
+            }
+            | TypedExpr::ModuleSelect {
                 constructor: ModuleValueConstructor::Record { arity, .. },
                 ..
             } => *arity > 0,
@@ -1271,6 +1244,51 @@ impl TypedExpr {
             | TypedExpr::NegateBool { .. }
             | TypedExpr::NegateInt { .. }
             | TypedExpr::Invalid { .. } => false,
+        }
+    }
+
+    /// Returns the name of the module and the function, if this is a well-defined (named)
+    /// function.
+    ///
+    pub fn module_function_name(&self) -> Option<(&EcoString, &EcoString)> {
+        match self {
+            TypedExpr::Var {
+                constructor:
+                    ValueConstructor {
+                        variant: ValueConstructorVariant::ModuleFn { module, name, .. },
+                        ..
+                    },
+                ..
+            }
+            | TypedExpr::ModuleSelect {
+                constructor: ModuleValueConstructor::Fn { module, name, .. },
+                ..
+            } => Some((module, name)),
+
+            TypedExpr::Int { .. }
+            | TypedExpr::Float { .. }
+            | TypedExpr::String { .. }
+            | TypedExpr::Block { .. }
+            | TypedExpr::Pipeline { .. }
+            | TypedExpr::Var { .. }
+            | TypedExpr::Fn { .. }
+            | TypedExpr::List { .. }
+            | TypedExpr::Call { .. }
+            | TypedExpr::BinOp { .. }
+            | TypedExpr::Case { .. }
+            | TypedExpr::RecordAccess { .. }
+            | TypedExpr::PositionalAccess { .. }
+            | TypedExpr::ModuleSelect { .. }
+            | TypedExpr::Tuple { .. }
+            | TypedExpr::TupleIndex { .. }
+            | TypedExpr::Todo { .. }
+            | TypedExpr::Panic { .. }
+            | TypedExpr::Echo { .. }
+            | TypedExpr::BitArray { .. }
+            | TypedExpr::RecordUpdate { .. }
+            | TypedExpr::NegateBool { .. }
+            | TypedExpr::NegateInt { .. }
+            | TypedExpr::Invalid { .. } => None,
         }
     }
 

@@ -303,36 +303,36 @@ impl TypedConstant {
         }
     }
 
-    pub(crate) fn referenced_variables(&self) -> im::HashSet<&EcoString> {
+    pub(crate) fn referenced_variables(&self) -> imbl::HashSet<&EcoString> {
         match self {
-            Constant::Var { name, .. } => im::hashset![name],
+            Constant::Var { name, .. } => imbl::hashset![name],
 
             Constant::Invalid { .. }
             | Constant::Int { .. }
             | Constant::Float { .. }
-            | Constant::String { .. } => im::hashset![],
+            | Constant::String { .. } => imbl::hashset![],
 
             Constant::Todo { message, .. } => message
                 .as_ref()
                 .map(|message| message.referenced_variables())
-                .unwrap_or(im::hashset![]),
+                .unwrap_or(imbl::hashset![]),
 
             Constant::Tuple { elements, .. } => elements
                 .iter()
                 .map(|element| element.referenced_variables())
-                .fold(im::hashset![], im::HashSet::union),
+                .fold(imbl::hashset![], imbl::HashSet::union),
 
             Constant::List { elements, tail, .. } => elements
                 .iter()
                 .map(|element| element.referenced_variables())
                 .chain(tail.iter().map(|tail| tail.referenced_variables()))
-                .fold(im::hashset![], im::HashSet::union),
+                .fold(imbl::hashset![], imbl::HashSet::union),
 
             Constant::Record { arguments, .. } => arguments
                 .iter()
                 .flatten()
                 .map(|argument| argument.value.referenced_variables())
-                .fold(im::hashset![], im::HashSet::union),
+                .fold(imbl::hashset![], imbl::HashSet::union),
 
             Constant::RecordUpdate {
                 record, arguments, ..
@@ -340,7 +340,7 @@ impl TypedConstant {
                 arguments
                     .iter()
                     .map(|arg| arg.value.referenced_variables())
-                    .fold(im::hashset![], im::HashSet::union),
+                    .fold(imbl::hashset![], imbl::HashSet::union),
             ),
 
             Constant::BitArray { segments, .. } => segments
@@ -350,9 +350,9 @@ impl TypedConstant {
                         .options
                         .iter()
                         .map(|option| option.referenced_variables())
-                        .fold(segment.value.referenced_variables(), im::HashSet::union)
+                        .fold(segment.value.referenced_variables(), imbl::HashSet::union)
                 })
-                .fold(im::hashset![], im::HashSet::union),
+                .fold(imbl::hashset![], imbl::HashSet::union),
 
             Constant::BinaryOperator { left, right, .. } => left
                 .referenced_variables()
@@ -550,13 +550,13 @@ impl TypedConstant {
     ///     - `[1, 2, ..[3, 4]]`
     ///     - `[1, 2, ..a_known_module_constant]`
     ///
-    pub fn list_elements(&self, current_module: &EcoString) -> Option<Vec<&Self>> {
+    pub fn list_elements(&self) -> Option<Vec<&Self>> {
         match self {
             Constant::List { elements, tail, .. } => {
                 if let Some(tail) = tail {
                     // There's a tail, if it cannot be known at compile time,
                     // then this entire list cannot be known at compile time!
-                    let tail_elements = tail.list_elements(current_module)?;
+                    let tail_elements = tail.list_elements()?;
                     Some(elements.iter().chain(tail_elements).collect())
                 } else {
                     // There's no tail, we just return the elements
@@ -567,17 +567,7 @@ impl TypedConstant {
                 constructor: Some(constructor),
                 ..
             } => match &constructor.variant {
-                // We don't want to inline constants across modules, so if this
-                // comes from a different module than the current one we return
-                // none: there's no literal values to inline.
-                ValueConstructorVariant::ModuleConstant {
-                    literal, module, ..
-                } if module != current_module => None,
-
-                ValueConstructorVariant::ModuleConstant { literal, .. } => {
-                    literal.list_elements(current_module)
-                }
-
+                ValueConstructorVariant::ModuleConstant { literal, .. } => literal.list_elements(),
                 ValueConstructorVariant::LocalVariable { .. }
                 | ValueConstructorVariant::ModuleFn { .. }
                 | ValueConstructorVariant::Record { .. } => None,

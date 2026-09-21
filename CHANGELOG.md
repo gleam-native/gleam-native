@@ -109,9 +109,7 @@
   OTP29.
   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
 
-- When compiling to Erlang, there will be one instance of each public constant
-  rather than one per module that uses it, reducing memory consumption of
-  programs containing large constants.
+- Creation of literal lists has been optimised on the JavaScript target.
   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
 
 - The compiler now provides a specific error message directing the user to the
@@ -121,6 +119,85 @@
 - The compiler now provides a more specific error message when encountering a
   merge conflict indicator
   ([0xda157](https://github.com/0xda157))
+
+- The compiler now provides hint about `|' in pattern matching
+  ([n0kk23](https://github.com/n0kk23))
+
+- The compiler now provides better error message when trying to import or use
+  private value or type from modules within current package. For example:
+
+  ```gleam
+  import wibble
+  //     ^^^^^^ `wibble` is a module in same package
+
+  fn go() -> wibble.Wobble {
+    todo
+  }
+  ```
+
+  Results in following errors:
+
+  ```
+  error: Use of private module type
+    ┌─ /workspaces/wobble/src/wobble.gleam:4:12
+    │
+  4 │ fn go() -> wibble.Wobble {
+    │            ^^^^^^^^^^^^^
+
+  `wibble.Wobble` is a private type.
+  ```
+
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- When an invalid type alias is created the error messages no longer cascade
+  through further usages.
+  ([James Dolan](https://github.com/jamesdolan16))
+
+- Matching on bit array patterns which contain empty string segments is now
+  deprecated.
+  ([Surya Rose](https://github.com/GearsDatapacks))
+
+- The compiler now recognises more unreachable clauses in a `case` where an
+  earlier clause matches an overlapping string.
+
+  ```gleam
+  pub fn go(input: String, x: Int) {
+    case input, x {
+      "ab", 1 -> 7
+      "a" <> _, _ -> 2
+      "ab", _ -> 3
+      _, _ -> 4
+    }
+  }
+  ```
+
+  The compiler will emit the following warning:
+
+  ```txt
+  warning: Unreachable pattern
+    ┌─ /main.gleam:5:5
+    │
+  5 │     "ab", _ -> 3
+    │     ^^^^^^^
+
+  This pattern cannot be reached as a previous pattern matches the same
+  values.
+
+  Hint: It can be safely removed.
+  ```
+
+  Anything reaching the third clause starts with `"a"`, so the second clause has
+  already matched it. Code that previously compiled cleanly may now emit this
+  warning.
+  ([John Downey](https://github.com/jtdowney))
+
+- The compiler's lexer now uses byte indexing with an ASCII fast path instead
+  of iterating over characters, and builds tokens from source slices to reduce
+  allocations.
+  ([John Downey](https://github.com/jtdowney))
+
+- The performance of `echo` for floats has been improved on the Erlang target.
+  ([Andrey Kozhev](https://github.com/ankddev))
 
 ### Build tool
 
@@ -133,7 +210,7 @@
   has no impact unless the user is using a very old version of git or has
   enabled this protocol in their configuration.
   ([Amr Kadry](https://github.com/Amrkadry) and
-  ([Louis Pilfold](https://github.com/lpil))
+  [Louis Pilfold](https://github.com/lpil))
 
 - The ordering of import statements in generated JavaScript code is now stable.
   Previously the same code compiled twice could produce different output, as
@@ -144,9 +221,22 @@
 - Make links to Tangled repositories use their new domain & URL format.
   ([Naomi Roberts](https://github.com/naomieow))
 
+- `compile-package` now supports a `--src-only` flag to compile only the `/src`
+  folder.
+  ([Rodrigo Álvarez](https://github.com/Papipo))
+
 - The build tool now shows a better error when trying to add a package as a
   dependency when it is already a development dependency (or vice-versa).
   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+
+- `--out` argument in `export package-information` and `export package-interface`
+  commands is no longer required. Those commands now print to stdout by
+  default.
+  ([Rodrigo Álvarez](https://github.com/Papipo))
+
+- The `export javascript-prelude` and `export typescript-prelude` commands gain
+  the `--out` parameter.
+  ([Louis Pilfold](https://github.com/lpil))
 
 ### Language server
 
@@ -186,6 +276,10 @@
   code action in constants, patterns and bit array "size" options.
   ([Andrey Kozhev](https://github.com/ankddev))
 
+- The language server now supports go-to-definition, find-references and
+  renaming for function argument labels.
+  ([Alistair Smith](https://github.com/alii))
+
 ### Formatter
 
 ### Compiler Wasm API
@@ -220,6 +314,10 @@
   unexpectedly.
   ([Senthilnathan](https://github.com/ssenthilnathan3))
 
+- Fixed a bug where a bit array segment pattern of an empty string would
+  generate invalid code on JavaScript.
+  ([Louis Pilfold](https://github.com/lpil))
+
 - Fixed a bug where comments after the last item in a tuple, or after the last
   argument in a function call wouldn't be formatted properly.
   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
@@ -229,6 +327,15 @@
 
 - Fixed a bug where echo would print BitArrays like `<<1, 2, 3>>` as strings on
   the Erlang target.
+  ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+
+- Fixed a bug where the compiler would not produce a type error when using a
+  record constructor as the updated record in a record update expression in a
+  constant.
+  ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+
+- Fixed a bug where the compiler would crash when writing a constant record
+  update depending on another invalid constant.
   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
 
 - Fixed a bug where the "Discard unused variable" language server code action
@@ -261,6 +368,55 @@
   ignored, or could pull a package into the dependency tree that nothing
   actually required.
   ([John Downey](https://github.com/jtdowney))
+
+- Fixed a bug where comparing `0.0` and `-0.0` resulted in a redundant
+  comparison warning, which is incorrect on Erlang/OTP 27+.
+  ([Jack Programs](https://github.com/jackprogramsjp))
+
+- Fixed a bug where a project with multiple path dependencies would perform
+  dependency resolution once per path dependency, so commands run after
+  `gleam deps download` would needlessly resolve versions again.
+  ([John Downey](https://github.com/jtdowney))
+
+- Fixed a bug where concatenating a string to a string in a block would
+  produce an invalid bitstring on the Erlang target.
+  ([Lillian Rose](https://github.com/lillianrubyrose) with
+  [Mar Bloeiman](https://github.com/strawmelonjuice))
+
+- Fixed a bug where the compiler would suggest wrapping a mismatched type in
+  `Ok()` even when doing so would not fix the type unification error.
+  ([Hari Mohan](https://github.com/seafoamteal))
+
+- Fixed a bug where `gleam export hex-tarball` and `gleam publish` could fail on
+  Windows with a "path is outside this Gleam project" error for files that were
+  inside the project.
+  ([John Downey](https://github.com/jtdowney))
+
+- Fixed a bug in generating TypeScript annotations for function signatures
+  that use types from aliased modules.
+  ([Ian Chamberlain](https://github.com/ian-h-chamberlain))
+
+- Fixed a bug where the generated `package-interface.json` would not include
+  deprecation messages for constructors.
+  ([Surya Rose](https://github.com/GearsDatapacks))
+
+- Fixed a bug where on the JavaScript target a string prefix pattern could be
+  skipped when an earlier clause matched an overlapping string, but then failed
+  for another reason.
+  ([John Downey](https://github.com/jtdowney))
+
+- Fixed a bug where on the JavaScript target a name given to a string prefix or
+  bit array in a pattern would not be bound in every branch it was used in.
+  ([John Downey](https://github.com/jtdowney))
+
+- Fixed a bug where the end position of the final token was incorrect when the
+  source ended with a multi-byte character.
+  ([John Downey](https://github.com/jtdowney))
+
+- Fixed a bug where the build tool would exit with an error when the gleam.toml
+  licence array contained a licence starting with `LicenseRef-`, which are used
+  by hex.pm to support non-SPDX licences.
+  ([Vivid](https://github.com/absolutely-vivid))
 
 ## v1.18.1 - 2026-08-01
 

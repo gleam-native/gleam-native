@@ -17,6 +17,6 @@ erlang-generation = { path = "../erlang-generation" }
 src-span = { path = "../src-span" }
 camino.workspace = true
 ecow.workspace = true
-im.workspace = true
+imbl.workspace = true
 arbitrary = "1"
 regex = { workspace = true }

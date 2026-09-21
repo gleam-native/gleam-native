@@ -2878,3 +2878,46 @@ pub const value = <<0:size(0), 1:size(8)>>
 "#,
     );
 }
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn match_on_empty_bit_array_string() {
+    assert_js!(
+        r#"
+pub fn main(x) {
+  let assert <<"":utf8>> = x
+  Nil
+}
+"#
+    );
+}
+
+#[test]
+fn bit_array_slice_assignment_inside_a_nested_pattern_after_a_guard() {
+    assert_js!(
+        r#"
+pub fn go(b: Bool, flag: Bool, r: Result(BitArray, Nil)) -> BitArray {
+  case b, r {
+    True, _ if flag -> <<1>>
+    _, Ok(<<x:bits>>) -> x
+    _, _ -> <<>>
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn bit_array_segment_assignment_proved_by_a_guarded_clause() {
+    assert_js!(
+        r#"
+pub fn go(bits: BitArray, flag: Bool) -> Int {
+  case bits {
+    <<_:8, 2>> if flag -> 0
+    <<1, 2 as y>> -> y
+    _ -> -1
+  }
+}
+"#,
+    );
+}

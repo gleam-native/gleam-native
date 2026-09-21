@@ -10,7 +10,7 @@ use erlang_generation::ErlangSourceBuilder;
 use gleam_core::{
     analyse::{ModuleAnalyzerConstructor, TargetSupport},
     ast::{TypedModule, UntypedModule},
-    build::{Origin, Outcome, Target, package_compiler::StdlibPackage},
+    build::{package_compiler::StdlibPackage, Origin, Outcome, Target},
     codegen::TypeScriptDeclarations,
     config::PackageConfig,
     erlang, javascript, parse,
@@ -175,7 +175,7 @@ fn parse_ok(src: &str) -> Option<UntypedModule> {
 
 fn analyse(src: &str, target: Target) -> Option<(TypedModule, LineNumbers)> {
     let ids = UniqueIdGenerator::new();
-    let mut modules = im::HashMap::new();
+    let mut modules = imbl::HashMap::new();
     let _ = modules.insert(PRELUDE_MODULE_NAME.into(), type_::build_prelude(&ids));
 
     let mut ast = parse_ok(src)?;

@@ -46,7 +46,7 @@ pub mod tests;
 
 macro_rules! wrap_format {
     ($($tts:tt)*) => {
-        wrap(&format!($($tts)*))
+        crate::error::wrap(&format!($($tts)*))
     }
 }
 pub(crate) use wrap_format;
@@ -958,7 +958,9 @@ fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<usize
     (score <= limit).then_some(score)
 }
 
-fn did_you_mean(name: &str, options: &[EcoString]) -> Option<String> {
+/// Returns a "Did you mean ...?" suggestion using the string from `options` that's most similar to
+/// `name`.
+pub fn did_you_mean(name: &str, options: &[EcoString]) -> Option<String> {
     // If only one option is given, return that option.
     // This seems to solve the `unknown_variable_3` test.
     if options.len() == 1 {
@@ -3931,10 +3933,15 @@ to variables, pass them to functions, or anything else that you would do with a 
 but this pattern matches {given}.
 Each clause must have a pattern for every subject value.",
             );
+            let hint = if *expected == 1 {
+                Some("Did you mean to match on alternative patterns using `|`?".into())
+            } else {
+                None
+            };
             Diagnostic {
                 title: "Incorrect number of patterns".into(),
                 text,
-                hint: None,
+                hint,
                 level: Level::Error,
                 location: Some(Location {
                     label: Label {
@@ -5296,6 +5303,50 @@ Be sure to finish it before running your program.",
                 extra_labels: vec![],
             }),
         },
+        TypeError::PrivateValueUse {
+            location,
+            name,
+            module_name,
+        } => Diagnostic {
+            title: "Use of private value".into(),
+            text: wrap_format!(
+                "`{module_name}` does define `{name}`, but it is private \
+and cannot be accessed by other modules."
+            ),
+            hint: None,
+            level: Level::Error,
+            location: Some(Location {
+                label: Label {
+                    text: None,
+                    span: *location,
+                },
+                path: path.clone(),
+                src: src.clone(),
+                extra_labels: vec![],
+            }),
+        },
+        TypeError::PrivateTypeUse {
+            location,
+            name,
+            module_name,
+        } => Diagnostic {
+            title: "Use of private type".into(),
+            text: wrap_format!(
+                "`{module_name}` does define `{name}`, but it is private \
+and cannot be accessed by other modules."
+            ),
+            hint: None,
+            level: Level::Error,
+            location: Some(Location {
+                label: Label {
+                    text: None,
+                    span: *location,
+                },
+                path: path.clone(),
+                src: src.clone(),
+                extra_labels: vec![],
+            }),
+        },
     })
 }
 
@@ -5415,9 +5466,12 @@ fn hint_wrap_value_in_result(expected: &Arc<Type>, given: &Arc<Type>) -> Option<
     let expected = collapse_links(expected.clone());
     let (expected_ok_type, expected_error_type) = expected.result_types()?;
 
-    if given.same_as(expected_ok_type.as_ref()) {
+    // Unbound type variables are trivially matched by `same_as` to any other type,
+    // leading to confusing hints. Any `given` type could match one of the `expected`
+    // type variables, leading to false positives for the wrap hint.
+    if !expected_ok_type.is_unbound() && given.same_as(expected_ok_type.as_ref()) {
         Some("Did you mean to wrap this in an `Ok`?".into())
-    } else if given.same_as(expected_error_type.as_ref()) {
+    } else if !expected_error_type.is_unbound() && given.same_as(expected_error_type.as_ref()) {
         Some("Did you mean to wrap this in an `Error`?".into())
     } else {
         None

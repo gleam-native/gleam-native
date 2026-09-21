@@ -727,6 +727,26 @@ pub enum Error {
         operator_start: u32,
         operator: BinOp,
     },
+
+    /// This happens when we try to use a private value from another module
+    /// from the same package. From another package an "unknown value"
+    /// error is unsed instead, to avoid sharing information about the
+    /// internals of the other package.
+    PrivateValueUse {
+        location: SrcSpan,
+        name: EcoString,
+        module_name: EcoString,
+    },
+
+    /// This happens when we try to use a private type from another module
+    /// from the same package. From another package an "unknown type"
+    /// error is unsed instead, to avoid sharing information about the
+    /// internals of the other package.
+    PrivateTypeUse {
+        location: SrcSpan,
+        name: EcoString,
+        module_name: EcoString,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -927,7 +947,7 @@ pub enum Warning {
         kind: TodoKind,
         location: SrcSpan,
         type_: Arc<Type>,
-        names: Names,
+        names: Box<Names>,
     },
 
     ImplicitlyDiscardedResult {
@@ -1234,6 +1254,10 @@ pub enum Warning {
     PipeIntoCallWhichReturnsFunction {
         location: SrcSpan,
     },
+
+    EmptyStringBitArraySegment {
+        location: SrcSpan,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
@@ -1441,7 +1465,9 @@ impl Error {
             | Error::RecordUpdateVariantWithNoFields { location }
             | Error::QualifiedTypeMissingName { location }
             | Error::TodoConstant { location }
-            | Error::LowercaseBoolPattern { location } => location.start,
+            | Error::LowercaseBoolPattern { location }
+            | Error::PrivateValueUse { location, .. }
+            | Error::PrivateTypeUse { location, .. } => location.start,
             Error::UnknownLabels { unknown, .. } => {
                 unknown.iter().map(|(_, s)| s.start).min().unwrap_or(0)
             }
@@ -1507,7 +1533,8 @@ impl Warning {
             | Warning::RedundantComparison { location, .. }
             | Warning::JavaScriptBitArrayUnsafeInt { location, .. }
             | Warning::UnusedRecursiveArgument { location, .. }
-            | Warning::PipeIntoCallWhichReturnsFunction { location } => *location,
+            | Warning::PipeIntoCallWhichReturnsFunction { location }
+            | Warning::EmptyStringBitArraySegment { location } => *location,
         }
     }
 
@@ -1628,6 +1655,11 @@ pub enum UnknownTypeConstructorError {
         type_constructors: Vec<EcoString>,
         imported_type_as_value: bool,
     },
+
+    PrivateModuleType {
+        name: EcoString,
+        module_name: EcoString,
+    },
 }
 
 pub fn convert_get_type_constructor_error(
@@ -1662,6 +1694,14 @@ pub fn convert_get_type_constructor_error(
             type_constructors,
             value_with_same_name: imported_type_as_value,
         },
+
+        UnknownTypeConstructorError::PrivateModuleType { name, module_name } => {
+            Error::PrivateTypeUse {
+                location: *location,
+                name,
+                module_name,
+            }
+        }
     }
 }
 

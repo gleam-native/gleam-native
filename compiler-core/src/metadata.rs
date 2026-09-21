@@ -65,7 +65,6 @@ impl RemapIds {
             documentation,
             contains_echo,
             references,
-            inline_functions,
         } = module;
 
         let types = types
@@ -106,7 +105,6 @@ impl RemapIds {
             documentation,
             contains_echo,
             references,
-            inline_functions,
         }
     }
 
@@ -170,6 +168,7 @@ impl RemapIds {
             name,
             parameters,
             documentation,
+            deprecation,
         } = variant;
 
         let parameters = parameters
@@ -191,6 +190,7 @@ impl RemapIds {
             name,
             parameters,
             documentation,
+            deprecation,
         }
     }
 
@@ -229,7 +229,6 @@ impl RemapIds {
                 name,
                 literal,
                 implementations,
-                remote_constants,
             } => ValueConstructorVariant::ModuleConstant {
                 documentation,
                 location,
@@ -237,7 +236,6 @@ impl RemapIds {
                 name,
                 literal: self.constant(literal),
                 implementations,
-                remote_constants,
             },
             ValueConstructorVariant::ModuleFn {
                 name,

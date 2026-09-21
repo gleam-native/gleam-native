@@ -21,5 +21,5 @@ pub fn main() {
 
 -spec main() -> nil.
 main() ->
-    _ = <<(some_module:wibble())/utf16>>,
+    _ = <<"a"/utf16>>,
     nil.

@@ -35,8 +35,7 @@ use crate::{
     },
     bit_array,
     build::{Origin, Target},
-    inline::InlinableFunction,
-    reference::{LabelDefinition, LabelReference, ModuleNameReference, RecordLabel, ReferenceMap},
+    reference::{LabelDefinition, LabelKey, LabelReference, ModuleNameReference, ReferenceMap},
     type_::expression::Implementations,
 };
 use error::*;
@@ -734,22 +733,6 @@ pub enum ValueConstructorVariant {
         name: EcoString,
         literal: Constant<Arc<Type>>,
         implementations: Implementations,
-        /// These are all the remote constants referenced by this module
-        /// constant, either directly or indirectly.
-        /// For example if we have:
-        ///
-        /// ```gleam
-        /// import other_module.{another_constant}
-        ///
-        /// pub const wibble = other_module.a_constant
-        ///
-        /// pub const wobble = [another_constant, wibble]
-        /// ```
-        ///
-        /// `wobble` is referencing both `(other_module, another_constant)`
-        /// directly, and `(other_module, a_constant)` indirectly through
-        /// `wibble`.
-        remote_constants: HashSet<(EcoString, EcoString)>,
     },
 
     /// A function belonging to the module
@@ -1058,8 +1041,6 @@ pub struct ModuleInterface {
     /// Wether there's any echo in the module.
     pub contains_echo: bool,
     pub references: References,
-    /// Functions which can be inlined
-    pub inline_functions: HashMap<EcoString, InlinableFunction>,
 }
 
 impl ModuleInterface {
@@ -1078,8 +1059,8 @@ pub struct References {
     pub value_references: ReferenceMap,
     pub type_references: ReferenceMap,
     pub module_references: HashMap<EcoString, Vec<ModuleNameReference>>,
-    pub label_references: HashMap<RecordLabel, Vec<LabelReference>>,
-    pub label_definitions: HashMap<RecordLabel, Vec<LabelDefinition>>,
+    pub label_references: HashMap<LabelKey, Vec<LabelReference>>,
+    pub label_definitions: HashMap<LabelKey, Vec<LabelDefinition>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1148,6 +1129,7 @@ pub struct TypeValueConstructor {
     pub name: EcoString,
     pub parameters: Vec<TypeValueConstructorField>,
     pub documentation: Option<EcoString>,
+    pub deprecation: Deprecation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

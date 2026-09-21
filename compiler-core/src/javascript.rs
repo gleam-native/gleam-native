@@ -97,7 +97,7 @@ pub struct Generator<'a> {
     line_numbers: &'a LineNumbers,
     module: &'a TypedModule,
     tracker: UsageTracker,
-    module_scope: im::HashMap<EcoString, usize>,
+    module_scope: imbl::HashMap<EcoString, usize>,
     current_module_name_segments_count: usize,
     typescript: TypeScriptDeclarations,
     // Debug ignored since SourceMapBuilder doesn't implement debug
@@ -134,7 +134,7 @@ impl<'a, 'doc> Generator<'a> {
             module,
             src_path,
             tracker: UsageTracker::default(),
-            module_scope: im::HashMap::new(),
+            module_scope: imbl::HashMap::new(),
             typescript,
             source_map_builder: if source_map {
                 let module_name = module.name.clone();
@@ -224,7 +224,7 @@ impl<'a, 'doc> Generator<'a> {
             self.register_prelude_usage(arena, &mut imports, "Error", None);
         }
 
-        if self.tracker.list_used {
+        if self.tracker.to_list_used {
             self.register_prelude_usage(arena, &mut imports, "toList", None);
         }
 
@@ -1566,7 +1566,7 @@ fn maybe_escape_property(label: &str) -> EcoString {
 #[derive(Debug, Default)]
 pub(crate) struct UsageTracker {
     pub ok_used: bool,
-    pub list_used: bool,
+    pub to_list_used: bool,
     pub list_empty_class_used: bool,
     pub list_empty_const_used: bool,
     pub list_non_empty_class_used: bool,

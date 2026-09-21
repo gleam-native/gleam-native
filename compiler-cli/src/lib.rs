@@ -103,8 +103,9 @@ use gleam_core::{
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateOptions {
-    /// (optional) Names of the packages to update
-    /// If omitted, all dependencies will be updated
+    /// (optional) Names of the packages to update.
+    ///
+    /// If omitted, all dependencies will be updated.
     #[arg(verbatim_doc_comment)]
     packages: Vec<String>,
 }
@@ -662,8 +663,14 @@ impl Command {
                 let paths = find_project_paths(directory)?;
                 export::hex_tarball(&paths)
             }
-            Self::Export(ExportTarget::JavascriptPrelude) => export::javascript_prelude(),
-            Self::Export(ExportTarget::TypescriptPrelude) => export::typescript_prelude(),
+            Self::Export(ExportTarget::JavaScriptPrelude { output }) => {
+                let paths = find_project_paths(directory)?;
+                export::javascript_prelude(&paths, output)
+            }
+            Self::Export(ExportTarget::TypeScriptPrelude { output }) => {
+                let paths = find_project_paths(directory)?;
+                export::typescript_prelude(&paths, output)
+            }
             Self::Export(ExportTarget::PackageInterface { output }) => {
                 let paths = find_project_paths(directory)?;
                 export::package_interface(&paths, output)
@@ -721,20 +728,36 @@ pub enum ExportTarget {
     /// The package bundled into a tarball, suitable for publishing to Hex
     HexTarball,
     /// The JavaScript prelude module
-    JavascriptPrelude,
+    JavaScriptPrelude {
+        /// (optional) The path to write the JavaScript file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
+    },
     /// The TypeScript prelude module
-    TypescriptPrelude,
+    TypeScriptPrelude {
+        /// (optional) The path to write the TypeScript file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
+    },
     /// Information on the modules, functions, and types in the project in JSON format
     PackageInterface {
-        /// The path to write the JSON file to
-        #[arg(long = "out", required = true)]
-        output: Utf8PathBuf,
+        /// (optional) The path to write the JSON file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
     },
     /// Package information (gleam.toml) in JSON format
     PackageInformation {
-        /// The path to write the JSON file to
-        #[arg(long = "out", required = true)]
-        output: Utf8PathBuf,
+        /// (optional) The path to write the JSON file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
     },
 }
 
@@ -763,19 +786,19 @@ pub struct NewOptions {
 pub struct CompilePackage {
     /// The compilation target for the generated project
     #[arg(long, ignore_case = true, help = target_doc())]
-    target: Target,
+    pub target: Target,
 
     /// The directory of the Gleam package
     #[arg(long = "package")]
-    package_directory: Utf8PathBuf,
+    pub package_directory: Utf8PathBuf,
 
     /// A directory to write compiled package to
     #[arg(long = "out")]
-    output_directory: Utf8PathBuf,
+    pub output_directory: Utf8PathBuf,
 
     /// A directories of precompiled Gleam projects
     #[arg(long = "lib")]
-    libraries_directory: Utf8PathBuf,
+    pub libraries_directory: Utf8PathBuf,
 
     /// The location of the JavaScript prelude module, relative to the `out`
     /// directory.
@@ -786,11 +809,15 @@ pub struct CompilePackage {
     /// importing of other JavaScript file extensions.
     ///
     #[arg(verbatim_doc_comment, long = "javascript-prelude")]
-    javascript_prelude: Option<Utf8PathBuf>,
+    pub javascript_prelude: Option<Utf8PathBuf>,
 
     /// Skip Erlang to BEAM bytecode compilation
     #[arg(long = "no-beam")]
-    skip_beam_compilation: bool,
+    pub skip_beam_compilation: bool,
+
+    /// Only compile modules in the `src` directory, excluding `test` and `dev`
+    #[arg(long = "src-only")]
+    pub src_only: bool,
 }
 
 #[derive(Subcommand, Debug)]

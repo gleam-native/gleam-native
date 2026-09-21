@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use ecow::EcoString;
-use im::{HashSet, hashmap};
+use imbl::{HashSet, hashmap};
 use itertools::Itertools;
 use src_span::SrcSpan;
 
@@ -15,6 +15,7 @@ use crate::{
         UntypedConstant, UntypedConstantBitArraySegment,
     },
     build::Target,
+    reference::LabelOwner,
     type_::{
         Error, ExprTyper, FieldAccessUsage, HasType, Type, ValueConstructorVariant, ValueUsage,
         Warning, assert_no_labelled_arguments, bit_array,
@@ -30,42 +31,15 @@ use crate::{
 
 pub struct ConstantTyper<'expression_typer, 'env, 'module> {
     typer: &'expression_typer mut ExprTyper<'env, 'module>,
-    remote_constants: std::collections::HashSet<(EcoString, EcoString)>,
-}
-
-pub struct InferredConstant {
-    pub constant: TypedConstant,
-    /// These are all the remote constants referenced by this inferred constant,
-    /// either directly or indirectly.
-    /// For example if we have:
-    ///
-    /// ```gleam
-    /// import other_module.{another_constant}
-    ///
-    /// pub const wibble = other_module.a_constant
-    ///
-    /// pub const wobble = [another_constant, wibble]
-    /// ```
-    ///
-    /// `wobble` is referencing both `(other_module, another_constant)`
-    /// directly, and `(other_module, a_constant)` indirectly through
-    /// `wibble`.
-    pub remote_constants: std::collections::HashSet<(EcoString, EcoString)>,
 }
 
 impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'module> {
     pub fn new(typer: &'expression_typer mut ExprTyper<'env, 'module>) -> Self {
-        Self {
-            typer,
-            remote_constants: std::collections::HashSet::new(),
-        }
+        Self { typer }
     }
 
-    pub fn infer(mut self, constant: UntypedConstant) -> InferredConstant {
-        InferredConstant {
-            constant: self.do_infer(constant),
-            remote_constants: self.remote_constants,
-        }
+    pub fn infer(mut self, constant: UntypedConstant) -> TypedConstant {
+        self.do_infer(constant)
     }
 
     fn do_infer(&mut self, value: UntypedConstant) -> TypedConstant {
@@ -237,14 +211,14 @@ impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'm
 
                 // Get the field arguments from the record that we'll use as the base.
                 let (base_arguments, updated_record_tag) = if let Constant::Record {
-                    arguments,
+                    arguments: Some(arguments),
                     record_constructor: Some(resolved_record_constructor),
                     ..
                 } = resolved_record
                     && let ValueConstructorVariant::Record { name, .. } =
                         resolved_record_constructor.variant
                 {
-                    (arguments.unwrap_or(vec![]), name)
+                    (arguments, name)
                 } else {
                     self.typer.problems.error(convert_unify_error(
                         UnifyError::CouldNotUnify {
@@ -279,6 +253,24 @@ impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'm
 
                 let mut implicit_labelled_arguments = field_map.fields.clone();
                 let mut update_argument_indices = HashSet::new();
+
+                // If there's any missing or additional base arguments then we
+                // know that there must have been an error typing the constant
+                // used in this record update. For example:
+                //
+                // ```rs
+                // pub type Wibble { Wibble(a: Int, b: Int) }
+                //
+                // const wibble = Wibble(1) // <- just one argument
+                // const wobble = Wibble(..wibble, b: 2)
+                // ```
+                //
+                // In that case we avoid typing this record update!
+                // In future we might try and be smarter, for example we could
+                // try and fill holes with invalid expressions.
+                if base_arguments.len() != field_types.len() {
+                    return self.new_invalid_constant(location);
+                }
 
                 let mut final_arguments = base_arguments;
                 for argument in arguments {
@@ -323,9 +315,12 @@ impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'm
                         return self.new_invalid_constant(location);
                     }
 
-                    if let Some(type_name) = expected_type.named_type_name() {
+                    if let Some((type_module, type_name)) = expected_type.named_type_name() {
                         self.typer.environment.references.register_label_reference(
-                            type_name,
+                            LabelOwner::Record {
+                                module: type_module,
+                                name: type_name,
+                            },
                             label.clone(),
                             label_location,
                             syntax,
@@ -446,25 +441,6 @@ impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'm
                         };
                     }
                 };
-
-                if let ValueConstructorVariant::ModuleConstant {
-                    remote_constants,
-                    module,
-                    name,
-                    ..
-                } = &constructor.variant
-                {
-                    if *module == self.typer.environment.current_module {
-                        // If this variable is referencing a constant from the
-                        // current module, then it will be referencing all the
-                        // same remote constants.
-                        self.remote_constants
-                            .extend(remote_constants.iter().cloned());
-                    } else {
-                        // Or we're referencing a remote constant!
-                        let _ = self.remote_constants.insert((module.clone(), name.clone()));
-                    }
-                }
 
                 match constructor.variant {
                     ValueConstructorVariant::ModuleConstant { .. }
@@ -780,13 +756,16 @@ impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'm
         // synthetic placeholders without a real value: their labels are
         // registered using the locations captured before the values were
         // discarded.
-        if let Some(type_name) = expected_return.named_type_name() {
+        if let Some((type_module, type_name)) = expected_return.named_type_name() {
             for argument in &typed_arguments {
                 if let Some(label) = &argument.label
                     && let Some(label_location) = argument.label_location()
                 {
                     self.typer.environment.references.register_label_reference(
-                        type_name.clone(),
+                        LabelOwner::Record {
+                            module: type_module.clone(),
+                            name: type_name.clone(),
+                        },
                         label.clone(),
                         label_location,
                         argument.label_syntax(),
@@ -800,7 +779,10 @@ impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'm
                     && argument.implicit.is_none()
                 {
                     self.typer.environment.references.register_label_reference(
-                        type_name.clone(),
+                        LabelOwner::Record {
+                            module: type_module.clone(),
+                            name: type_name.clone(),
+                        },
                         label.clone(),
                         label_location,
                         argument.syntax,
@@ -977,11 +959,7 @@ impl<'expression_typer, 'env, 'module> ConstantTyper<'expression_typer, 'env, 'm
                     *segment.value,
                     segment.options,
                     segment.location,
-                    |env, expr| {
-                        let inferred = env.infer_const(&None, expr);
-                        self.remote_constants.extend(inferred.remote_constants);
-                        Ok(inferred.constant)
-                    },
+                    |env, expr| Ok(env.infer_const(&None, expr)),
                 );
 
                 if let Ok(segment) = &segment {

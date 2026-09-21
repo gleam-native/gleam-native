@@ -936,7 +936,7 @@ impl Lowerer<'_> {
                 self.guard(expression)?,
             ))),
 
-            ClauseGuard::LocalVariable { name, .. } => {
+            ClauseGuard::Var { name, .. } => {
                 Ok(native_ir::Expression::Variable(name.clone().into()))
             }
 
@@ -959,8 +959,7 @@ impl Lowerer<'_> {
             ClauseGuard::FieldAccess { index: None, .. } => {
                 Err(self.unsupported("this guard expression", guard.location()))
             }
-            ClauseGuard::ModuleSelect { literal, .. }
-            | ClauseGuard::UnqualifiedRemoteConstant { literal, .. } => self.constant(literal),
+            ClauseGuard::ModuleSelect { literal, .. } => self.constant(literal),
             ClauseGuard::Invalid { .. } => {
                 Err(self.unsupported("this guard expression", guard.location()))
             }
@@ -1589,10 +1588,10 @@ impl Lowerer<'_> {
                 // When the fallback is the final variant of an exhaustive
                 // match its check is not performed, but the fields it
                 // extracts must still be made available.
-                let fallback_fields = match fallback_check.as_ref() {
+                let fallback_fields = match fallback_check {
                     exhaustiveness::FallbackCheck::RuntimeCheck { check } => {
                         match self.runtime_check(
-                            check,
+                            check.as_ref(),
                             &var.type_,
                             subject,
                             prefix_slices,
